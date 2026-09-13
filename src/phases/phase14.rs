@@ -1,0 +1,1070 @@
+// src/phases/phase14.rs
+
+//! # Faza 14: Rozmyte Hashowanie i Ekstremalna Korelacja Krzyżowa
+//!
+//! Algorytm CTPH używany do znajdowania podobieństw, badania różnic objętości (Delta Size)
+//! i wyłapywania pomyłek w rozszerzeniach (Cross-Extension Matching) między programami.
+//! Wykorzystuje Memory Mapping (mmap) chroniąc RAM. Posiada system logowania Ratatui i Dual-Logging.
+//!
+//! UWAGA ARCHITEKTONICZNA: w przeciwieństwie do Faz 1-13, ta faza ma DWA
+//! zupełnie różne etapy obliczeniowe:
+//! - **Etap 1 (hashowanie, [`process_side_stream`])**: standardowy wzorzec
+//!   dwustronny UFS/Skrypt z dedykowanymi pulami Rayon (`half_threads`) — jak
+//!   w poprzednich fazach.
+//! - **Etap 4 (korelacja krzyżowa, w [`run`])**: NIE ma podziału UFS/Skrypt
+//!   jako dwóch stron do zrównoleglenia — zamiast tego dla plików WSPÓLNYCH
+//!   porównuje UFS-wersję ze Skrypt-wersją TEGO SAMEGO pliku (pętla
+//!   sekwencyjna), a dla plików UNIKALNYCH robi porównanie "każdy z każdym"
+//!   (`unique_ufs` × `unique_scr`, złożoność O(n×m)) na jednej, płaskiej puli
+//!   równoległej Rayon (`par_iter`) — half_threads nie ma tu zastosowania,
+//!   bo nie ma dwóch stron do podziału, jest jedno zadanie do zrównoleglenia.
+//!
+//! NAPRAWIONY BUG (bezpieczeństwo/UX): pętle korelacji w Etapie 4 (zarówno
+//! sekwencyjna po plikach wspólnych, jak i równoległa po unikalnych) NIE
+//! sprawdzały `CANCEL_SIGNAL` w ogóle — Ctrl+C podczas tego etapu (który dla
+//! dużej liczby plików unikalnych może trwać najdłużej ze wszystkich w
+//! całej fazie, ze względu na złożoność O(n×m)) nie miał żadnego efektu.
+//! Teraz obie pętle reagują na anulowanie.
+//!
+//! NAPRAWIONY BUG (rozjazd dokumentacji): stała kontrolująca próg fallbacku
+//! `fs::read_to_end` (gdy `mmap` zawiedzie) miała komentarz mówiący "50 MB",
+//! podczas gdy wartość wynosiła `1024*1024*1024` (1 GB). Wartość była
+//! prawdopodobnie poprawna, komentarz nieaktualny. Rozwiązane przez
+//! przeniesienie do konfigurowalnego ustawienia `config.fuzzy_hash_fallback_max_mb`
+//! (domyślnie 1024 MB = zachowanie dotychczasowe) — użytkownik decyduje
+//! świadomie, zamiast zgadywać z komentarza.
+
+use crate::settings::Ustawienia;
+use crate::tui::state::PhaseEvent;
+use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use ratatui::style::Color;
+use rayon::prelude::*;
+use rusqlite::{params, Connection, Result};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
+use tracing::{info, instrument, warn};
+
+const CHUNK_SIZE: usize = 100;
+
+// ============================================================================
+// POMOCNIKI I STRUKTURY DANYCH (CZYSTE FUNKCJE - PEŁNA TESTOWALNOŚĆ)
+// ============================================================================
+
+/// Formatuje różnicę wagi (bajty) ze znakiem: dodatnia różnica dostaje
+/// jawny prefiks `+` (ujemna ma już `-` z natury formatowania liczby),
+/// wartość bezwzględna przepuszczana przez [`format_bytes`] dla czytelności.
+fn format_delta(bytes: i64) -> String {
+    let sign = if bytes > 0 { "+" } else { "" };
+    format!("{}{}", sign, format_bytes(bytes.unsigned_abs()))
+}
+
+/// Mapuje rozszerzenie pliku na szeroką kategorię tematyczną, używaną
+/// wyłącznie do grupowania w raporcie końcowym (nie wpływa na żadną decyzję
+/// klasyfikacyjną). Rozszerzenia spoza znanych list trafiają do `"inny"`,
+/// dosłowny brak rozszerzenia (`"brak"`) ma własną etykietę.
+fn get_file_category(ext: &str) -> &'static str {
+    match ext {
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" => "archiwum",
+        "docx" | "xlsx" | "pptx" | "pdf" | "odt" | "ods" | "csv" => "dokument",
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "dng" => "obraz",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" => "wideo",
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => "audio",
+        "txt" | "json" | "xml" | "py" | "rs" | "js" | "html" | "css" | "sh" => "tekst/kod",
+        "exe" | "dll" | "so" | "elf" | "bin" | "apk" | "jar" => "wykonywalny",
+        "brak" => "brak rozsz.",
+        _ => "inny",
+    }
+}
+
+/// Klasyfikuje wynik porównania ssdeep DWÓCH WERSJI TEGO SAMEGO pliku (ta
+/// sama ścieżka względna, obecna po obu stronach — UFS vs Skrypt). W tym
+/// kontekście `0%` dopasowania JEST anomalią ("Frankenstein" — zlepek
+/// śmieci), bo oczekujemy wysokiego podobieństwa dla pliku o tej samej
+/// nazwie/ścieżce odzyskanego dwoma niezależnymi programami. Próg `HIGH`
+/// (≥90%) nie jest osobno raportowany jako anomalia — to oczekiwany, zdrowy wynik.
+fn classify_common_match_score(score: u32) -> &'static str {
+    if score == 0 { "FRANKENSTEIN" }
+    else if score < 90 { "PARTIAL" }
+    else { "HIGH" }
+}
+
+/// Klasyfikuje wynik korelacji krzyżowej DWÓCH RÓŻNYCH plików unikalnych
+/// (różne ścieżki, potencjalnie różne nazwy, znalezione tylko po jednej
+/// stronie). Tu `0%` to zwykły BRAK dopasowania (`"NONE"`), NIE anomalia —
+/// zdecydowana większość przypadkowych par plików unikalnych będzie miała
+/// zerowe podobieństwo, to oczekiwane, nie podejrzane (w przeciwieństwie do
+/// [`classify_common_match_score`], gdzie ta sama ścieżka uzasadnia wyższe
+/// oczekiwania).
+fn classify_unique_match_score(score: u32) -> &'static str {
+    if score >= 90 { "TWIN" }
+    else if score > 0 { "PARTIAL" }
+    else { "NONE" }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Task {
+    id: i32,
+    rel_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SideFuzzyResult {
+    id: i32,
+    hash: Option<String>,
+    io_error: Option<bool>,
+}
+
+pub(crate) enum ScanMsg {
+    UfsChunk(Vec<SideFuzzyResult>),
+    ScriptChunk(Vec<SideFuzzyResult>),
+}
+
+/// Liczniki live dla JEDNEJ strony w Etapie 1 (hashowanie CTPH). `computed`
+/// = udane hashe, `too_small` = pliki puste lub zbyt małe dla sensownego
+/// CTPH (ssdeep odrzuca bardzo małe wejścia), `too_large_fallback` = pliki,
+/// dla których `mmap` zawiódł ORAZ rozmiar przekroczył
+/// `config.fuzzy_hash_fallback_max_mb` (pominięte, nie wczytane do RAM w całości).
+pub(crate) struct LiveStats {
+    processed_files: AtomicUsize,
+    processed_bytes: AtomicU64,
+    computed: AtomicUsize,
+    too_small: AtomicUsize,
+    too_large_fallback: AtomicUsize,
+    errors: AtomicUsize,
+    extensions: Mutex<HashMap<String, usize>>, 
+
+    /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
+    /// TEJ strony podczas liczenia sygnatury CTPH (`ssdeep::hash`) — patrz
+    /// moduł `thread_activity`. Dotyczy WYŁĄCZNIE Etapu 1 (hashowanie) —
+    /// Etap 4 (korelacja O(n×m)) tej fazy nie jest tu śledzony.
+    thread_activity: crate::thread_activity::ThreadActivityTracker,
+}
+
+impl LiveStats {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            processed_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            computed: AtomicUsize::new(0),
+            too_small: AtomicUsize::new(0),
+            too_large_fallback: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+            extensions: Mutex::new(HashMap::new()),
+            thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
+        }
+    }
+}
+
+/// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
+/// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
+fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
+    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+}
+
+/// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (Etap 1 —
+/// hashowanie) — prędkość MB/s, top 4 rozszerzenia (licznik wystąpień, nie
+/// waga — inaczej niż w innych fazach), obliczone CTPH, pliki zbyt małe,
+/// pliki pominięte przez fallback RAM, błędy I/O.
+fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
+    let bytes = stats.processed_bytes.load(Ordering::Relaxed);
+    let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+    let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
+
+    let top_ext = {
+        let map = stats.extensions.lock().unwrap();
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        sorted.into_iter().take(4).map(|(k, v)| {
+            let e = if k == "brak" { "brak".to_string() } else { format!(".{}", k) };
+            format!("{} ({})", e, v)
+        }).collect::<Vec<_>>().join(", ")
+    };
+    let display_top = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+
+    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+
+    format!(
+        "[{}]\nPrędkość: {:.2} MB/s\nTop formaty: {}\nSygnatury CTPH obliczone: {}\nZbyt małe (<4KB): {}\nPominięte (fallback RAM): {}\nWątki CTPH (Wariant A): {}\nBłędy I/O: {}",
+        label, speed_mb, display_top,
+        stats.computed.load(Ordering::Relaxed),
+        stats.too_small.load(Ordering::Relaxed),
+        stats.too_large_fallback.load(Ordering::Relaxed),
+        activity_markup,
+        stats.errors.load(Ordering::Relaxed),
+    )
+}
+
+// Struktury dla Raportu Hierarchicznego (Korelacja)
+type ExtMap = HashMap<String, Vec<(String, i64, bool)>>; 
+
+/// Agreguje statystyki jednej kategorii dopasowania (Bliźniaki/Frankensteiny/
+/// Częściowe) do Dziennika Końcowego: liczba plików, suma różnic wag,
+/// liczba pomyłek rozszerzenia, oraz mapa rozszerzenie -> lista przykładów
+/// (ścieżka, delta, czy_pomylone_rozszerzenie).
+struct CategoryStats {
+    count: usize,
+    total_delta: i64,
+    ext_mismatches: usize,
+    extensions: ExtMap,
+}
+impl CategoryStats {
+    fn new() -> Self { Self { count: 0, total_delta: 0, ext_mismatches: 0, extensions: HashMap::new() } }
+    fn add(&mut self, ext: &str, path: String, delta: i64, ext_mismatch: bool) {
+        self.count += 1;
+        self.total_delta += delta;
+        if ext_mismatch { self.ext_mismatches += 1; }
+        self.extensions.entry(ext.to_string()).or_default().push((path, delta, ext_mismatch));
+    }
+}
+
+// ============================================================================
+// ETAP 1: SILNIK GENEROWANIA SYGNATUR CTPH Z WYKORZYSTANIEM MMAP (I/O)
+// ============================================================================
+
+/// Skanuje wszystkie zadania (`tasks`) dla JEDNEJ strony: dla każdego pliku
+/// próbuje wygenerować sygnaturę CTPH przez `mmap` (Zero-Copy). Jeśli `mmap`
+/// zawiedzie, spada na klasyczny bufor `fs::read_to_end` — ale TYLKO gdy
+/// rozmiar pliku nie przekracza `fallback_max_bytes` (parametr, pochodzący z
+/// `config.fuzzy_hash_fallback_max_mb`), inaczej plik jest pomijany
+/// (`too_large_fallback`) zamiast wczytany w całości do RAM. Rozgłasza
+/// postęp i statystyki do UI co ~200 plików LUB co 250ms (hybrydowy próg —
+/// wzorzec z Fazy 5-7/10-13).
+pub struct StreamCtx<'a> {
+    pub base_path: &'a Path,
+    pub tasks: &'a [Task],
+    pub side_label: &'a str,
+    pub stats: &'a LiveStats,
+    pub tx_db: mpsc::SyncSender<ScanMsg>,
+    pub is_ufs: bool,
+    pub start_time: Instant,
+    pub fallback_max_bytes: u64,
+    pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
+    pub bar_idx: usize,
+}
+
+#[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
+
+fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
+    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, start_time, fallback_max_bytes, tx_ui, bar_idx } = ctx;
+
+    tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
+        if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
+
+        let mut results = Vec::with_capacity(chunk.len());
+        let mut last_ui_update = Instant::now();
+
+        for task in chunk {
+            if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+
+            let full_path = base_path.join(&task.rel_path);
+            let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+
+            let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+            {
+                let mut map = stats.extensions.lock().unwrap();
+                *map.entry(ext).or_insert(0) += 1;
+            }
+
+            let mut hash_opt = None;
+            let mut io_err = Some(false);
+
+            if file_size == 0 {
+                stats.too_small.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let file_res = std::fs::File::open(&full_path);
+                if let Ok(mut file) = file_res {
+                    let mmap_res = unsafe { memmap2::MmapOptions::new().map(&file) };
+                    if let Ok(mmap) = mmap_res {
+                        match stats.thread_activity.track_current(|| ssdeep::hash(&mmap)) {
+                            Ok(h) => {
+                                hash_opt = Some(h);
+                                stats.computed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => { stats.too_small.fetch_add(1, Ordering::Relaxed); }
+                        }
+                    } else {
+                        if file_size > fallback_max_bytes {
+                             stats.too_large_fallback.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let mut buffer = Vec::new();
+                            if file.read_to_end(&mut buffer).is_ok() {
+                                if let Ok(h) = stats.thread_activity.track_current(|| ssdeep::hash(&buffer)) {
+                                    hash_opt = Some(h);
+                                    stats.computed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    stats.too_small.fetch_add(1, Ordering::Relaxed);
+                                }
+                            } else {
+                                stats.errors.fetch_add(1, Ordering::Relaxed);
+                                io_err = Some(true);
+                            }
+                        }
+                    }
+                } else {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    io_err = Some(true);
+                }
+            }
+
+            let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+            stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
+
+            let now = Instant::now();
+            // Hybrydowy próg (wzorzec z Fazy 5-7/10-13): licznik globalny jako
+            // główny wyzwalacz (nie resetuje się na granicy paczki), plus
+            // siatka bezpieczeństwa czasowa.
+            let should_update = current.is_multiple_of(200)
+                || now.duration_since(last_ui_update).as_millis() > 250;
+
+            if should_update {
+                last_ui_update = now;
+
+                // PASEK: wyłącznie postęp + bieżący plik (bez liczników)
+                let _ = tx_ui.send(PhaseEvent::UpdateBar {
+                    idx: bar_idx,
+                    current: current as u64,
+                    message: format_display_path(&task.rel_path),
+                });
+                let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
+                    idx: bar_idx,
+                    path: full_path.to_string_lossy().to_string(),
+                });
+
+                // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
+                let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+                    idx: bar_idx,
+                    text: build_source_block(side_label, stats, start_time),
+                });
+            }
+
+            results.push(SideFuzzyResult { id: task.id, hash: hash_opt, io_error: io_err });
+        }
+
+        if !results.is_empty() {
+            if is_ufs { let _ = tx_db.send(ScanMsg::UfsChunk(results)); } 
+            else { let _ = tx_db.send(ScanMsg::ScriptChunk(results)); }
+        }
+    });
+
+    let _ = tx_ui.send(PhaseEvent::UpdateBar {
+        idx: bar_idx,
+        current: stats.processed_files.load(Ordering::Relaxed) as u64,
+        message: "Generowanie sygnatur ssdeep w 100% zakończone.".to_string(),
+    });
+}
+
+/// Formatuje jedną kategorię dopasowania (Bliźniaki/Frankensteiny/Częściowe)
+/// do Dziennika Końcowego: nagłówek + top 5 rozszerzeń z przykładową ścieżką
+/// i deltą wagi per rozszerzenie.
+fn write_category_block(out: &mut String, stats: &CategoryStats, icon: &str) {
+    use std::fmt::Write as FmtWrite;
+
+    if stats.count == 0 { 
+        let _ = writeln!(out, "   [ ✔ ] Brak plików w tej kategorii.");
+        return; 
+    }
+    
+    let _ = writeln!(out, "   [ 👇 ] Zestawienie odnalezionych typów, pomyłek formatów i delt wagowych:");
+    
+    let mut sorted: Vec<_> = stats.extensions.iter().collect();
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len())); 
+    
+    for (ext, paths) in sorted.into_iter().take(5) {
+        let cat = get_file_category(ext);
+        let _ = writeln!(out, "     - {} Typ Pliku: {:<12} [ {:<4} ]: {} plików", icon, cat, ext, paths.len());
+        
+        let (sample_path, sample_delta, sample_mismatch) = &paths[0];
+        let mismatch_warn = if *sample_mismatch { " [ 🚨 BŁĄD ROZSZERZENIA!]" } else { "" };
+        let delta_str = format_delta(*sample_delta);
+        
+        let _ = writeln!(out, "       [ 🔍 ] Przykładowy dowód z tej grupy:");
+        let _ = writeln!(out, "         - Ścieżka: \"{}\"{}", sample_path, mismatch_warn);
+        let _ = writeln!(out, "         - Delta:   {}", delta_str);
+    }
+    let _ = writeln!(out);
+}
+
+// ============================================================================
+// GŁÓWNA FUNKCJA (Entrypoint)
+// ============================================================================
+
+/// Wylicza rozmiar prywatnej puli Rayon przypisywanej JEDNEJ stronie w
+/// Etapie 1 (`CONCURRENT`) — patrz `phase3::compute_half_threads` dla
+/// pełnego uzasadnienia. NIE dotyczy Etapu 4 (korelacja), gdzie nie ma
+/// dwóch stron do podziału — patrz dokumentacja modułu.
+fn compute_half_threads(total_threads: usize) -> usize {
+    std::cmp::max(1, total_threads / 2)
+}
+
+/// Punkt wejścia Fazy 14, wołany przez `menu::actions::run_phase_with_ui`.
+/// Patrz dokumentacja modułu dla opisu dwuetapowej architektury (hashowanie
+/// vs korelacja) i naprawionego braku `CANCEL_SIGNAL` w Etapie 4.
+#[instrument(skip(conn, config, tx_ui), fields(ufs_path = %config.ufs_path, script_path = %config.script_path))]
+pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+    CANCEL_SIGNAL.store(false, Ordering::SeqCst);
+
+    let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 14: Rozmyte Hashowanie (CTPH / ssdeep).".to_string()));
+    
+    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
+    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE" } else { "SEKWENCYJNIE" };
+    let _ = tx_ui.send(PhaseEvent::Log(format!("Metodyka pracy szyny dyskowej: {}", io_text)));
+    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let _ = tx_ui.send(PhaseEvent::Log("Ochrona RAM (mmap): AKTYWNA (Bypass ładowania dla limitu wagi!)".to_string()));
+
+    let fallback_max_bytes = config.fuzzy_hash_fallback_max_mb.saturating_mul(1024 * 1024);
+    let _ = tx_ui.send(PhaseEvent::Log(format!("Limit fallbacku RAM (gdy mmap zawiedzie): {} MB", config.fuzzy_hash_fallback_max_mb)));
+
+    let start_time = Instant::now();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+
+    // TWORZENIE ROZBUDOWANEJ TABELI W BAZIE SQLITE
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS phase14_analysis (
+            file_id INTEGER PRIMARY KEY,
+            match_type TEXT,
+            match_pct REAL,
+            twin_file_path TEXT,
+            delta_bytes INTEGER,
+            extension_mismatch BOOLEAN,
+            FOREIGN KEY(file_id) REFERENCES files(id)
+        )", []
+    )?;
+
+    // INICJALIZACJA DUAL-LOGGING
+    let raport_cfg = config.raporty_faz.get("Faza 14").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
+        katalog: config.log_path.clone(),
+        plik_operacyjny: "raport_operacyjny_faza14.txt".to_string(),
+        plik_dziennika: "dziennik_koncowy_faza14.txt".to_string(),
+    });
+    
+    fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
+    
+    let log_twins_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_zaginione_blizniaki.txt");
+    let log_franks_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_frankensteiny.txt");
+    let log_partial_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_czesciowe_uszkodzenia.txt");
+    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+
+    let log_twins = Arc::new(Mutex::new(File::create(&log_twins_path).unwrap()));
+    let log_franks = Arc::new(Mutex::new(File::create(&log_franks_path).unwrap()));
+    let log_partial = Arc::new(Mutex::new(File::create(&log_partial_path).unwrap()));
+
+    {
+        let _ = writeln!(log_twins.lock().unwrap(), "=== FAZA 14: ZAGINIONE BLIŹNIAKI (Cross-Korelacja Plików Unikalnych) ===\nOdnalezione pliki posiadające różne ścieżki i nazwy, ale w ponad 90% identyczne wnętrze.\nZawierają informacje o różnicy wag (Delta) i potencjalnych błędach odzyskanego rozszerzenia.\n");
+        let _ = writeln!(log_franks.lock().unwrap(), "=== FAZA 14: FRANKENSTEINY (Zlepki binarne) ===\nPliki mające identyczną ścieżkę w UFS i Skrypcie, lecz wykazujące 0% podobieństwa wewnątrz (Całkowicie zniszczone przez File Carvera).\n");
+        let _ = writeln!(log_partial.lock().unwrap(), "=== FAZA 14: CZĘŚCIOWE USZKODZENIA (Przesunięcia Sektorowe) ===\nPliki, których wnętrze jest podobne tylko w 1% - 89% (Częściowo ucięte / zmieszane).\n");
+    }
+
+    // --- ETAP 1A: POBIERANIE ZADAŃ DO HASHOWANIA ---
+    let mut stmt = conn.prepare(
+        "SELECT id, relative_path, found_in_ufs, found_in_script, fuzzy_hash_ufs, fuzzy_hash_script 
+         FROM files 
+         WHERE (hash_match = 0 OR hash_match IS NULL) AND (phase14_done = 0 OR phase14_done IS NULL)"
+    )?;
+    
+    let mut ufs_tasks = Vec::new();
+    let mut script_tasks = Vec::new();
+    let mut skipped = 0;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?))
+    })?;
+
+    for r in rows.filter_map(|r| r.ok()) {
+        let (id, rel, in_u, in_s, h_u, h_s) = r;
+        if in_u && h_u.is_none() { ufs_tasks.push(Task { id, rel_path: rel.clone() }); }
+        if in_s && h_s.is_none() { script_tasks.push(Task { id, rel_path: rel.clone() }); }
+        
+        if (in_u && h_u.is_some()) || (in_s && h_s.is_some()) { skipped += 1; }
+    }
+    drop(stmt);
+
+    let total_db_rows = ufs_tasks.len() + script_tasks.len();
+    
+    if skipped > 0 {
+        let _ = tx_ui.send(PhaseEvent::Log(format!("Wznowienie sesji: Pominięto {} plików z wyliczonym już hashem ssdeep.", skipped)));
+    }
+
+    if total_db_rows == 0 && skipped == 0 {
+        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików spornych (różny hash). Baza aktualna.".to_string()));
+        return Ok(());
+    } else if total_db_rows == 0 {
+        let _ = tx_ui.send(PhaseEvent::Log("✔ Wszystkie pliki zostały już zhashowane. Przechodzę prosto do korelacji w RAM...".to_string()));
+    }
+
+    let half_threads = compute_half_threads(actual_threads);
+    let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
+
+    let ufs_stats = LiveStats::new(activity_slots);
+    let script_stats = LiveStats::new(activity_slots);
+    let ufs_base = PathBuf::from(&config.ufs_path);
+    let script_base = PathBuf::from(&config.script_path);
+
+    // --- ETAP 2 & 3: PRZETWARZANIE STRUMIENIOWE (MPSC) ---
+    if total_db_rows > 0 {
+        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (CTPH)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
+        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (CTPH)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
+        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+
+        std::thread::scope(|s| {
+            let (tx_db, rx_db) = mpsc::sync_channel(200);
+
+            let _db_thread = s.spawn(|| {
+                let mut db_inserted = 0;
+                let mut last_db_update = Instant::now();
+
+                let update_sql = |c: &mut Connection, chunk: &[SideFuzzyResult], is_ufs: bool| {
+                    let tx_trans = c.transaction().unwrap();
+                    {
+                        let mut stmt = match is_ufs {
+                            true => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_ufs = COALESCE(?1, fuzzy_hash_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3").unwrap(),
+                            false => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_script = COALESCE(?1, fuzzy_hash_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3").unwrap()
+                        };
+                        
+                        for res in chunk {
+                            if res.hash.is_some() || res.io_error == Some(true) {
+                                stmt.execute(params![res.hash, res.io_error, res.id]).unwrap();
+                            }
+                        }
+                    }
+                    tx_trans.commit().unwrap();
+                };
+
+                for msg in rx_db {
+                    let c_len = match &msg {
+                        ScanMsg::UfsChunk(chunk) => { update_sql(conn, chunk, true); chunk.len() },
+                        ScanMsg::ScriptChunk(chunk) => { update_sql(conn, chunk, false); chunk.len() },
+                    };
+                    
+                    db_inserted += c_len;
+                    let now = Instant::now();
+                    if now.duration_since(last_db_update).as_millis() > 60 {
+                        last_db_update = now;
+                        let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Zapisywanie hashów CTPH...".to_string() });
+                    }
+                }
+                let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Hashe CTPH w 100% zsynchronizowane z SQLite.".to_string() });
+            });
+
+            if config.io_mode == "CONCURRENT" {
+                let tx1 = tx_db.clone();
+                let tx2 = tx_db.clone();
+
+                // Referencje (nie własność) - ufs_stats/script_stats/ufs_base/
+                // script_base/tx_ui są odczytywane ponownie PO zakończeniu tego
+                // bloku (korelacja Etapu 4, raport końcowy), więc domknięcia
+                // `move` mogą przejąć wyłącznie te referencje, nie same wartości.
+                let stat_u = &ufs_stats;
+                let stat_s = &script_stats;
+                let ufs_base_ref = &ufs_base;
+                let script_base_ref = &script_base;
+                let tx_ui_ref = &tx_ui;
+
+                // NAPRAWA (ten sam bug jak w Fazie 5/6/7/10-13): dedykowana
+                // pula per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
+
+                s.spawn(move || { 
+                    if !ufs_tasks.is_empty() { 
+                        if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                            pool.install(|| {
+                                process_side_stream(StreamCtx { base_path: ufs_base_ref, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, fallback_max_bytes, tx_ui: tx_ui_ref, bar_idx: 0, });
+                            });
+                        } else {
+                            process_side_stream(StreamCtx { base_path: ufs_base_ref, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, fallback_max_bytes, tx_ui: tx_ui_ref, bar_idx: 0, });
+                        }
+                        let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku UFS zakończone.".to_string())); 
+                    } 
+                });
+                s.spawn(move || { 
+                    if !script_tasks.is_empty() { 
+                        if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                            pool.install(|| {
+                                process_side_stream(StreamCtx { base_path: script_base_ref, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, fallback_max_bytes, tx_ui: tx_ui_ref, bar_idx: 1, });
+                            });
+                        } else {
+                            process_side_stream(StreamCtx { base_path: script_base_ref, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, fallback_max_bytes, tx_ui: tx_ui_ref, bar_idx: 1, });
+                        }
+                        let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku Skryptu zakończone.".to_string())); 
+                    } 
+                });
+                drop(tx_db); 
+            } else {
+                if !ufs_tasks.is_empty() { 
+                    process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 0, }); 
+                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku UFS zakończone.".to_string())); 
+                }
+                if !script_tasks.is_empty() { 
+                    process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db, is_ufs: false, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 1, }); 
+                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku Skryptu zakończone.".to_string())); 
+                }
+            }
+        });
+    }
+
+    // --- ETAP 4: BŁYSKAWICZNA KORELACJA W PAMIĘCI RAM Z DELTĄ ---
+    if CANCEL_SIGNAL.load(Ordering::SeqCst) {
+        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        return Ok(());
+    }
+
+    let _ = tx_ui.send(PhaseEvent::Log("🚀 Rozpoczynam korelację krzyżową sygnatur CTPH w pamięci RAM...".to_string()));
+
+    let mut stmt = conn.prepare("SELECT id, relative_path, found_in_ufs, found_in_script, fuzzy_hash_ufs, fuzzy_hash_script FROM files WHERE (hash_match = 0 OR hash_match IS NULL) AND phase14_done = 0")?;
+    
+    struct HashRow { id: i32, rel_path: String, hash_u: Option<String>, hash_s: Option<String> }
+    let mut common_rows = Vec::new();
+    let mut unique_ufs = Vec::new();
+    let mut unique_scr = Vec::new();
+
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?))
+    })?;
+
+    for r in rows.filter_map(|r| r.ok()) {
+        let (id, rel, in_u, in_s, h_u, h_s) = r;
+        if in_u && in_s { common_rows.push(HashRow { id, rel_path: rel, hash_u: h_u, hash_s: h_s }); }
+        else if in_u && h_u.is_some() { unique_ufs.push((id, rel, h_u.unwrap())); }
+        else if in_s && let Some(h) = h_s { unique_scr.push((id, rel, h)); }
+    }
+    drop(stmt);
+
+    let total_correlations = common_rows.len() + unique_ufs.len();
+    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 3, label: "Korelacja Krzyżowa RAM".to_string(), total: total_correlations as u64, color: Color::Yellow });
+
+    let live_twins = Arc::new(AtomicUsize::new(0));
+    let live_franks = Arc::new(AtomicUsize::new(0));
+    let live_partial = Arc::new(AtomicUsize::new(0));
+    let live_mismatches = Arc::new(AtomicUsize::new(0));
+    let live_total_delta = Arc::new(AtomicI64::new(0));
+    let progress_counter = Arc::new(AtomicUsize::new(0));
+
+    let mut db_updates: Vec<(i32, String, f64, Option<String>, i64, bool)> = Vec::new();
+    let db_updates_mtx = Arc::new(Mutex::new(&mut db_updates));
+
+    let ufs_b = ufs_base.clone();
+    let scr_b = script_base.clone();
+    let mut correlation_cancelled = false;
+    
+    // Klasyczna pętla po wspólnych ścieżkach - NAPRAWA: sprawdza CANCEL_SIGNAL
+    for row in common_rows {
+        if CANCEL_SIGNAL.load(Ordering::Relaxed) { correlation_cancelled = true; break; }
+
+        let mut pct = 0.0;
+        let mut m_type = "NONE".to_string();
+        let mut delta = 0;
+        let ext = Path::new(&row.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        
+        if let (Some(hu), Some(hs)) = (&row.hash_u, &row.hash_s)
+            && let Ok(score) = ssdeep::compare(hu, hs) {
+                pct = score as f64;
+                let w_ufs = std::fs::metadata(ufs_b.join(&row.rel_path)).map(|m| m.len() as i64).unwrap_or(0);
+                let w_scr = std::fs::metadata(scr_b.join(&row.rel_path)).map(|m| m.len() as i64).unwrap_or(0);
+                delta = w_ufs - w_scr; 
+                
+                live_total_delta.fetch_add(delta.abs(), Ordering::Relaxed);
+
+                m_type = classify_common_match_score(score as u32).to_string();
+                match m_type.as_str() {
+                    "FRANKENSTEIN" => {
+                        live_franks.fetch_add(1, Ordering::Relaxed);
+                        let _ = writeln!(log_franks.lock().unwrap(), "[Typ: .{:<4}] Ścieżka (0% match, zlepek): \"{}\"", ext, row.rel_path);
+                    }
+                    "PARTIAL" => {
+                        live_partial.fetch_add(1, Ordering::Relaxed);
+                        let delta_s = format_delta(delta);
+                        let _ = writeln!(log_partial.lock().unwrap(), "[Typ: .{:<4}] [{:>3}% match] [Δ: {}] Ścieżka: \"{}\"", ext, score, delta_s, row.rel_path);
+                    }
+                    _ => {}
+                }
+            }
+        db_updates_mtx.lock().unwrap().push((row.id, m_type, pct, None, delta, false));
+        let c = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // Zestawienie wyników korelacji w locie na pasku nr 3
+        if c.is_multiple_of(50) {
+            let m = live_mismatches.load(Ordering::Relaxed);
+            let d_total = format_bytes(live_total_delta.load(Ordering::Relaxed) as u64);
+            let _ = tx_ui.send(PhaseEvent::UpdateBar {
+                idx: 3,
+                current: c as u64,
+                message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", live_twins.load(Ordering::Relaxed), m, d_total),
+            });
+        }
+    }
+
+    let last_ui_update = Arc::new(AtomicU64::new(0)); 
+
+    // Równoległa pętla "każdy z każdym" dla plików unikalnych - NAPRAWA:
+    // sprawdza CANCEL_SIGNAL zarówno przed rozpoczęciem drogiego wewnętrznego
+    // porównania O(m) dla danego elementu, jak i wewnątrz niego (przerywa
+    // wcześniej rozpoczęte porównanie, jeśli anulowanie nadejdzie w trakcie).
+    let cross_results: Vec<_> = if correlation_cancelled {
+        Vec::new()
+    } else {
+        unique_ufs.par_iter().map(|(u_id, u_path, u_hash)| {
+            let ext_ufs = Path::new(&u_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+            let mut best_score = 0;
+            let mut best_match_path = None;
+            let mut delta = 0;
+            let mut ext_mismatch = false;
+
+            if !CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                for (_, s_path, s_hash) in &unique_scr {
+                    if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                    if let Ok(score) = ssdeep::compare(u_hash, s_hash)
+                        && score > best_score {
+                            best_score = score;
+                            best_match_path = Some(s_path.clone());
+                            if score == 100 { break; }
+                        }
+                }
+
+                if best_score > 0
+                    && let Some(ref bp) = best_match_path {
+                        let ext_scr = Path::new(&bp).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+                        if ext_ufs != ext_scr { ext_mismatch = true; }
+
+                        let w_ufs = std::fs::metadata(ufs_b.join(u_path)).map(|m| m.len() as i64).unwrap_or(0);
+                        let w_scr = std::fs::metadata(scr_b.join(bp)).map(|m| m.len() as i64).unwrap_or(0);
+                        delta = w_ufs - w_scr;
+                    }
+            }
+
+            let current = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            let now_ms = start_time.elapsed().as_millis() as u64;
+            let last_ms = last_ui_update.load(Ordering::Relaxed);
+            
+            if now_ms - last_ms > 80
+                && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    let m = live_mismatches.load(Ordering::Relaxed);
+                    let d_total = format_bytes(live_total_delta.load(Ordering::Relaxed) as u64);
+                    let _ = tx_ui.send(PhaseEvent::UpdateBar {
+                        idx: 3,
+                        current: current as u64,
+                        message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", live_twins.load(Ordering::Relaxed), m, d_total),
+                    });
+                }
+
+            (*u_id, u_path.clone(), best_score, best_match_path, delta, ext_mismatch, ext_ufs)
+        }).collect()
+    };
+
+    for (u_id, u_path, score, best_path, delta, ext_mismatch, ext_ufs) in cross_results {
+        if score > 0 { live_total_delta.fetch_add(delta.abs(), Ordering::Relaxed); }
+
+        let m_type = classify_unique_match_score(score as u32).to_string();
+        match m_type.as_str() {
+            "TWIN" => {
+                live_twins.fetch_add(1, Ordering::Relaxed);
+                if ext_mismatch { live_mismatches.fetch_add(1, Ordering::Relaxed); }
+
+                let p = best_path.clone().unwrap_or_default();
+                let d_str = format_delta(delta);
+                let bad_ext_flag = if ext_mismatch { " [ZŁY TYP!]" } else { "" };
+                let _ = writeln!(log_twins.lock().unwrap(), "[{:<4}] [{:>3}%] [Δ: {:>10}]{} UFS: \"{}\" <---> Skrypt: \"{}\"", 
+                    ext_ufs, score, d_str, bad_ext_flag, u_path, p);
+            }
+            "PARTIAL" => { live_partial.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
+        db_updates.push((u_id, m_type, score as f64, best_path, delta, ext_mismatch));
+    }
+
+    if correlation_cancelled {
+        let _ = tx_ui.send(PhaseEvent::Log("🛑 Korelacja krzyżowa przerwana przez użytkownika - zapisuję częściowe wyniki...".to_string()));
+    }
+
+    let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 3, current: total_correlations as u64, message: "Zderzanie sygnatur RAM zakończone sukcesem.".to_string() });
+
+    // --- ETAP 3: ZAPIS DO BAZY ---
+    let _ = tx_ui.send(PhaseEvent::Log("🔄 Eksportowanie relacji dowodowych (Z Deltami) do bazy danych...".to_string()));
+    let tx_trans = conn.transaction()?;
+    {
+        // OPTYMALIZACJA: prepare_cached dla insertów/update'ów
+        let mut stmt_insert = tx_trans.prepare_cached("INSERT OR REPLACE INTO phase14_analysis (file_id, match_type, match_pct, twin_file_path, delta_bytes, extension_mismatch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+        let mut stmt_update = tx_trans.prepare_cached("UPDATE files SET phase14_done = 1 WHERE id = ?1")?;
+        for (id, m_type, pct, twin_path, delta, ext_mism) in &db_updates {
+            stmt_insert.execute(params![id, m_type, pct, twin_path, delta, ext_mism])?;
+            stmt_update.execute(params![id])?;
+        }
+    }
+    tx_trans.commit()?;
+
+    // --- ETAP 4: RAPORT KRYMINALISTYCZNY HIERARCHICZNY ---
+    let mut stats_twins = CategoryStats::new();
+    let mut stats_franks = CategoryStats::new();
+    let mut stats_partial = CategoryStats::new();
+
+    let mut stmt = conn.prepare("SELECT f.relative_path, a.match_type, a.delta_bytes, a.extension_mismatch FROM files f JOIN phase14_analysis a ON f.id = a.file_id WHERE f.phase14_done = 1")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, bool>(3)?)))?;
+    for r in rows.filter_map(|r| r.ok()) {
+        let (path, m_type, delta, ext_mism) = r;
+        let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        match m_type.as_str() {
+            "TWIN" => stats_twins.add(&ext, path, delta, ext_mism),
+            "FRANKENSTEIN" => stats_franks.add(&ext, path, delta, ext_mism),
+            "PARTIAL" => stats_partial.add(&ext, path, delta, ext_mism),
+            _ => {}
+        }
+    }
+    drop(stmt);
+
+    let elapsed = start_time.elapsed();
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
+    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+
+    // -- GENEROWANIE RAPORTU TEKSTOWEGO --
+    let mut log_out = String::new();
+    use std::fmt::Write as FmtWrite;
+
+    let _ = writeln!(&mut log_out, "==========================================================================");
+    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 14 (ROZMYTE HASHOWANIE I KORELACJA CTPH)");
+    let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
+    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
+    let _ = writeln!(&mut log_out, "==========================================================================\n");
+
+    let _ = writeln!(&mut log_out, "[ 1 ] ZAGINIONE BLIŹNIAKI (Korelacja Krzyżowa Plików Unikalnych):");
+    let _ = writeln!(&mut log_out, "   -> Odnaleziono ukryte kopie (Podobieństwo >= 90%): {}", stats_twins.count);
+    if stats_twins.ext_mismatches > 0 {
+        let _ = writeln!(&mut log_out, "      * W tym z pomyłką rozszerzenia: {}", stats_twins.ext_mismatches);
+    }
+    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Programy UFS i Skrypt odzyskały ten sam plik, ale pod zupełnie innymi nazwami lub w innych folderach. Dzięki ssdeep udało się je ze sobą powiązać.");
+    write_category_block(&mut log_out, &stats_twins, "👯‍♂️");
+
+    let _ = writeln!(&mut log_out, "[ 2 ] DETEKCJA PRZESUNIĘĆ SEKTORÓW (Częściowe Uszkodzenia):");
+    let _ = writeln!(&mut log_out, "   -> Zgodność częściowa (1% - 89% match): {}", stats_partial.count);
+    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki posiadają tę samą nazwę i wspólną bazę bitową, ale zauważalnie różnią się objętością. Wymagają ewentualnej, ostrożnej weryfikacji.");
+    write_category_block(&mut log_out, &stats_partial, "🩹");
+
+    let _ = writeln!(&mut log_out, "[ 3 ] ŁOWCA FRANKENSTEINÓW (Zlepki Binarne):");
+    let _ = writeln!(&mut log_out, "   -> Całkowity brak podobieństwa (0% match): {}", stats_franks.count);
+    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: OBA programy zrzuciły pliki o identycznej nazwie i zbliżonej wadze, lecz ich struktura wewnątrz jest całkowicie inna. Są to zlepki śmieci z dysku, mylnie uznane za plik.\n");
+    write_category_block(&mut log_out, &stats_franks, "🧟‍♂️");
+
+    if total_io_errors > 0 {
+        let _ = writeln!(&mut log_out, "\n[ BŁĘDY FIZYCZNE I/O ]");
+        let _ = writeln!(&mut log_out, "   -> Błędy odczytu mmap (OOM/Bad Sector): {}", total_io_errors);
+    }
+
+    if let Ok(mut f) = fs::File::create(&dz_path) {
+        let _ = f.write_all(log_out.as_bytes());
+        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
+    }
+
+    // Wysyłamy również do Ratatui Log Panel
+    for line in log_out.lines() {
+        let _ = tx_ui.send(PhaseEvent::Log(line.to_string()));
+    }
+
+    // Zrzut telemetrii do głównego pliku logów w tle
+    info!(
+        twins = stats_twins.count,
+        franks = stats_franks.count,
+        partials = stats_partial.count,
+        delta_twins = stats_twins.total_delta,
+        czas_trwania_sek = elapsed.as_secs_f64(),
+        "Faza 14 zakończona"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// TESTY JEDNOSTKOWE
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // compute_activity_slots (identyczna logika z Fazy 3-7/10-13)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_activity_slots_concurrent_uses_half_threads() {
+        assert_eq!(compute_activity_slots("CONCURRENT", 4, 2), 2);
+    }
+
+    #[test]
+    fn test_compute_activity_slots_sequential_uses_full_actual_threads() {
+        assert_eq!(compute_activity_slots("SEQUENTIAL", 4, 2), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // format_delta
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_format_delta_positive_gets_plus_sign() {
+        assert_eq!(format_delta(1024), "+1.00 KB");
+    }
+
+    #[test]
+    fn test_format_delta_negative_no_extra_sign() {
+        // format_bytes działa na wartości bezwzględnej, minus pochodzi z
+        // samego faktu, że sign="" dla ujemnych - ale liczba nie ma minusa
+        // w tej implementacji (bezwzględna wartość jest formatowana bez znaku)
+        let result = format_delta(-1024);
+        assert!(!result.starts_with('+'));
+        assert!(result.contains("1.00 KB"));
+    }
+
+    #[test]
+    fn test_format_delta_zero() {
+        assert_eq!(format_delta(0), "0 B");
+    }
+
+    // ------------------------------------------------------------------
+    // get_file_category
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_get_file_category_known_types() {
+        assert_eq!(get_file_category("zip"), "archiwum");
+        assert_eq!(get_file_category("docx"), "dokument");
+        assert_eq!(get_file_category("jpg"), "obraz");
+        assert_eq!(get_file_category("mp4"), "wideo");
+        assert_eq!(get_file_category("mp3"), "audio");
+        assert_eq!(get_file_category("rs"), "tekst/kod");
+        assert_eq!(get_file_category("exe"), "wykonywalny");
+    }
+
+    #[test]
+    fn test_get_file_category_no_extension() {
+        assert_eq!(get_file_category("brak"), "brak rozsz.");
+    }
+
+    #[test]
+    fn test_get_file_category_unknown_extension() {
+        assert_eq!(get_file_category("xyz123"), "inny");
+    }
+
+    // ------------------------------------------------------------------
+    // classify_common_match_score
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_common_zero_is_frankenstein() {
+        assert_eq!(classify_common_match_score(0), "FRANKENSTEIN");
+    }
+
+    #[test]
+    fn test_classify_common_below_90_is_partial() {
+        assert_eq!(classify_common_match_score(1), "PARTIAL");
+        assert_eq!(classify_common_match_score(89), "PARTIAL");
+    }
+
+    #[test]
+    fn test_classify_common_90_and_above_is_high() {
+        assert_eq!(classify_common_match_score(90), "HIGH");
+        assert_eq!(classify_common_match_score(100), "HIGH");
+    }
+
+    // ------------------------------------------------------------------
+    // classify_unique_match_score
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_unique_zero_is_none_not_anomaly() {
+        // Kluczowa różnica względem classify_common_match_score: tu 0% to
+        // zwykły brak dopasowania, NIE anomalia "Frankenstein"
+        assert_eq!(classify_unique_match_score(0), "NONE");
+    }
+
+    #[test]
+    fn test_classify_unique_below_90_is_partial() {
+        assert_eq!(classify_unique_match_score(1), "PARTIAL");
+        assert_eq!(classify_unique_match_score(89), "PARTIAL");
+    }
+
+    #[test]
+    fn test_classify_unique_90_and_above_is_twin() {
+        assert_eq!(classify_unique_match_score(90), "TWIN");
+        assert_eq!(classify_unique_match_score(100), "TWIN");
+    }
+
+    // ------------------------------------------------------------------
+    // CategoryStats
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_category_stats_accumulates_correctly() {
+        let mut stats = CategoryStats::new();
+        stats.add("jpg", "a.jpg".to_string(), 100, false);
+        stats.add("jpg", "b.jpg".to_string(), -50, true);
+        stats.add("png", "c.png".to_string(), 20, false);
+
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.total_delta, 70); // 100 + (-50) + 20
+        assert_eq!(stats.ext_mismatches, 1);
+        assert_eq!(stats.extensions.get("jpg").unwrap().len(), 2);
+        assert_eq!(stats.extensions.get("png").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_category_stats_empty_by_default() {
+        let stats = CategoryStats::new();
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.total_delta, 0);
+        assert_eq!(stats.ext_mismatches, 0);
+        assert!(stats.extensions.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // compute_half_threads / build_source_block
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_half_threads() {
+        assert_eq!(compute_half_threads(8), 4);
+        assert_eq!(compute_half_threads(1), 1);
+    }
+
+    #[test]
+    fn test_build_source_block_reports_counts() {
+        use std::time::Duration;
+        let stats = LiveStats::new(4);
+        stats.computed.store(100, Ordering::Relaxed);
+        stats.too_small.store(5, Ordering::Relaxed);
+        stats.too_large_fallback.store(2, Ordering::Relaxed);
+        stats.errors.store(1, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.starts_with("[UFS Explorer]"));
+        assert!(block.contains("Sygnatury CTPH obliczone: 100"));
+        assert!(block.contains("Zbyt małe (<4KB): 5"));
+        assert!(block.contains("Pominięte (fallback RAM): 2"));
+        assert!(block.contains("Błędy I/O: 1"));
+    }
+
+    #[test]
+    fn test_build_source_block_shows_thread_activity_markup() {
+        use std::time::Duration;
+        let stats = LiveStats::new(2);
+        stats.thread_activity.mark_busy(0);
+
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let line = block.lines().find(|l| l.starts_with("Wątki CTPH")).expect("powinna istnieć linia Wariantu A");
+        assert_eq!(line, "Wątki CTPH (Wariant A): {G:1} {R:2}");
+    }
+
+    #[test]
+    fn test_build_source_block_placeholder_when_no_extensions() {
+        use std::time::Duration;
+        let stats = LiveStats::new(4);
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("Skrypt Autorski", &stats, start_time);
+        assert!(block.contains("Top formaty: Analiza danych..."));
+    }
+}

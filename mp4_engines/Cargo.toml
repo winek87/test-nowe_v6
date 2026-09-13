@@ -1,0 +1,29 @@
+[package]
+name = "mp4_engines"
+version = "0.1.0"
+edition = "2024"
+
+# ============================================================================
+# WSPÓLNE SILNIKI NAPRAWY KONTENERÓW ISOBMFF
+# ============================================================================
+#
+# Crate powstał, bo te same silniki istniały w DWÓCH kopiach — w `mp4_doctor`
+# i w module `mp4_repair` Weryfikatora — i zdążyły się rozjechać. W kopii
+# `mp4_doctor` żyła m.in. wada parsowania SPS (pusty blok macierzy skalowania),
+# naprawiona tylko po naszej stronie, a jej kopia nie miała ani jednego testu.
+#
+# Kierunek scalenia: wygrywa wersja przetestowana. Sprawdzone linia po linii,
+# że jest ścisłym NADZBIOREM — ta sama logika (miejscami przepisana na
+# `contains` zamiast łańcucha porównań), plus poprawki, plus testy; jedyne, co
+# zniknęło, to makro `dlog!` zastąpione przez `tracing`.
+#
+# Weryfikator nie mógł być tu źródłem, bo jest binarką — biblioteka nie może od
+# niego zależeć. Stąd osobny crate, od którego zależą OBA projekty.
+
+[dependencies]
+byteorder = "1.5.0"
+memmap2 = "0.9.11"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

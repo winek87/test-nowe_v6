@@ -1,0 +1,79 @@
+[package]
+name = "Weryfikator"
+version = "0.5.0"
+edition = "2024"
+
+
+[[bin]]
+name = "weryfikator"
+path = "src/main.rs"
+
+#[lints.cargo]
+#non_kebab_case_bins = "allow"
+
+# ============================================================================
+# WORKSPACE
+# ============================================================================
+#
+# `mp4_doctor` jest członkiem workspace'u, nie osobnym projektem obok — dzięki
+# temu dzieli z Weryfikatorem jedną wersję ratatui/crossterm/rusqlite i jeden
+# katalog `target`, a jego biblioteka daje się wołać wprost z menu.
+#
+# `decoder` i `mp4_swarm_server` zostają WYKLUCZONE świadomie:
+# * `decoder` pokrywa się z `mp4_repair::boxes` (parser drzewa ISOBMFF),
+# * `mp4_swarm_server` to serwer HTTP (axum), sensowny tylko przy szukaniu
+#   obcego dawcy przez sygnaturę DNA — czego model dwóch kopii nie potrzebuje.
+#
+# Wykluczenie jest wymagane, nie kosmetyczne: bez niego Cargo odmawia budowy,
+# bo oba leżą w katalogu korzenia workspace'u.
+[workspace]
+members = ["mp4_engines", "mp4/mp4_doctor"]
+exclude = ["mp4/decoder", "mp4/mp4_swarm_server"]
+
+[dependencies]
+rusqlite = "0.40.2"
+
+# Biblioteka `mp4_doctor` — silniki naprawcze MP4 zostały z niej wcześniej
+# PRZENIESIONE do `mp4_repair`, a to zależność na całą reszcie: skaner,
+# sanityzator, poligon i tryby headless, wołane z pozycji w menu.
+mp4_engines = { path = "mp4_engines" }
+mp4_doctor = { path = "mp4/mp4_doctor" }
+serde = { version = "1.0.229", features = ["derive"] }
+blake3 = "1.8.7"
+infer = "0.22.0"
+xattr = "1.6.1"
+filetime = "0.2.29"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time", "local-time"] }
+tracing-appender = "0.2.5"
+rayon = "1.12.0"
+zip = "8.6.0"
+image = "0.25.10"
+libheif-rs = { version = "3.0.0", features = ["embedded-libheif", "image"] }
+exiftool-rs = "0.8.0"
+libc = "0.2.189"
+serde_json = "1.0.151"
+ssdeep = "0.7.0"
+tempfile = "3.27.0"
+ctrlc = "3.5.2"
+dialoguer = "0.12.0"
+rolling-file = "0.2.0"
+jwalk = "0.9.0"
+sysinfo = "0.39.6"
+crossterm = { version = "0.29.0", features = ["libc", "serde"] }
+colored = { version = "3.1.1", features = ["no-color"] }
+memmap2 = "0.9.11"
+yara = { version = "0.32.0", features = ["module-magic"] }
+ratatui = "0.30.2"
+rawloader = "0.37.2"
+mp4 = "0.14.0"
+matroska = "0.30.1"
+
+# --- Rdzeń naprawy MP4 (port silników z projektu mp4_doctor) ---
+# `byteorder` - zapis big-endian przy budowie atomów ISOBMFF.
+# `memchr` - szybkie wyszukiwanie sygnatur w buforze przy skanowaniu NAL.
+byteorder = "1.5.0"
+memchr = "2.8.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"

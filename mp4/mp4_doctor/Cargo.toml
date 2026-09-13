@@ -1,0 +1,53 @@
+[package]
+name = "mp4_doctor"
+version = "2.0.0"
+edition = "2024"
+authors = ["Twój Zespół <twoj@email.com>"]
+description = "Autonomiczny Silnik Heurystyczny do odzyskiwania wideo MP4/MOV"
+
+[lib]
+name = "mp4_doctor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mp4_doctor"
+path = "src/main.rs"
+
+[dependencies]
+# Wspólne silniki naprawy kontenerów ISOBMFF. Wcześniej `mp4_doctor` miał ich
+# WŁASNE kopie (`engine_clone.rs`, `engine_native.rs`, `engine_recontainer.rs`,
+# `validator.rs`), które rozjechały się z wersją Weryfikatora — łącznie z
+# nienaprawioną wadą parsowania SPS. Teraz oba projekty używają jednego źródła.
+mp4_engines = { path = "../../mp4_engines" }
+
+# Terminal UI & Cross-platform terminal control (TUI Migration)
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+
+# Parser argumentów CLI (Przygotowanie pod Headless Mode)
+clap = { version = "4.6", features = ["derive"] }
+
+# Baza danych SQLite (silnik samonauki)
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# Superszybkie przeszukiwanie pamięci RAM dla Cyfrowego DNA
+memchr = "2.8.3"
+byteorder = "1.5.0"
+chrono = { version = "0.4", features = ["serde"] }
+ctrlc = "3.5.2"
+lazy_static = "1.5.0"
+rayon = "1.12.0"
+
+# --- NOWE ZALEŻNOŚCI AI (ENTERPRISE) ---
+
+# Logika Rozmyta (Fuzzy Logic) - do obliczania podobieństwa nieznanego DNA do znanych wzorców
+strsim = "0.11.1"
+
+# Kolektywny Rój - Serializacja bazy danych SQLite do formatu JSON i z powrotem
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+num_cpus = "1.17.0"
+memmap2 = "0.9.11"
+
+[lints.rust]
+unused_imports = "allow"

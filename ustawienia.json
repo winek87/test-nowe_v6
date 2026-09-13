@@ -1,0 +1,105 @@
+{
+  "ufs_path": "/mnt/skrypt_sdb1_ro_root/@snapshots/@data",
+  "script_path": "/mnt/skrypt_sdb1_ro_root/sda1/@data",
+  "target_path": "/media/kopia",
+  "db_path": ".db",
+  "db_file_name": "baza.db",
+  "log_path": "./dziennik",
+  "log_file_name": "weryfikator.log",
+  "csv_report_path": "./raport_koncowy.csv",
+  "raporty_faz": {
+    "Faza 07": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza7_entropia.log",
+      "plik_dziennika": "dziennik_koncowy_faza7_entropia.log"
+    },
+    "Faza 11": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza11_walidacja_archiwow.log",
+      "plik_dziennika": "dziennik_koncowy_faza11_walidacja_archiwow.log"
+    },
+    "Faza 13": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza13_dekodowanie_ram.log",
+      "plik_dziennika": "dziennik_koncowy_faza13_dekodowanie_ram.log"
+    },
+    "Faza 10": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza10_walidacja_tekstu.log",
+      "plik_dziennika": "dziennik_koncowy_faza10_walidacja_tekstu.log"
+    },
+    "Faza 03": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza3_blake3_zgodne.log",
+      "plik_dziennika": "dziennik_koncowy_faza3_blake3_zgodne.log"
+    },
+    "Faza 06": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza6_zawartosc.log",
+      "plik_dziennika": "dziennik_koncowy_faza6_zawartosc.log"
+    },
+    "Faza 16": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza16_yara.log",
+      "plik_dziennika": "dziennik_koncowy_faza16_yara.log"
+    },
+    "Faza 04": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza4_blake3_resztkowe.log",
+      "plik_dziennika": "dziennik_koncowy_faza4_blake3_resztkowe.log"
+    },
+    "Faza 14": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza14_rozmyte_hashowanie.log",
+      "plik_dziennika": "dziennik_koncowy_faza14_rozmyte_hashowanie.log"
+    },
+    "Faza 02": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza2_rozmiary.log",
+      "plik_dziennika": "dziennik_koncowy_faza2_rozmiary.log"
+    },
+    "Faza 05": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza5_inode.log",
+      "plik_dziennika": "dziennik_koncowy_faza5_inode.log"
+    },
+    "Faza 08": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza8_raport_decyzyjny.log",
+      "plik_dziennika": "dziennik_koncowy_faza8_raport_decyzyjny.log"
+    },
+    "Faza 09": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza9_smart_merge.log",
+      "plik_dziennika": "dziennik_koncowy_faza9_smart_merge.log"
+    },
+    "Faza 17": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza17_naprawa_aktywna.log",
+      "plik_dziennika": "dziennik_koncowy_faza17_naprawa_aktywna.log"
+    },
+    "Faza 12": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza12_exif_media.log",
+      "plik_dziennika": "dziennik_koncowy_faza12_exif_media.log"
+    },
+    "Faza 15": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza15_xattr.log",
+      "plik_dziennika": "dziennik_koncowy_faza15_xattr.log"
+    },
+    "Faza 01": {
+      "katalog": "./dziennik/fazy",
+      "plik_operacyjny": "raport_operacyjny_faza1_mapowanie.log",
+      "plik_dziennika": "dziennik_koncowy_faza1_mapowanie.log"
+    }
+  },
+  "phase13_fast_mode": false,
+  "deep_archive_scan": false,
+  "fuzzy_hash_fallback_max_mb": 1024,
+  "log_level": "INFO",
+  "dashboard_refresh_rate": 1000,
+  "max_threads": 0,
+  "io_mode": "SEQUENTIAL",
+  "admin_password_hash": "d289b2da9b7051f36b4e396e0af3e069e78cf119a7fdcb6437b685c4875e9f9e"
+}

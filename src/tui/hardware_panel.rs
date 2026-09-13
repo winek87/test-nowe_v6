@@ -1,0 +1,272 @@
+// src/tui/hardware_panel.rs
+
+//! # Komponenty Sprzętowe i Konfiguracyjne
+//!
+//! Zawiera logikę renderowania bocznych paneli systemowych:
+//! 1. Zużycie procesora i pamięci RAM (Z systemem barw termowizyjnych).
+//! 2. Lista wykrytych i podłączonych dysków.
+//! 3. Aktywna konfiguracja programu (ścieżki, limity, środowisko).
+
+use ratatui::{
+    layout::{Constraint, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    Frame,
+};
+
+use crate::menu::state::AppState;
+
+/// Konwersja procentu obciążenia (0-100) na barwę krytyczną dla TUI (System Termowizji).
+pub fn get_thermal_color_ratatui(pct: f64) -> Color {
+    if pct > 80.0 { Color::Red } 
+    else if pct > 50.0 { Color::Yellow } 
+    else { Color::Green }
+}
+
+/// Wewnętrzna funkcja do bezpiecznego przycinania długich ścieżek, 
+/// pozostawiająca początek i koniec (np. /mnt/.../data)
+fn truncate_path(path: &str, max_len: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() > max_len {
+        let half = (max_len.saturating_sub(3)) / 2;
+        if half == 0 { return path.to_string(); }
+        let start: String = chars[..half].iter().collect();
+        let end: String = chars[chars.len() - half..].iter().collect();
+        format!("{}...{}", start, end)
+    } else {
+        path.to_string()
+    }
+}
+
+pub fn draw_hw_panel(f: &mut Frame, app: &AppState, area: Rect) {
+    let cpu_color = get_thermal_color_ratatui(app.cpu_usage as f64);
+    let ram_color = get_thermal_color_ratatui(app.ram_pct);
+
+    let hw_text = Line::from(vec![
+        Span::styled(" [ 💻 ] CPU: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:>5.1}%", app.cpu_usage), Style::default().fg(cpu_color).add_modifier(Modifier::BOLD)),
+        Span::raw("   |   "),
+        Span::styled("[ 🧠 ] RAM: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.1} / {:.1} GB ({:.1}%)", app.ram_used_gb, app.ram_total_gb, app.ram_pct),
+            Style::default().fg(ram_color).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let hw_paragraph = Paragraph::new(hw_text).block(Block::default().borders(Borders::ALL).title(" Zasoby Systemowe "));
+    f.render_widget(hw_paragraph, area);
+}
+
+pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect) {
+    let mut disk_rows = Vec::new();
+    for disk in &app.disk_list {
+        let free_color = if disk.available_gb > 50.0 { Color::Green } else if disk.available_gb > 10.0 { Color::Yellow } else { Color::Red };
+        disk_rows.push(Row::new(vec![
+            Cell::from(format!("[ 💽 ] /dev/{}", disk.name)).style(Style::default().fg(Color::Cyan)),
+            Cell::from(disk.mount_point.clone()),
+            Cell::from(format!("{:.1} / {:.1} GB", disk.used_gb, disk.total_gb)),
+            Cell::from(format!("{:.1} GB", disk.available_gb)).style(Style::default().fg(free_color)),
+            Cell::from(format!("{:.1}%", disk.usage_pct)),
+        ]));
+    }
+    let disks_table = Table::new(disk_rows, &[
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(20),
+        Constraint::Percentage(15),
+        Constraint::Percentage(15),
+    ])
+    .header(Row::new(vec![
+        "[ 💽 ] URZĄDZENIE", "PUNKT MONTOWANIA", "ZAJĘTE / RAZEM GB", "WOLNE GB", "Zajętość %"]).style(Style::default().fg(Color::DarkGray)))
+    .block(Block::default().borders(Borders::ALL).title(" Dyski Fizyczne "));
+    f.render_widget(disks_table, area);
+}
+
+pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
+    let max_path_len = area.width.saturating_sub(25) as usize;
+    let ufs_trunc = truncate_path(&app.ustawienia.ufs_path, max_path_len);
+    let scr_trunc = truncate_path(&app.ustawienia.script_path, max_path_len);
+    let log_trunc = truncate_path(&app.ustawienia.log_path, max_path_len);
+
+    let db_info = format!("{} ({:.1} MB | Zabezpieczone: {})", app.ustawienia.db_file_name, app.db_file_size_mb, app.db_records_count);
+    
+    let io_str = if app.ustawienia.io_mode == "CONCURRENT" { "RÓWNOLEGŁY" } else { "SEKWENCYJNY" };
+    let threads_str = if app.ustawienia.max_threads == 0 { "AUTO".to_string() } else { app.ustawienia.max_threads.to_string() };
+    let fast_str = if app.ustawienia.phase13_fast_mode { "TAK" } else { "NIE" };
+
+    let mut paths_text = vec![
+        Line::from(vec![
+            Span::styled(" [ 📂 ] Źródło UFS:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(ufs_trunc, Style::default().fg(Color::Yellow))
+        ]),
+        Line::from(vec![
+            Span::styled(" [ 📂 ] Skrypt Aut.:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(scr_trunc, Style::default().fg(Color::Yellow))
+        ]),
+        Line::from(vec![
+            Span::styled(" [ 📚 ] Baza Danych:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate_path(&db_info, max_path_len), Style::default().fg(Color::Green))
+        ]),
+        Line::from(vec![
+            Span::styled(" [ 📝 ] Ścieżka Logów: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(log_trunc, Style::default().fg(Color::Cyan))
+        ]),
+        Line::from(vec![
+            Span::styled(" [ 💡 ] Parametry:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Tryb I/O:     {}", io_str), Style::default().fg(Color::White))
+        ]),
+        Line::from(vec![
+            Span::styled("                      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Wątki CPU:   {}", threads_str), Style::default().fg(Color::White))
+        ]),
+        Line::from(vec![
+            Span::styled("                      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Szybki Skan: {}", fast_str), Style::default().fg(Color::White))
+        ]),
+    ];
+
+    // Widoczne TYLKO gdy jest faktycznie coś do przejrzenia - nie zaśmieca
+    // dashboardu, gdy narzędzie Składania Strukturalnego DNG nigdy nie było
+    // używane albo wszystko zostało już przejrzane.
+    if app.dng_pending_review > 0 {
+        paths_text.push(Line::from(vec![
+            Span::styled(" [ 🧩 ] DNG do przeglądu: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", app.dng_pending_review), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    let paths_paragraph = Paragraph::new(paths_text).block(Block::default().borders(Borders::ALL).title(" Konfiguracja Środowiska "));
+    f.render_widget(paths_paragraph, area);
+}
+
+// ============================================================================
+// TESTY JEDNOSTKOWE
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Ustawienia;
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+    fn ekran(bufor: &ratatui::buffer::Buffer) -> String {
+        (0..bufor.area.height)
+            .map(|y| (0..bufor.area.width).map(|x| bufor[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Renderuje wskazany panel na pustym terminalu i zwraca to, co widać.
+    fn wyrenderuj(
+        szer: u16,
+        wys: u16,
+        u: &mut Ustawienia,
+        rysuj: impl Fn(&mut Frame, &AppState, Rect),
+    ) -> String {
+        let mut app = AppState::new(u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+        let mut terminal = Terminal::new(TestBackend::new(szer, wys)).unwrap();
+        terminal.draw(|f| { let obszar = f.area(); rysuj(f, &app, obszar); }).unwrap();
+        ekran(terminal.backend().buffer())
+    }
+
+    // ------------------------------------------------------------------
+    // PRÓG TERMICZNY
+    // ------------------------------------------------------------------
+
+    /// Kolor jest jedynym sygnałem obciążenia, jaki operator widzi kątem oka —
+    /// progi muszą być dokładnie tam, gdzie je zadeklarowano.
+    #[test]
+    fn test_progi_kolorow_obciazenia() {
+        assert_eq!(get_thermal_color_ratatui(0.0), Color::Green);
+        assert_eq!(get_thermal_color_ratatui(50.0), Color::Green, "Równo 50 to jeszcze zielony");
+        assert_eq!(get_thermal_color_ratatui(50.1), Color::Yellow);
+        assert_eq!(get_thermal_color_ratatui(80.0), Color::Yellow, "Równo 80 to jeszcze żółty");
+        assert_eq!(get_thermal_color_ratatui(80.1), Color::Red);
+        assert_eq!(get_thermal_color_ratatui(100.0), Color::Red);
+    }
+
+    #[test]
+    fn test_wartosci_spoza_zakresu_nie_wywracaja_progow() {
+        assert_eq!(get_thermal_color_ratatui(-5.0), Color::Green);
+        assert_eq!(get_thermal_color_ratatui(500.0), Color::Red);
+        assert_eq!(get_thermal_color_ratatui(f64::NAN), Color::Green, "NaN nie przechodzi porównań");
+    }
+
+    // ------------------------------------------------------------------
+    // SKRACANIE ŚCIEŻEK
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_krotka_sciezka_zostaje_nietknieta() {
+        assert_eq!(truncate_path("/mnt/dane", 40), "/mnt/dane");
+    }
+
+    #[test]
+    fn test_dluga_sciezka_zachowuje_poczatek_i_koniec() {
+        let dluga = "/mnt/skrypt_sdb1_ro_root/@snapshots/@data/zdjecia/2026";
+        let skrocona = truncate_path(dluga, 20);
+
+        assert!(skrocona.len() < dluga.len(), "Ścieżka musi zostać skrócona");
+        assert!(skrocona.contains("..."), "Skrócenie musi być widoczne");
+        assert!(skrocona.starts_with("/mnt"), "Początek mówi, który to dysk");
+        assert!(skrocona.ends_with("2026"), "Koniec mówi, co jest przetwarzane");
+    }
+
+    /// Skracanie działa na ZNAKACH, nie bajtach — inaczej cięcie polskiej
+    /// ścieżki rozwaliłoby znak wielobajtowy i wysypało render.
+    #[test]
+    fn test_skracanie_nie_tnie_znakow_wielobajtowych() {
+        let z_ogonkami = "/mnt/zdjęcia/wakacje_zażółć_gęślą_jaźń/plik.dng";
+        let skrocona = truncate_path(z_ogonkami, 20);
+        assert!(skrocona.chars().count() <= 21, "Długość liczona w znakach: {}", skrocona);
+    }
+
+    #[test]
+    fn test_skrajnie_maly_limit_nie_wywraca_skracania() {
+        for limit in [0usize, 1, 2, 3] {
+            let _ = truncate_path("/bardzo/dluga/sciezka/do/pliku", limit);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // RENDEROWANIE
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_panel_sprzetu_pokazuje_cpu_i_ram() {
+        let mut u = Ustawienia::default();
+        let widok = wyrenderuj(80, 12, &mut u, draw_hw_panel);
+        assert!(widok.contains("CPU"), "Brak sekcji CPU:\n{}", widok);
+        assert!(widok.contains("RAM"), "Brak sekcji RAM:\n{}", widok);
+    }
+
+    /// Panel pokazuje ŹRÓDŁA, bazę, logi i parametry pracy. Ścieżki docelowej
+    /// (`target_path`) w nim nie ma — to nie przeoczenie testu, tylko zakres
+    /// tego panelu.
+    #[test]
+    fn test_panel_sciezek_pokazuje_zrodla_i_parametry() {
+        let mut u = Ustawienia::default();
+        u.ufs_path = "/moje/zrodlo/ufs".to_string();
+        u.io_mode = "SEQUENTIAL".to_string();
+        u.max_threads = 0;
+
+        let widok = wyrenderuj(140, 14, &mut u, draw_paths_panel);
+
+        assert!(widok.contains("/moje/zrodlo/ufs"), "Brak ścieżki UFS:\n{}", widok);
+        assert!(widok.contains("SEKWENCYJNY"), "Tryb I/O musi być rozwinięty do słowa:\n{}", widok);
+        assert!(widok.contains("AUTO"), "Zero wątków musi być pokazane jako AUTO:\n{}", widok);
+    }
+
+    /// Rysowanie nie może panikować na skrajnych rozmiarach — operator bywa na
+    /// konsoli szeregowej albo w wąskim panelu bocznym.
+    #[test]
+    fn test_panele_nie_panikuja_na_skrajnych_rozmiarach() {
+        let mut u = Ustawienia::default();
+        for (szer, wys) in [(1u16, 1u16), (10, 3), (20, 5), (200, 60)] {
+            let _ = wyrenderuj(szer, wys, &mut u, draw_hw_panel);
+            let _ = wyrenderuj(szer, wys, &mut u, draw_disks_panel);
+            let _ = wyrenderuj(szer, wys, &mut u, draw_paths_panel);
+        }
+    }
+}
