@@ -94,6 +94,25 @@ fn plik_same_zera(sciezka: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Czyta co najwyżej pierwsze `ile` bajtów pliku (mniej, gdy plik jest
+/// krótszy) — do kontroli magic-bytes, gdzie sprawdzenie kilkunastu bajtów
+/// nagłówka nie wymaga wczytywania całego pliku do RAM, tak jak
+/// [`plik_same_zera`].
+fn czytaj_prefiks(sciezka: &Path, ile: usize) -> std::result::Result<Vec<u8>, WynikWeryfikacji> {
+    use std::io::Read;
+    let mut plik = match std::fs::File::open(sciezka) {
+        Ok(f) => f,
+        Err(e) => return Err(Err(format!("nie udało się odczytać naprawionego pliku: {}", e))),
+    };
+    let mut bufor = vec![0u8; ile];
+    let wczytano = match plik.read(&mut bufor) {
+        Ok(n) => n,
+        Err(e) => return Err(Err(format!("nie udało się odczytać naprawionego pliku: {}", e))),
+    };
+    bufor.truncate(wczytano);
+    Ok(bufor)
+}
+
 /// Weryfikuje naprawiony plik metodą właściwą dla JEGO rozszerzenia.
 ///
 /// ## Dlaczego to istnieje
@@ -315,6 +334,80 @@ pub fn weryfikuj_naprawiony_plik(sciezka: &Path) -> WynikWeryfikacji {
                 return Err("brak znacznika %%EOF w końcówce pliku".to_string());
             }
             Ok("nagłówek %PDF- i znacznik %%EOF na miejscu (gwarancja SŁABA - bez parsowania obiektów)")
+        }
+
+        // --- RIFF (WAV/AVI), MP3, ASF (WMV/WMA), OLE2/CFBF (DOC/XLS/PPT) ---
+        //
+        // Te formaty wpadały wcześniej do gałęzi domyślnej — sama niepustość
+        // i brak samych zer wystarczały, więc bajtowe zszycie dwóch
+        // NIEPOWIĄZANYCH plików przez `splice::SpliceModule` (stosuje się do
+        // DOWOLNEGO rozszerzenia przy `match_type = PARTIAL` z Fazy 14)
+        // przechodziło bez oporu, mimo że każdy z tych formatów ma czym się
+        // bronić na tanim poziomie samego nagłówka — ten sam duch co
+        // istniejące kontrole `pdf`/`tar` wyżej: bez pełnego parsera, ale
+        // jawnie i uczciwie SŁABE, zamiast udawać brak metody tam, gdzie
+        // metoda istnieje.
+        //
+        // `.docx`/`.xlsx`/`.pptx` (OOXML, format ZIP) mają już pełną
+        // weryfikację CRC32 przez gałąź `is_zip_based_extension` wyżej — to
+        // dotyczy WYŁĄCZNIE starszego, binarnego formatu (Office 97-2003).
+        "wav" => {
+            let prefiks = match czytaj_prefiks(sciezka, 12) { Ok(p) => p, Err(w) => return w };
+            if prefiks.len() >= 12 && &prefiks[0..4] == b"RIFF" && &prefiks[8..12] == b"WAVE" {
+                Ok("nagłówek RIFF/WAVE na miejscu (gwarancja SŁABA - bez parsowania chunków audio)")
+            } else {
+                Err("brak nagłówka RIFF/WAVE - nie jest to poprawny plik WAV".to_string())
+            }
+        }
+
+        "avi" => {
+            let prefiks = match czytaj_prefiks(sciezka, 12) { Ok(p) => p, Err(w) => return w };
+            if prefiks.len() >= 12 && &prefiks[0..4] == b"RIFF" && &prefiks[8..12] == b"AVI " {
+                Ok("nagłówek RIFF/AVI na miejscu (gwarancja SŁABA - bez parsowania listy klatek)")
+            } else {
+                Err("brak nagłówka RIFF/AVI - nie jest to poprawny plik AVI".to_string())
+            }
+        }
+
+        // MP3 nie ma jednego stałego nagłówka: plik może zaczynać się od
+        // znacznika ID3 (metadane) ALBO wprost od pierwszej ramki MPEG audio
+        // (11-bitowa synchronizacja: 0xFF, potem górne 3 bity ustawione).
+        // Naprawiony/zszyty plik bez ID3 jest w pełni legalny, więc obie
+        // ścieżki są akceptowane.
+        "mp3" => {
+            let prefiks = match czytaj_prefiks(sciezka, 4) { Ok(p) => p, Err(w) => return w };
+            let ma_id3 = prefiks.len() >= 3 && &prefiks[0..3] == b"ID3";
+            let ma_synchronizacje_ramki = prefiks.len() >= 2 && prefiks[0] == 0xFF && (prefiks[1] & 0xE0) == 0xE0;
+            if ma_id3 || ma_synchronizacje_ramki {
+                Ok("znacznik ID3 albo synchronizacja ramki MPEG audio na miejscu (gwarancja SŁABA - bez dekodowania próbek)")
+            } else {
+                Err("brak znacznika ID3 i brak synchronizacji ramki MPEG audio na początku pliku".to_string())
+            }
+        }
+
+        "wmv" | "wma" => {
+            // GUID nagłówka ASF ({75B22630-668E-11CF-A6D9-00AA0062CE6C}),
+            // zapisany w kolejności bajtów pliku (mieszany endian GUID-a).
+            const ASF_HEADER_GUID: [u8; 16] = [
+                0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
+                0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+            ];
+            let prefiks = match czytaj_prefiks(sciezka, 16) { Ok(p) => p, Err(w) => return w };
+            if prefiks.len() >= 16 && prefiks[..16] == ASF_HEADER_GUID {
+                Ok("GUID nagłówka ASF na miejscu (gwarancja SŁABA - bez parsowania obiektów strumienia)")
+            } else {
+                Err("brak GUID-a nagłówka ASF - nie jest to poprawny plik WMV/WMA".to_string())
+            }
+        }
+
+        "doc" | "xls" | "ppt" => {
+            const OLE2_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+            let prefiks = match czytaj_prefiks(sciezka, 8) { Ok(p) => p, Err(w) => return w };
+            if prefiks.len() >= 8 && prefiks[..8] == OLE2_MAGIC {
+                Ok("sygnatura OLE2/CFBF na miejscu (gwarancja SŁABA - bez parsowania strumieni złożonego dokumentu)")
+            } else {
+                Err("brak sygnatury OLE2/CFBF - nie jest to poprawny binarny plik Office (.doc/.xls/.ppt)".to_string())
+            }
         }
 
         // Brak metody dla formatu: NIE udajemy dowodu. Sprawdzamy tylko, że
@@ -691,6 +784,108 @@ mod tests {
 
         let bez_konca = zapisz(dir.path(), "bez_konca.pdf", b"%PDF-1.7\njakas tresc\n");
         assert!(weryfikuj_naprawiony_plik(&bez_konca).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA: formaty, które wcześniej wpadały w gałąź domyślną (sama
+    // niepustość, brak samych zer) — `splice::SpliceModule` stosuje się do
+    // DOWOLNEGO rozszerzenia przy `match_type = PARTIAL`, więc bajtowe
+    // zszycie dwóch niepowiązanych plików tych formatów przechodziło bez
+    // oporu. Sedno testów: śmieci z odpowiednim rozszerzeniem muszą zostać
+    // ODRZUCONE (gałąź domyślna by je przyjęła), a prawdziwy nagłówek musi
+    // przejść z jawnie SŁABĄ gwarancją.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_weryfikacja_wav_wymaga_naglowka_riff_wave() {
+        let dir = tempdir().unwrap();
+
+        let mut dobry = b"RIFF".to_vec();
+        dobry.extend_from_slice(&100u32.to_le_bytes());
+        dobry.extend_from_slice(b"WAVE");
+        dobry.extend_from_slice(b"reszta danych audio, tresc bez znaczenia dla samego naglowka");
+        let p_ok = zapisz(dir.path(), "ok.wav", &dobry);
+        let wynik = weryfikuj_naprawiony_plik(&p_ok);
+        assert!(wynik.is_ok(), "poprawny nagłówek RIFF/WAVE musi przejść: {:?}", wynik);
+        assert!(wynik.unwrap().contains("SŁABA"));
+
+        let p_smieci = zapisz(dir.path(), "smieci.wav", b"to zupelnie nie jest plik WAV, tylko tekst");
+        assert!(weryfikuj_naprawiony_plik(&p_smieci).is_err(), "śmieci z rozszerzeniem .wav muszą zostać odrzucone");
+    }
+
+    #[test]
+    fn test_weryfikacja_avi_wymaga_naglowka_riff_avi() {
+        let dir = tempdir().unwrap();
+
+        let mut dobry = b"RIFF".to_vec();
+        dobry.extend_from_slice(&200u32.to_le_bytes());
+        dobry.extend_from_slice(b"AVI ");
+        dobry.extend_from_slice(b"reszta strumienia, tresc bez znaczenia dla samego naglowka");
+        let p_ok = zapisz(dir.path(), "ok.avi", &dobry);
+        assert!(weryfikuj_naprawiony_plik(&p_ok).is_ok());
+
+        // Sedno: sama sygnatura "RIFF" NIE WYSTARCZA - .wav ma ją też, a to
+        // jest inny podtyp kontenera. Musi się nie zgadzać.
+        let mut zle_riff = b"RIFF".to_vec();
+        zle_riff.extend_from_slice(&100u32.to_le_bytes());
+        zle_riff.extend_from_slice(b"WAVE");
+        let p_zle = zapisz(dir.path(), "podszywka.avi", &zle_riff);
+        assert!(
+            weryfikuj_naprawiony_plik(&p_zle).is_err(),
+            "RIFF/WAVE podszywający się pod .avi musi zostać odrzucony - to zły podtyp kontenera"
+        );
+    }
+
+    #[test]
+    fn test_weryfikacja_mp3_przyjmuje_id3_i_synchronizacje_ramki() {
+        let dir = tempdir().unwrap();
+
+        let mut z_id3 = b"ID3".to_vec();
+        z_id3.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        z_id3.extend_from_slice(b"reszta pliku mp3, tresc bez znaczenia");
+        let p_id3 = zapisz(dir.path(), "z_id3.mp3", &z_id3);
+        assert!(weryfikuj_naprawiony_plik(&p_id3).is_ok(), "plik z nagłówkiem ID3 musi przejść");
+
+        // Bez ID3, wprost od pierwszej ramki MPEG audio (synchronizacja
+        // 11-bitowa: 0xFF + górne 3 bity ustawione) - w pełni legalny plik
+        // MP3, dokładnie to, co naprawiony/zszyty plik może wyglądać.
+        let mut bez_id3 = vec![0xFFu8, 0xFB, 0x90, 0x00];
+        bez_id3.extend_from_slice(b"reszta ramek audio");
+        let p_bez_id3 = zapisz(dir.path(), "bez_id3.mp3", &bez_id3);
+        assert!(weryfikuj_naprawiony_plik(&p_bez_id3).is_ok(), "plik zaczynający się wprost od ramki MPEG audio musi przejść");
+
+        let p_smieci = zapisz(dir.path(), "smieci.mp3", b"to zupelnie nie jest plik mp3");
+        assert!(weryfikuj_naprawiony_plik(&p_smieci).is_err());
+    }
+
+    #[test]
+    fn test_weryfikacja_wmv_wma_wymaga_guid_naglowka_asf() {
+        let dir = tempdir().unwrap();
+
+        let mut dobry = vec![0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C];
+        dobry.extend_from_slice(b"reszta obiektow ASF, tresc bez znaczenia");
+        let p_wmv = zapisz(dir.path(), "ok.wmv", &dobry);
+        assert!(weryfikuj_naprawiony_plik(&p_wmv).is_ok());
+        let p_wma = zapisz(dir.path(), "ok.wma", &dobry);
+        assert!(weryfikuj_naprawiony_plik(&p_wma).is_ok(), "ten sam kontener ASF obsługuje też .wma");
+
+        let p_smieci = zapisz(dir.path(), "smieci.wmv", b"to zupelnie nie jest plik ASF/WMV");
+        assert!(weryfikuj_naprawiony_plik(&p_smieci).is_err());
+    }
+
+    #[test]
+    fn test_weryfikacja_doc_xls_ppt_wymaga_sygnatury_ole2() {
+        let dir = tempdir().unwrap();
+
+        let mut dobry = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        dobry.extend_from_slice(b"reszta strumieni skladnika OLE2, tresc bez znaczenia");
+        for rozszerzenie in ["doc", "xls", "ppt"] {
+            let p = zapisz(dir.path(), &format!("ok.{}", rozszerzenie), &dobry);
+            assert!(weryfikuj_naprawiony_plik(&p).is_ok(), "poprawna sygnatura OLE2 musi przejść dla .{}", rozszerzenie);
+        }
+
+        let p_smieci = zapisz(dir.path(), "smieci.doc", b"to zupelnie nie jest plik Office");
+        assert!(weryfikuj_naprawiony_plik(&p_smieci).is_err());
     }
 
     #[test]
