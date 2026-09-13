@@ -449,7 +449,15 @@ fn test_m6_concurrency_stress_live_rendering_during_event_burst() {
 // SUITE 2: TERMINAL LIFECYCLE & SIGNAL STRESS
 // =========================================================================
 
+// Zmierzone empirycznie na tym środowisku: ~2s na każdy cykl
+// `TerminalGuard::init()`/`restore()` w prawdziwym PTY (prawdopodobnie
+// zapytanie DSR o pozycję kursora, na które w sztucznym PTY bez
+// prawdziwego emulatora terminala nikt nie odpowiada, aż do timeoutu) - przy
+// 100 cyklach to ~200s. Ten jeden test odpowiadał za połowę czasu całego
+// `cargo test --workspace` w tym repo. Reszta testów w tym pliku jest szybka
+// (<10s każdy) i zostaje uruchamiana domyślnie.
 #[test]
+#[ignore = "Test PTY - 100 cykli init/restore w prawdziwym pseudoterminalu, ~200s. Uruchom z --ignored."]
 fn test_m6_terminal_lifecycle_100_rapid_toggles_pty() {
     let _guard = PTY_TEST_LOCK.lock().unwrap();
     let pty = PtyTestEnvironment::new().expect("Failed to initialize PTY");
@@ -529,7 +537,10 @@ fn test_m6_terminal_lifecycle_100_rapid_toggles_pty() {
     assert!(!pty.is_raw_mode_active());
 }
 
+// Ten sam koszt ~2s/cykl co `test_m6_terminal_lifecycle_100_rapid_toggles_pty`
+// wyżej, tu przez 100 cykli RAII drop zamiast jawnego `restore()`.
 #[test]
+#[ignore = "Test PTY - 100 cykli RAII drop w prawdziwym pseudoterminalu, ~200s. Uruchom z --ignored."]
 fn test_m6_terminal_lifecycle_100_raii_drops_pty() {
     let _guard = PTY_TEST_LOCK.lock().unwrap();
     let pty = PtyTestEnvironment::new().expect("Failed to initialize PTY");

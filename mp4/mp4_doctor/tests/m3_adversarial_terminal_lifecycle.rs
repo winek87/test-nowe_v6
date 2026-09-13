@@ -539,7 +539,16 @@ fn test_headless_execution_in_pty_no_alternate_screen_no_raw_mode() {
 // ---------------------------------------------------------------------------
 // TEST 8: TerminalGuard Rapid Re-init & Drop Churn Stress
 // ---------------------------------------------------------------------------
+// Zmierzone empirycznie: ~2s na każdy cykl `TerminalGuard::init()`/drop w
+// prawdziwym PTY (prawdopodobnie zapytanie DSR o pozycję kursora, na które w
+// sztucznym PTY bez prawdziwego emulatora terminala nikt nie odpowiada, aż do
+// timeoutu) - przy 50 cyklach to ~100s. Razem z analogicznymi testami w
+// `m6_adversarial_hardening.rs` te kilka testów odpowiadało za większość
+// czasu całego `cargo test --workspace` w tym repo. Pozostałe testy PTY w tym
+// pliku są znacznie szybsze (pojedyncze cykle, <5s) i zostają uruchamiane
+// domyślnie.
 #[test]
+#[ignore = "Test PTY - 50 cykli init/drop w prawdziwym pseudoterminalu, ~100s. Uruchom z --ignored."]
 fn test_terminal_guard_rapid_reinit_churn_stress() {
     let _guard = PTY_TEST_LOCK.lock().unwrap();
     let pty = PtyTestEnvironment::new().expect("Failed to initialize PTY for churn stress");
@@ -590,7 +599,10 @@ fn test_terminal_guard_rapid_reinit_churn_stress() {
 // ---------------------------------------------------------------------------
 // TEST 9: TerminalGuard Concurrency & Race Condition Challenge
 // ---------------------------------------------------------------------------
+// Ten sam koszt ~2s/cykl co `test_terminal_guard_rapid_reinit_churn_stress`
+// wyżej, tu przez 20 cykli init/restore pod współbieżnym spamem force_restore.
 #[test]
+#[ignore = "Test PTY - 20 cykli init/restore w prawdziwym pseudoterminalu pod współbieżnym obciążeniem, ~40s. Uruchom z --ignored."]
 fn test_terminal_guard_concurrent_force_restore_during_lifecycle() {
     let _guard = PTY_TEST_LOCK.lock().unwrap();
     let pty = PtyTestEnvironment::new().expect("Failed to initialize PTY for race challenge");
