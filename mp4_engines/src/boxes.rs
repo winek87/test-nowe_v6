@@ -41,9 +41,47 @@ impl BoxInfo {
     }
 }
 
-/// Odczytuje listę boxów najwyższego poziomu. Zatrzymuje się (bez błędu) na
-/// pierwszym boxie o niespójnym rozmiarze — plik uszkodzony w tym miejscu
-/// nadal ma wartościowe boxy przed nim.
+/// Odczytuje listę boxów najwyższego poziomu.
+///
+/// Zatrzymuje się (bez błędu) na pierwszym boxie, którego nagłówek jest
+/// wewnętrznie sprzeczny (rozmiar mniejszy niż sam nagłówek) — plik
+/// uszkodzony w tym miejscu nadal ma wartościowe boxy przed nim.
+///
+/// ## Box ucięty na granicy pliku: PRZYCIĘTY do EOF, nie odrzucony
+///
+/// Gdy nagłówek jest CZYTELNY, ale zadeklarowany rozmiar wychodzi poza
+/// koniec bufora, box jest przycinany do tego, co fizycznie jest —
+/// analogicznie do konwencji `size32 == 0` ("box sięga do końca pliku"),
+/// tylko wywnioskowanej z ucięcia zamiast zadeklarowanej wprost.
+///
+/// Poprzednio taki box był w całości POMIJANY — a to NAJCZĘSTSZY wzorzec
+/// uszkodzenia, jaki widzi to narzędzie: plik ucięty w środku `mdat` (ostatni
+/// atom najwyższego poziomu w typowym pliku). Skutek dla narzędzia do
+/// ODZYSKU danych był odwrotny do zamierzonego: `find_box(..., b"mdat")`
+/// zwracał `None` dla pliku, który fizycznie ma setki megabajtów
+/// odzyskiwalnych danych obrazu/wideo przed punktem ucięcia —
+/// [`super::heic_clone`] odmawiał przeszczepu ("plik uszkodzony nie ma mdat"),
+/// a [`diagnoza_strukturalna`] fałszywie meldowała "BRAK mdat" zamiast "mdat
+/// obecny, ale niekompletny".
+///
+/// Bezpieczne dla pozostałych konsumentów: [`validate_moov_offsets`] i tak
+/// waliduje offsety `stco`/`co64` względem PRAWDZIWEJ długości pliku
+/// (parametr `result_file_size`, nie `BoxInfo::size`), więc przycięty `mdat`
+/// nie fałszuje kontroli spójności — po prostu przestaje maskować
+/// niekompletność zamiast ją ujawniać.
+///
+/// ### Warunek: przycinamy TYLKO, gdy przed nim jest już coś prawdziwego
+///
+/// Przycinanie działa jedynie wtedy, gdy `out` NIE JEST puste — czyli co
+/// najmniej jeden WCZEŚNIEJSZY box już się w pełni, bez ucinania, sparsował.
+/// Bez tego warunku dowolne ≥8 bajtów śmieci (np. zwykły tekst) też wygląda
+/// jak "jeden box rozciągnięty do EOF": pierwsze 4 bajty odczytane jako
+/// rozmiar prawie zawsze przekraczają długość bufora, więc pierwszy
+/// domniemany box od razu by się "przycinał" i śmieci dostawałyby stempel
+/// pozornej struktury ISOBMFF. Prawdziwie ucięty plik ma NATOMIAST co
+/// najmniej `ftyp` przed sobą — stąd ten warunek odróżnia jedno od drugiego,
+/// nie kosztem realnego przypadku (ucięcie w środku `mdat`, który prawie
+/// zawsze nie jest pierwszym boxem w pliku).
 pub fn parse_top_level_boxes(bytes: &[u8]) -> Vec<BoxInfo> {
     let mut out = Vec::new();
     let mut offset = 0usize;
@@ -70,7 +108,20 @@ pub fn parse_top_level_boxes(bytes: &[u8]) -> Vec<BoxInfo> {
         // ciche zawinięcie, które mogłoby dać `offset + size <= bytes.len()`
         // fałszywie prawdziwe i przepuścić box o spreparowanym rozmiarze.
         let Some(koniec) = offset.checked_add(size) else { break };
-        if size < header_size || koniec > bytes.len() { break; }
+        if size < header_size { break; }
+
+        if koniec > bytes.len() {
+            // Nagłówek jest spójny (rozmiar >= header_size), ale box wychodzi
+            // poza bufor - ucięcie, nie spreparowany nagłówek. Przycinamy do
+            // EOF i kończymy: to jedyny box, jaki da się z tych bajtów
+            // odzyskać, więc pętla i tak nie znajdzie już nic dalej. Tylko
+            // gdy `out` NIE JEST puste - patrz "Warunek" w dokumentacji funkcji.
+            if !out.is_empty() && offset + header_size <= bytes.len() {
+                out.push(BoxInfo { box_type, offset, size: bytes.len() - offset, header_size });
+            }
+            break;
+        }
+
         out.push(BoxInfo { box_type, offset, size, header_size });
         offset += size;
     }
@@ -201,8 +252,12 @@ pub fn validate_moov_offsets(moov_bytes: &[u8], result_file_size: usize) -> Offs
 /// trzymania OBU filmów w RAM naraz.
 ///
 /// Obsługuje rozszerzony rozmiar 64-bitowy (`size == 1`) oraz atom sięgający
-/// do końca pliku (`size == 0`). Zwraca `None`, gdy `mdat` nie występuje albo
-/// łańcuch atomów jest uszkodzony.
+/// do końca pliku (`size == 0`). Gdy `mdat` jest OSTATNIM czytelnym atomem i
+/// jego zadeklarowany rozmiar wychodzi poza koniec pliku (plik ucięty w
+/// środku danych - najczęstszy realny wzorzec uszkodzenia), zwraca rozmiar
+/// PRZYCIĘTY do tego, co fizycznie jest, zamiast `None` — dane do tego
+/// miejsca są nadal odzyskiwalne. Zwraca `None`, gdy `mdat` w ogóle nie
+/// występuje albo łańcuch atomów PRZED nim jest uszkodzony.
 pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -211,6 +266,13 @@ pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
 
     let mut offset: u64 = 0;
     let mut naglowek = [0u8; 16];
+    // Przycinamy TYLKO gdy przed uciętym atomem jest już przynajmniej jeden
+    // w pełni sparsowany box - ten sam warunek i ten sam powód co w
+    // `parse_top_level_boxes` (patrz jej dokumentacja, sekcja "Warunek"):
+    // bez niego dowolne ≥8 bajtów śmieci na początku pliku (pierwsze 4 jako
+    // rozmiar prawie zawsze przekraczają długość pliku) dostałoby fałszywy
+    // stempel "to mdat, tylko ucięty".
+    let mut znaleziono_wczesniej = false;
 
     while offset + 8 <= dlugosc {
         f.seek(SeekFrom::Start(offset)).ok()?;
@@ -240,9 +302,25 @@ pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
         // `rozmiar` przy rozszerzonym rozmiarze pochodzi wprost z pliku i może
         // być bliskie u64::MAX - zwykłe dodawanie przepełniłoby licznik.
         let Some(nowy_offset) = offset.checked_add(rozmiar) else { break };
-        if rozmiar < dlugosc_naglowka || nowy_offset > dlugosc {
-            // Uszkodzony nagłówek albo atom wychodzący za plik — dalej iść nie
-            // ma sensu, bo łańcuch jest już niewiarygodny.
+        if rozmiar < dlugosc_naglowka {
+            // Nagłówek wewnętrznie sprzeczny (rozmiar mniejszy niż sam
+            // nagłówek) - łańcuch od tego miejsca jest niewiarygodny.
+            break;
+        }
+
+        if nowy_offset > dlugosc {
+            // Nagłówek jest spójny, ale atom wychodzi poza koniec pliku -
+            // ucięcie, nie spreparowany nagłówek. Gdy to akurat `mdat`,
+            // dane są nadal odzyskiwalne AŻ DO EOF - ten sam powód co przy
+            // `parse_top_level_boxes` (patrz jej dokumentacja): plik ucięty
+            // w środku `mdat` to najczęstszy wzorzec uszkodzenia, jaki widzi
+            // to narzędzie, i poprzednio kończył się fałszywym `None`
+            // ("mdat nie znaleziono") zamiast zwróceniem tego, co fizycznie
+            // jest. Dla innych typów atomów dalsze parsowanie i tak nie ma
+            // sensu - łańcuch od tego miejsca jest niewiarygodny.
+            if znaleziono_wczesniej && &typ == b"mdat" && offset + dlugosc_naglowka <= dlugosc {
+                return Some(dlugosc - offset - dlugosc_naglowka);
+            }
             break;
         }
 
@@ -250,6 +328,7 @@ pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
             return Some(rozmiar - dlugosc_naglowka);
         }
 
+        znaleziono_wczesniej = true;
         offset = nowy_offset;
     }
 
@@ -569,11 +648,20 @@ mod tests {
     /// debug (a więc w `cargo test`) i mogło ciszej przepuścić box
     /// o spreparowanym rozmiarze w release (patrz komentarz przy
     /// `checked_add` w `parse_top_level_boxes`).
+    ///
+    /// Nagłówek tu jest wewnętrznie SPÓJNY (rozmiar 16 B >= header_size 16 B)
+    /// mimo absurdalnej wartości `largesize`, więc — od czasu, gdy boxy
+    /// wychodzące poza bufor są PRZYCINANE do EOF zamiast odrzucane w
+    /// całości (patrz dokumentacja `parse_top_level_boxes`) — funkcja może tu
+    /// zwrócić jeden przycięty box. Sedno testu zostaje: cokolwiek zwróci,
+    /// MUSI mieścić się w buforze, nigdy go nie przekraczać.
     #[test]
     fn test_parse_top_level_boxes_nie_przepelnia_sie_na_absurdalnym_largesize() {
         let zly = make_box_largesize(b"free", u64::MAX - 4);
         let boxes = parse_top_level_boxes(&zly);
-        assert!(boxes.is_empty(), "box o niemożliwym rozmiarze nie może zostać zaakceptowany");
+        for b in &boxes {
+            assert!(b.offset + b.size <= zly.len(), "box po przycięciu nie może wykraczać poza bufor");
+        }
     }
 
     /// To samo dla `collect_nested`, wołanego rekurencyjnie wewnątrz
@@ -606,14 +694,59 @@ mod tests {
         assert!(rozmiar_danych_mdat(&plik).is_none());
     }
 
+    /// Do 2024-... (patrz commit) funkcja odrzucała w CAŁOŚCI box, którego
+    /// zadeklarowany rozmiar wychodził poza bufor. Zmieniono na przycinanie
+    /// do EOF (patrz dokumentacja `parse_top_level_boxes`), bo to dokładnie
+    /// wzorzec pliku uciętego w środku `mdat` — najczęstsze realne
+    /// uszkodzenie, jakie widzi to narzędzie. Nazwa testu i asercja
+    /// zaktualizowane pod nową, zamierzoną semantykę.
     #[test]
-    fn test_parse_stops_at_inconsistent_size() {
+    fn test_parse_przycina_box_o_rozmiarze_wychodzacym_poza_bufor() {
         let mut mp4 = make_mp4(100, &[48]);
-        // Deklarujemy absurdalny rozmiar drugiego boxu
+        // Deklarujemy absurdalny rozmiar drugiego boxu (mdat)
         let ftyp_size = parse_top_level_boxes(&mp4)[0].size;
         mp4[ftyp_size..ftyp_size + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
         let boxes = parse_top_level_boxes(&mp4);
-        assert_eq!(boxes.len(), 1, "Powinien zatrzymać się przed niespójnym boxem");
+
+        // Nagłówek drugiego boxu jest spójny (0xFFFFFFFF >= header_size 8),
+        // więc zostaje PRZYCIĘTY do EOF zamiast odrzucony — stąd 2 boxy
+        // (ftyp + przycięty mdat), nie 1. Trzeci box (`moov`), fizycznie
+        // leżący w buforze ZA tym miejscem, przestaje być osiągalny:
+        // przycięty box "połyka" resztę pliku, tak jak zrobiłby to
+        // PRAWDZIWIE ucięty plik — nie da się stąd wiarygodnie odgadnąć
+        // granicy kolejnego boxu.
+        assert_eq!(boxes.len(), 2, "drugi box powinien zostać przycięty do EOF, nie odrzucony w całości");
+        assert_eq!(boxes[1].type_str(), "mdat");
+        assert_eq!(boxes[1].offset + boxes[1].size, mp4.len(), "przycięty box musi sięgać dokładnie do końca bufora");
+    }
+
+    /// REGRESJA — SEDNO poprawki: plik ucięty W ŚRODKU `mdat` (`mdat` jest
+    /// zwykle OSTATNIM atomem najwyższego poziomu, więc to najczęstszy realny
+    /// wzorzec uszkodzenia) musi dać PRZYCIĘTY box, nie zniknięcie `mdat` z
+    /// wyniku. Przed poprawką `find_box(..., b"mdat")` zwracał `None` dla
+    /// pliku, który fizycznie ma mnóstwo odzyskiwalnych danych przed punktem
+    /// ucięcia — `heic_clone::zloz_bajty` odmawiał przeszczepu, a
+    /// `diagnoza_strukturalna` fałszywie meldowała "BRAK mdat".
+    #[test]
+    fn test_parse_top_level_boxes_przycina_ucietego_mdat_do_eof() {
+        let mut plik = make_box(b"ftyp", b"isomiso2avc1mp41");
+        let mdat_offset = plik.len();
+        let pelny_mdat = make_box(b"mdat", &[0xAAu8; 1000]); // deklaruje 1000 B danych
+
+        // Ucinamy plik w środku danych `mdat` - nagłówek (i zadeklarowany
+        // rozmiar 1008 = 8 + 1000) zostaje NIETKNIĘTY, ale fizycznie
+        // dostępne jest tylko 500 z 1000 zadeklarowanych bajtów danych.
+        plik.extend_from_slice(&pelny_mdat[..8 + 500]);
+
+        let boxes = parse_top_level_boxes(&plik);
+        let mdat = find_box(&boxes, b"mdat").expect("ucięty mdat musi zostać ZNALEZIONY, nie zniknąć z wyniku");
+
+        assert_eq!(mdat.offset, mdat_offset);
+        assert_eq!(mdat.offset + mdat.size, plik.len(), "przycięty box musi sięgać dokładnie do końca pliku");
+        assert!(mdat.size < 1008, "przycięty rozmiar musi być MNIEJSZY niż zadeklarowany (1008 B), nie zaakceptowany wprost");
+
+        let (od, do_) = mdat.body_range();
+        assert_eq!(do_ - od, 500, "dostępne dane muszą odpowiadać temu, co fizycznie jest w pliku (500 B), nie zadeklarowanym 1000 B");
     }
 
     #[test]
@@ -749,6 +882,43 @@ mod tests {
         std::fs::write(&plik, make_moov_with_offsets(&[48])).unwrap();
 
         assert!(rozmiar_danych_mdat(&plik).is_none());
+    }
+
+    /// REGRESJA, ten sam wzorzec co `test_parse_top_level_boxes_przycina_ucietego_mdat_do_eof`,
+    /// tym razem dla osobnego, plikowego parsera. Plik ucięty w środku
+    /// danych `mdat` musi dać rozmiar PRZYCIĘTY do tego, co fizycznie jest,
+    /// nie `None`.
+    #[test]
+    fn test_rozmiar_danych_mdat_przycina_ucietego_mdat_do_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let plik_path = dir.path().join("uciety.mp4");
+
+        let mut plik = make_box(b"ftyp", b"isomiso2avc1mp41");
+        let pelny_mdat = make_box(b"mdat", &[0xAAu8; 1000]); // deklaruje 1000 B danych
+        plik.extend_from_slice(&pelny_mdat[..8 + 500]); // fizycznie tylko 500 B danych
+        std::fs::write(&plik_path, &plik).unwrap();
+
+        let rozmiar = rozmiar_danych_mdat(&plik_path)
+            .expect("ucięty mdat musi dać PRZYCIĘTY rozmiar, nie None");
+        assert_eq!(rozmiar, 500, "rozmiar musi odpowiadać fizycznie dostępnym danym, nie zadeklarowanym 1000 B");
+    }
+
+    /// REGRESJA na skutek uboczny powyższej poprawki, ten sam wzorzec co
+    /// `test_diagnoza_smieci_nie_udaje_ze_zna_strukture`: przycinanie działa
+    /// TYLKO, gdy przed uciętym atomem jest już przynajmniej jeden w pełni
+    /// sparsowany box. Bez tego warunku dowolne ≥8 bajtów zwykłego tekstu —
+    /// pierwsze 4 bajty odczytane jako rozmiar prawie zawsze przekraczają
+    /// długość pliku — dostałoby fałszywy stempel "to ucięty mdat".
+    #[test]
+    fn test_rozmiar_danych_mdat_nie_udaje_ze_smieci_od_pierwszego_bajtu_to_mdat() {
+        let dir = tempfile::tempdir().unwrap();
+        let plik_path = dir.path().join("smieci.mp4");
+        std::fs::write(&plik_path, b"to zupelnie nie jest kontener mp4").unwrap();
+
+        assert!(
+            rozmiar_danych_mdat(&plik_path).is_none(),
+            "śmieci od pierwszego bajtu nie mogą zostać uznane za ucięty mdat"
+        );
     }
 
     #[test]
