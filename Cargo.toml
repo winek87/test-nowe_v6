@@ -19,16 +19,19 @@ path = "src/main.rs"
 # temu dzieli z Weryfikatorem jedną wersję ratatui/crossterm/rusqlite i jeden
 # katalog `target`, a jego biblioteka daje się wołać wprost z menu.
 #
-# `decoder` i `mp4_swarm_server` zostają WYKLUCZONE świadomie:
-# * `decoder` pokrywa się z `mp4_repair::boxes` (parser drzewa ISOBMFF),
-# * `mp4_swarm_server` to serwer HTTP (axum), sensowny tylko przy szukaniu
-#   obcego dawcy przez sygnaturę DNA — czego model dwóch kopii nie potrzebuje.
+# `mp4_swarm_server` zostaje WYKLUCZONY świadomie: to serwer HTTP (axum),
+# sensowny tylko przy szukaniu obcego dawcy przez sygnaturę DNA — czego model
+# dwóch kopii nie potrzebuje. Ma zostać osobnym bytem, nie członkiem workspace'u.
 #
 # Wykluczenie jest wymagane, nie kosmetyczne: bez niego Cargo odmawia budowy,
-# bo oba leżą w katalogu korzenia workspace'u.
+# bo leży w katalogu korzenia workspace'u.
+#
+# (Był tu też `mp4/decoder` — samodzielny, nieudokumentowany parser drzewa
+# ISOBMFF pokrywający się z `mp4_repair::boxes`, niewołany z żadnego miejsca w
+# projekcie i bez ani jednego testu. Usunięty; historia w git przy potrzebie.)
 [workspace]
 members = ["mp4_engines", "mp4/mp4_doctor"]
-exclude = ["mp4/decoder", "mp4/mp4_swarm_server"]
+exclude = ["mp4/mp4_swarm_server"]
 
 [dependencies]
 rusqlite = "0.40.2"
