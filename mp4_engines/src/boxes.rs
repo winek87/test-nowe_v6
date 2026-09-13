@@ -84,7 +84,7 @@ pub fn find_box(boxes: &[BoxInfo], box_type: &[u8; 4]) -> Option<BoxInfo> {
 
 /// Rekurencyjnie zbiera boxy podanego typu z zagnieżdżonej struktury
 /// (`moov` → `trak` → `mdia` → `minf` → `stbl` → `stco`).
-fn collect_nested(bytes: &[u8], start: usize, end: usize, target: &[u8; 4], out: &mut Vec<BoxInfo>) {
+pub(crate) fn collect_nested(bytes: &[u8], start: usize, end: usize, target: &[u8; 4], out: &mut Vec<BoxInfo>) {
     const CONTAINERS: &[&[u8; 4]] = &[b"moov", b"trak", b"mdia", b"minf", b"stbl"];
     let mut offset = start;
     while offset + 8 <= end {
