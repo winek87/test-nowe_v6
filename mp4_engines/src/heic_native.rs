@@ -456,6 +456,27 @@ pub fn zbuduj_hvcc(zestawy: &ZestawyParametrow, sps: &OpisSps) -> Option<Vec<u8>
         (NAL_SPS, &zestawy.sps),
         (NAL_PPS, &zestawy.pps),
     ] {
+        // Pole długości w `hvcC` jest 16-bitowe - `dane.len() as u16` bez
+        // kontroli CICHO OBCINA wartość (modulo 65536), podczas gdy
+        // `extend_from_slice(dane)` niżej i tak dopisuje PEŁNĄ, nieobciętą
+        // długość. Zadeklarowana długość rozjeżdżałaby się wtedy z liczbą
+        // bajtów faktycznie zapisanych, rozstrajając każdy KOLEJNY wpis w
+        // tablicy `hvcC` o tę różnicę - box strukturalnie zbudowałby się bez
+        // błędu, ale byłby fałszywy.
+        //
+        // `zestawy_parametrow` bierze granice NAL-a WPROST z odnalezionego
+        // łańcucha, bez górnego limitu długości, a `mdat` tego modułu może
+        // mieć do `LIMIT_W_RAM` (256 MB) - więc VPS/SPS/PPS dłuższy niż
+        // 65535 B nie jest teoretyczny: to pojedynczy, spreparowany albo
+        // przypadkowo trafiony NAL typu 32/33/34 w uszkodzonym strumieniu,
+        // dokładnie to, na co ta funkcja musi być odporna z definicji.
+        // Prawdziwe VPS/SPS/PPS mieszczą się w tym z ogromnym zapasem
+        // (dziesiątki-setki bajtów), więc odrzucenie tu nie kosztuje
+        // niczego na materiale zdrowym.
+        if dane.len() > u16::MAX as usize {
+            return None;
+        }
+
         // array_completeness(1)=1 | reserved(1)=0 | NAL_unit_type(6)
         c.push(0x80 | typ);
         c.extend_from_slice(&1u16.to_be_bytes());
@@ -1015,6 +1036,39 @@ mod tests {
 
         assert!(nasze.iter().all(|t| t.1), "nasze tablice deklarują komplet zestawów parametrów");
         assert!(wzorcowe.iter().all(|t| !t.1), "wzorcowe deklarują niekomplet - stąd jedyna różnica bajtowa");
+    }
+
+    /// REGRESJA: pole długości w `hvcC` jest 16-bitowe. Wcześniej
+    /// `dane.len() as u16` cicho OBCINAŁ zbyt długi zestaw parametrów,
+    /// podczas gdy `extend_from_slice` obok dopisywał PEŁNĄ, nieobciętą
+    /// długość — box budował się bez błędu, ale zadeklarowana długość
+    /// rozjeżdżała się z liczbą zapisanych bajtów, rozstrajając każdy
+    /// KOLEJNY wpis tablicy. `zestawy_parametrow` bierze granice NAL-a wprost
+    /// z łańcucha bez górnego limitu, a `mdat` tego modułu może mieć do 256
+    /// MB — więc "VPS" dłuższy niż 65535 B to realny scenariusz na
+    /// spreparowanym/uszkodzonym materiale, nie tylko teoria.
+    #[test]
+    fn test_hvcc_odrzuca_zestaw_parametrow_dluzszy_niz_16_bitow() {
+        let opis = parsuj_sps(&SPS).unwrap();
+        let mut z = zestawy();
+        z.vps = vec![0u8; u16::MAX as usize + 1];
+
+        assert!(
+            zbuduj_hvcc(&z, &opis).is_none(),
+            "zestaw parametrów dłuższy niż da się zapisać w 16-bitowym polu musi być odrzucony, nie cicho obcięty"
+        );
+    }
+
+    /// Kontrola sensu powyższego testu: dokładnie na granicy (65535 B, czyli
+    /// `u16::MAX`) budowa MUSI się udać — próg jest w odrzuceniu DŁUŻSZYCH
+    /// zestawów, nie w samej ich obecności.
+    #[test]
+    fn test_hvcc_przyjmuje_zestaw_parametrow_dokladnie_na_granicy_16_bitow() {
+        let opis = parsuj_sps(&SPS).unwrap();
+        let mut z = zestawy();
+        z.pps = vec![0u8; u16::MAX as usize];
+
+        assert!(zbuduj_hvcc(&z, &opis).is_some(), "dokładnie u16::MAX bajtów musi się zmieścić");
     }
 
     #[test]
