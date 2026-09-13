@@ -311,14 +311,14 @@ impl App {
                     let _ = crate::db::save_donor(ws, &dna, &moov_path);
                 }
             }
-            AppEvent::RepairSuccess { dna, algorithm, .. } => {
+            AppEvent::RepairSuccess { dna, algorithm, features, .. } => {
                 if let Some(ref ws) = self.active_workspace {
-                    let _ = crate::db::reward_algorithm(ws, &dna, &algorithm);
+                    let _ = crate::db::reward_algorithm(ws, &dna, &algorithm, &features);
                 }
             }
-            AppEvent::RepairFailure { dna, algorithm, .. } => {
+            AppEvent::RepairFailure { dna, algorithm, features, .. } => {
                 if let Some(ref ws) = self.active_workspace {
-                    let _ = crate::db::penalize_algorithm(ws, &dna, &algorithm);
+                    let _ = crate::db::penalize_algorithm(ws, &dna, &algorithm, &features);
                 }
             }
         }

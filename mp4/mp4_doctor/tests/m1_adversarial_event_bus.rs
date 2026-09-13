@@ -12,6 +12,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
+use mp4_doctor::ai::FeatureVector;
 use mp4_doctor::event::{
     channel, AppEvent, LogLevel, LogMessage, SanitizerMetrics, StatUpdate,
 };
@@ -58,8 +59,9 @@ fn test_receiver_drop_all_helper_methods_never_panic() {
     tx.operation_failed("Op", "Failed");
 
     tx.donor_found("dna", "/path");
-    tx.repair_success("file", "dna", "algo");
-    tx.repair_failure("file", "dna", "algo");
+    let cechy = FeatureVector { file_size_mb: 1.0, entropy: 1.0, h264_profile: 0.0, aac_freq: 0.0, video_audio_ratio: 0.0 };
+    tx.repair_success("file", "dna", "algo", cechy.clone());
+    tx.repair_failure("file", "dna", "algo", cechy);
 }
 
 #[test]

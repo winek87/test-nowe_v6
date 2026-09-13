@@ -26,6 +26,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use mp4_doctor::ai::FeatureVector;
 use mp4_doctor::event::{
     channel, AppEvent, LogLevel, LogMessage, SanitizerMetrics, StatUpdate, WorkerStatus,
 };
@@ -248,6 +249,7 @@ fn make_heterogeneous_event(thread_id: usize, seq: usize) -> AppEvent {
                     file_name: format!("corrupt_{}_{}.mp4", thread_id, seq),
                     dna: format!("DNA_{}", thread_id),
                     algorithm: "engine_recontainer".to_string(),
+                    features: FeatureVector { file_size_mb: 10.0, entropy: 7.0, h264_profile: 100.0, aac_freq: 44100.0, video_audio_ratio: 0.8 },
                 }
             }
         }

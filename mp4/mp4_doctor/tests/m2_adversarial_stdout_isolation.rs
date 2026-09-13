@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::os::fd::FromRawFd;
 
+use mp4_doctor::ai::FeatureVector;
 use mp4_doctor::event::{channel, AppEvent, LogLevel};
 use mp4_doctor::workspace::Workspace;
 use mp4_doctor::{autopilot, db, god_mode, scanner, training_ground};
@@ -396,8 +397,9 @@ fn test_db_operations_zero_stdout() {
     assert!(conn.is_ok(), "Failed to init db");
 
     let _ = db::save_donor(&ws, "TEST_DNA_123", "/fake/path/donor.moov");
-    let _ = db::reward_algorithm(&ws, "TEST_DNA_123", "Native");
-    let _ = db::penalize_algorithm(&ws, "TEST_DNA_123", "Clone");
+    let cechy = FeatureVector { file_size_mb: 1.0, entropy: 1.0, h264_profile: 0.0, aac_freq: 0.0, video_audio_ratio: 0.0 };
+    let _ = db::reward_algorithm(&ws, "TEST_DNA_123", "Native", &cechy);
+    let _ = db::penalize_algorithm(&ws, "TEST_DNA_123", "Clone", &cechy);
     let _ = db::mark_trained(&ws, "abc123hash");
     let _ = db::get_all_trained(&ws);
     let _ = db::build_brain_cache(&ws);

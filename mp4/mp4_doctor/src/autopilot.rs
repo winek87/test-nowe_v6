@@ -215,7 +215,7 @@ pub fn run(
         } else {
             event_sender.update_thread(thread_id, format!("❌ Kaskada: Algorytm '{}' odrzucony.", algo));
             let _ = fs::remove_file(out_str); 
-            event_sender.repair_failure(&file_name, &dna_sig, algo);
+            event_sender.repair_failure(&file_name, &dna_sig, algo, features.clone());
         }
     }
 
@@ -225,7 +225,7 @@ pub fn run(
         
         for (algo, file_path, _) in &successful_repairs {
             if algo == best_algo {
-                event_sender.repair_success(&file_name, &dna_sig, algo);
+                event_sender.repair_success(&file_name, &dna_sig, algo, features.clone());
                 event_sender.success("AUTOPILOT", format!("Sukces naprawy pliku {} za pomocą algorytmu '{}'!", file_name, algo));
             } else {
                 let _ = fs::remove_file(file_path);

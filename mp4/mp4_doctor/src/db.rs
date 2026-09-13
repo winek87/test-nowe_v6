@@ -138,26 +138,51 @@ pub fn init_db(ws: &Workspace) -> SqlResult<Connection> {
     Ok(conn)
 }
 
-pub fn reward_algorithm(ws: &Workspace, dna: &str, algo: &str) -> SqlResult<()> {
+/// Nagradza algorytm za sukces naprawy DANEGO wektora cech.
+///
+/// # `features` — dlaczego to NIE JEST kosmetyka
+///
+/// Do niedawna ten parametr nie istniał, a kolumna `features_json` (obecna w
+/// schemacie od dawna — patrz migracja w [`init_db`]) nigdy nie była
+/// zapisywana. Skutek: [`BrainCache::feature_store`] było TRWALE puste,
+/// `get_best_algorithms`'s pętla ucząca `KnnClassifier` (`knn.train(...)`)
+/// nigdy się nie wykonywała, a `knn.predict()` zawsze zwracał `None` z
+/// własnej straży `knowledge_base.is_empty()`. Cała "Enterprise ML"/KNN
+/// gałąź logiki rozmytej była martwa w praktyce — system zawsze spadał od
+/// razu do fallbacku Levenshteina.
+///
+/// `features` jest tu WYMAGANY, nie opcjonalny, bo w jedynym miejscu
+/// wywołania (`autopilot::run`) jest liczony przez `dna::extract_dna` na
+/// samym początku przebiegu i pozostaje w zasięgu przez całą resztę funkcji —
+/// nie ma scenariusza, w którym trzeba by nagrodzić algorytm bez znanych cech
+/// pliku, którego dotyczy.
+pub fn reward_algorithm(ws: &Workspace, dna: &str, algo: &str, features: &FeatureVector) -> SqlResult<()> {
     let conn = init_db(ws)?;
+    let features_json = serde_json::to_string(features).ok();
     conn.execute(
-        "INSERT INTO knowledge_base (dna_signature, algorithm_name, score)
-         VALUES (?1, ?2, 10)
-         ON CONFLICT(dna_signature, algorithm_name) 
-         DO UPDATE SET score = score + 10",
-        params![dna, algo],
+        "INSERT INTO knowledge_base (dna_signature, algorithm_name, score, features_json)
+         VALUES (?1, ?2, 10, ?3)
+         ON CONFLICT(dna_signature, algorithm_name)
+         DO UPDATE SET score = score + 10, features_json = ?3",
+        params![dna, algo, features_json],
     )?;
     Ok(())
 }
 
-pub fn penalize_algorithm(ws: &Workspace, dna: &str, algo: &str) -> SqlResult<()> {
+/// Kara dla algorytmu za porażkę naprawy. `features` — ten sam powód co w
+/// [`reward_algorithm`]: ten sam wektor cech co przy sukcesie/porażce TEGO
+/// SAMEGO pliku w tym samym przebiegu `autopilot::run`, więc zapisanie go
+/// także tutaj tylko wzbogaca `feature_store` o kolejny punkt danych dla tej
+/// sygnatury DNA.
+pub fn penalize_algorithm(ws: &Workspace, dna: &str, algo: &str, features: &FeatureVector) -> SqlResult<()> {
     let conn = init_db(ws)?;
+    let features_json = serde_json::to_string(features).ok();
     conn.execute(
-        "INSERT INTO knowledge_base (dna_signature, algorithm_name, score)
-         VALUES (?1, ?2, -5)
-         ON CONFLICT(dna_signature, algorithm_name) 
-         DO UPDATE SET score = score - 5",
-        params![dna, algo],
+        "INSERT INTO knowledge_base (dna_signature, algorithm_name, score, features_json)
+         VALUES (?1, ?2, -5, ?3)
+         ON CONFLICT(dna_signature, algorithm_name)
+         DO UPDATE SET score = score - 5, features_json = ?3",
+        params![dna, algo, features_json],
     )?;
     Ok(())
 }
@@ -188,14 +213,25 @@ pub fn get_db_stats(ws: &Workspace) -> usize {
 pub fn build_brain_cache(ws: &Workspace) -> SqlResult<BrainCache> {
     let mut cache = BrainCache::default();
     let conn = init_db(ws)?;
-    
-    // Sortujemy wiedzę wg najwyższej punktacji (score)
-    let mut stmt = conn.prepare("SELECT dna_signature, algorithm_name FROM knowledge_base ORDER BY score DESC")?;
+
+    // Sortujemy wiedzę wg najwyższej punktacji (score) — dzięki temu, przy
+    // wielu wierszach dla tej samej sygnatury DNA, PIERWSZY napotkany niżej
+    // ma NAJWYŻSZY wynik. `feature_store.entry(...).or_insert(...)` celowo
+    // NIE nadpisuje przy kolejnych (gorzej ocenionych) wierszach tej samej
+    // sygnatury, więc zapisane cechy odpowiadają temu samemu algorytmowi, co
+    // `cache.algorithms.get(dna).first()` w `get_best_algorithms`.
+    let mut stmt = conn.prepare(
+        "SELECT dna_signature, algorithm_name, features_json FROM knowledge_base ORDER BY score DESC"
+    )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
     })?;
-    for row in rows.flatten() {
-        cache.algorithms.entry(row.0).or_insert_with(Vec::new).push(row.1);
+    for (dna, algo, features_json) in rows.flatten() {
+        if let Some(json) = features_json
+            && let Ok(feat) = serde_json::from_str::<FeatureVector>(&json) {
+                cache.feature_store.entry(dna.clone()).or_insert(feat);
+            }
+        cache.algorithms.entry(dna).or_insert_with(Vec::new).push(algo);
     }
 
     let mut stmt2 = conn.prepare("SELECT dna_signature, donor_path FROM donors_cache")?;
@@ -212,15 +248,23 @@ pub fn build_brain_cache(ws: &Workspace) -> SqlResult<BrainCache> {
 // --- FUNKCJE KOLEKTYWNEGO ROJU (IMPORT/EKSPORT AI) ---
 
 /// Zrzuca całą zawartość uczenia maszynowego (SQLite) do formatu JSON.
+///
+/// `features` w każdym wpisie NIE jest już zaszyte na sztywno jako `None` —
+/// wcześniej eksport (a więc i synchronizacja z rojem) bezpowrotnie gubił
+/// wektory cech, nawet gdy `reward_algorithm`/`penalize_algorithm` je
+/// zapisały: importujący węzeł dostawał sygnaturę DNA i wynik, ale nigdy
+/// materiału do wytrenowania WŁASNEGO klasyfikatora KNN na cudzym
+/// doświadczeniu.
 pub fn export_brain_to_json(ws: &Workspace, json_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let conn = init_db(ws)?;
-    let mut stmt = conn.prepare("SELECT dna_signature, algorithm_name, score FROM knowledge_base")?;
+    let mut stmt = conn.prepare("SELECT dna_signature, algorithm_name, score, features_json FROM knowledge_base")?;
     let rows = stmt.query_map([], |row| {
+        let features_json: Option<String> = row.get(3)?;
         Ok(KnowledgeEntry {
             dna_signature: row.get(0)?,
             algorithm_name: row.get(1)?,
             score: row.get(2)?,
-            features: None,
+            features: features_json.and_then(|j| serde_json::from_str(&j).ok()),
         })
     })?;
 
@@ -315,13 +359,17 @@ pub fn import_brain_from_json(ws: &Workspace, json_path: &str) -> Result<usize, 
     let mut imported_count = 0;
 
     for entry in import.knowledge {
-        // Łączymy doświadczenie własne z cudzym (dodajemy score)
+        let features_json = entry.features.as_ref().and_then(|f| serde_json::to_string(f).ok());
+        // Łączymy doświadczenie własne z cudzym (dodajemy score). Cechy:
+        // `COALESCE` zamiast bezwarunkowego nadpisania — wpis z Roju bez
+        // cech (np. ze starszej wersji węzła, sprzed tej poprawki) nie może
+        // wymazać cech już poznanych LOKALNIE dla tej samej pary DNA+algorytm.
         let res = conn.execute(
-            "INSERT INTO knowledge_base (dna_signature, algorithm_name, score)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(dna_signature, algorithm_name) 
-             DO UPDATE SET score = score + ?3",
-            params![entry.dna_signature, entry.algorithm_name, entry.score],
+            "INSERT INTO knowledge_base (dna_signature, algorithm_name, score, features_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(dna_signature, algorithm_name)
+             DO UPDATE SET score = score + ?3, features_json = COALESCE(?4, features_json)",
+            params![entry.dna_signature, entry.algorithm_name, entry.score, features_json],
         );
         if res.is_ok() { imported_count += 1; }
     }
@@ -533,6 +581,121 @@ mod tests {
         // ścieżka WZGLĘDNA wobec katalogu uruchomienia, podczas gdy przestrzeń
         // powstaje w `<katalog przestrzeni>/test_ws_db`. Sprzątanie nigdy więc
         // niczego nie usuwało, a katalog zostawał w drzewie projektu.
+        let _ = std::fs::remove_dir_all(&ws.root_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA — KNN PRZESTAJE BYĆ CICHYM NO-OPEM
+    //
+    // Wcześniej `feature_store` było TRWALE puste: `reward_algorithm` nie
+    // zapisywało `features_json`, a `build_brain_cache` nie odczytywało go
+    // z powrotem. `knn.train()` nigdy się nie wykonywał, `knn.predict()`
+    // zawsze zwracał `None` z własnej straży `knowledge_base.is_empty()`, a
+    // system zawsze spadał wprost do fallbacku Levenshteina. Testy niżej
+    // dowodzą, że to nieprawda: cechy przeżywają pełny cykl zapis→odczyt, a
+    // KNN faktycznie przewiduje na podstawie podobieństwa cech, nie samego
+    // dopasowania łańcucha DNA.
+    // ------------------------------------------------------------------
+
+    fn wektor(rozmiar: f64, entropia: f64) -> FeatureVector {
+        FeatureVector { file_size_mb: rozmiar, entropy: entropia, h264_profile: 100.0, aac_freq: 44100.0, video_audio_ratio: 0.8 }
+    }
+
+    #[test]
+    fn test_reward_algorithm_zapisuje_features_json_ktory_wraca_w_build_brain_cache() {
+        let ws = Workspace::init_testowy("test_knn_zapis").unwrap();
+        let cechy = wektor(10.0, 7.0);
+
+        reward_algorithm(&ws, "DNA_A", "Clone", &cechy).unwrap();
+
+        let cache = build_brain_cache(&ws).unwrap();
+        assert_eq!(
+            cache.feature_store.get("DNA_A"),
+            Some(&cechy),
+            "wektor cech zapisany przez reward_algorithm musi wrócić nietknięty z build_brain_cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws.root_dir);
+    }
+
+    #[test]
+    fn test_penalize_algorithm_tez_zapisuje_features_json() {
+        let ws = Workspace::init_testowy("test_knn_kara").unwrap();
+        let cechy = wektor(5.0, 3.0);
+
+        penalize_algorithm(&ws, "DNA_B", "Recontainer", &cechy).unwrap();
+
+        let cache = build_brain_cache(&ws).unwrap();
+        assert_eq!(cache.feature_store.get("DNA_B"), Some(&cechy));
+
+        let _ = std::fs::remove_dir_all(&ws.root_dir);
+    }
+
+    /// Zasila `BrainCache` DWOMA klastrami po 3 dobrze poznane przypadki
+    /// każdy — tyle, ile `get_best_algorithms` bierze pod uwagę (`k=3`).
+    ///
+    /// Dlaczego 3 na klaster, a nie 1: przy k=3 i mniej niż 3 punktach w
+    /// CAŁEJ bazie wiedzy, KNN głosuje na WSZYSTKICH dostępnych sąsiadach,
+    /// niezależnie od odległości — z dwoma klastrami po jednym punkcie
+    /// każdym wychodzi remis 1:1, rozstrzygany kolejnością iteracji
+    /// `HashMap` (czyli LOSOWO, bo Rust losuje seed hashowania per proces).
+    /// Po 3 punkty na klaster gwarantują, że k=3 NAJBLIŻSZYCH sąsiadów
+    /// zapytania to zawsze CAŁY właściwy klaster — wynik przestaje być
+    /// przypadkiem.
+    fn zasil_dwa_klastry(ws: &Workspace) {
+        for (i, (rozmiar, entropia)) in [(9.0, 6.9), (10.0, 7.0), (11.0, 7.1)].iter().enumerate() {
+            reward_algorithm(ws, &format!("AAAA_KLASTER_{}", i), "Clone", &wektor(*rozmiar, *entropia)).unwrap();
+        }
+        for (i, (rozmiar, entropia)) in [(1990.0, 1.9), (2000.0, 2.0), (2010.0, 2.1)].iter().enumerate() {
+            reward_algorithm(ws, &format!("BBBB_KLASTER_{}", i), "Native", &wektor(*rozmiar, *entropia)).unwrap();
+        }
+    }
+
+    /// SEDNO POPRAWKI: dla sygnatury DNA, której `BrainCache` NIGDY nie
+    /// widziało (brak dokładnego dopasowania), klasyfikator KNN musi
+    /// przewidzieć algorytm na podstawie PODOBIEŃSTWA CECH do znanych
+    /// przypadków — nie samego podobieństwa łańcucha DNA.
+    ///
+    /// Sygnatura zapytania jest celowo daleka w odległości Levenshteina od
+    /// wszystkich znanych sygnatur (próg fallbacku to `< 15`), żeby wynik
+    /// dowodził działania SAMEGO KNN, a nie przypadkowego trafienia logiki
+    /// rozmytej.
+    #[test]
+    fn test_get_best_algorithms_uzywa_knn_dla_nieznanego_dna_na_podstawie_cech() {
+        let ws = Workspace::init_testowy("test_knn_predykcja").unwrap();
+        zasil_dwa_klastry(&ws);
+
+        let cache = build_brain_cache(&ws).unwrap();
+        assert_eq!(cache.feature_store.len(), 6, "wszystkie 6 sygnatur musi mieć zapisane cechy");
+
+        let nieznane_dna = "ZZZZ_UNSEEN_CAMERA_MODEL_XYZ";
+        let cechy_podobne_do_a = wektor(10.5, 7.05);
+
+        let wynik = cache.get_best_algorithms(nieznane_dna, &cechy_podobne_do_a);
+
+        assert_eq!(
+            wynik, vec!["Clone".to_string()],
+            "KNN musi przewidzieć algorytm najbliższego klastra po CECHACH, nie po dopasowaniu łańcucha DNA"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws.root_dir);
+    }
+
+    /// Kontrola sensu powyższego testu: ta sama nieznana sygnatura, ale z
+    /// cechami bliskimi DRUGIEMU klastrowi, musi dać DRUGI algorytm — jeśli
+    /// KNN faktycznie waży cechy, a nie zwraca stałej odpowiedzi.
+    #[test]
+    fn test_get_best_algorithms_knn_zmienia_predykcje_wraz_z_cechami() {
+        let ws = Workspace::init_testowy("test_knn_predykcja_odwrotna").unwrap();
+        zasil_dwa_klastry(&ws);
+
+        let cache = build_brain_cache(&ws).unwrap();
+        let nieznane_dna = "ZZZZ_UNSEEN_CAMERA_MODEL_XYZ";
+        let cechy_podobne_do_b = wektor(1995.0, 1.95);
+
+        let wynik = cache.get_best_algorithms(nieznane_dna, &cechy_podobne_do_b);
+        assert_eq!(wynik, vec!["Native".to_string()]);
+
         let _ = std::fs::remove_dir_all(&ws.root_dir);
     }
 }

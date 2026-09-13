@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, Receiver, SendError, Sender};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::FeatureVector;
+
 /// Log severity levels for operational log messages and TUI color-coding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -259,17 +261,28 @@ pub enum AppEvent {
     },
 
     /// Repair succeeded with a specific heuristic algorithm (rewards algorithm in SQLite).
+    ///
+    /// `features` — wektor cech pliku, obliczony wcześniej przez
+    /// `dna::extract_dna` w tym samym przebiegu. Bez niego `reward_algorithm`
+    /// nie ma czego zapisać do kolumny `features_json`, a `BrainCache::feature_store`
+    /// zostaje trwale puste — klasyfikator KNN nigdy się nie trenuje, mimo że
+    /// dane leżały w zasięgu ręki od samego początku. Patrz dokumentacja
+    /// `db::reward_algorithm`.
     RepairSuccess {
         file_name: String,
         dna: String,
         algorithm: String,
+        features: FeatureVector,
     },
 
     /// Repair failed with a specific heuristic algorithm (penalizes algorithm in SQLite).
+    ///
+    /// `features` — ten sam powód co w [`AppEvent::RepairSuccess`].
     RepairFailure {
         file_name: String,
         dna: String,
         algorithm: String,
+        features: FeatureVector,
     },
 }
 
@@ -421,16 +434,22 @@ impl EventSender {
     }
 
     /// Notifies that a repair succeeded with an algorithm (triggers SQLite DB reward).
+    ///
+    /// `features` must be the same `FeatureVector` computed for this file by
+    /// `dna::extract_dna` earlier in the same run — see the field doc on
+    /// [`AppEvent::RepairSuccess`] for why this is required, not optional.
     pub fn repair_success(
         &self,
         file_name: impl Into<String>,
         dna: impl Into<String>,
         algorithm: impl Into<String>,
+        features: FeatureVector,
     ) {
         let _ = self.send(AppEvent::RepairSuccess {
             file_name: file_name.into(),
             dna: dna.into(),
             algorithm: algorithm.into(),
+            features,
         });
     }
 
@@ -440,11 +459,13 @@ impl EventSender {
         file_name: impl Into<String>,
         dna: impl Into<String>,
         algorithm: impl Into<String>,
+        features: FeatureVector,
     ) {
         let _ = self.send(AppEvent::RepairFailure {
             file_name: file_name.into(),
             dna: dna.into(),
             algorithm: algorithm.into(),
+            features,
         });
     }
 }
@@ -655,8 +676,9 @@ mod tests {
         tx.operation_finished("Scan completed successfully");
         tx.operation_failed("Sanitize", "File not found");
         tx.donor_found("dna123", "/path/to/moov");
-        tx.repair_success("corrupt.mp4", "dna123", "recontainer");
-        tx.repair_failure("broken.mp4", "dna456", "native");
+        let cechy = FeatureVector { file_size_mb: 12.0, entropy: 7.1, h264_profile: 100.0, aac_freq: 44100.0, video_audio_ratio: 0.8 };
+        tx.repair_success("corrupt.mp4", "dna123", "recontainer", cechy.clone());
+        tx.repair_failure("broken.mp4", "dna456", "native", cechy.clone());
 
         let events: Vec<AppEvent> = rx.try_iter().collect();
         assert_eq!(events.len(), 6);
@@ -665,8 +687,8 @@ mod tests {
         assert_eq!(events[1], AppEvent::OperationFinished("Scan completed successfully".into()));
         assert_eq!(events[2], AppEvent::OperationFailed("Sanitize".into(), "File not found".into()));
         assert_eq!(events[3], AppEvent::DonorFound { dna: "dna123".into(), moov_path: "/path/to/moov".into() });
-        assert_eq!(events[4], AppEvent::RepairSuccess { file_name: "corrupt.mp4".into(), dna: "dna123".into(), algorithm: "recontainer".into() });
-        assert_eq!(events[5], AppEvent::RepairFailure { file_name: "broken.mp4".into(), dna: "dna456".into(), algorithm: "native".into() });
+        assert_eq!(events[4], AppEvent::RepairSuccess { file_name: "corrupt.mp4".into(), dna: "dna123".into(), algorithm: "recontainer".into(), features: cechy.clone() });
+        assert_eq!(events[5], AppEvent::RepairFailure { file_name: "broken.mp4".into(), dna: "dna456".into(), algorithm: "native".into(), features: cechy });
     }
 
     #[test]

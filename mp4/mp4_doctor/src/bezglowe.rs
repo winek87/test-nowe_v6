@@ -74,12 +74,12 @@ fn obsluz_zdarzenie(ws: &Workspace, zdarzenie: AppEvent) {
             let _ = crate::db::save_donor(ws, &dna, &moov_path);
             println!("[ DAWCA ] {} -> {}", dna, moov_path);
         }
-        AppEvent::RepairSuccess { file_name, dna, algorithm } => {
-            let _ = crate::db::reward_algorithm(ws, &dna, &algorithm);
+        AppEvent::RepairSuccess { file_name, dna, algorithm, features } => {
+            let _ = crate::db::reward_algorithm(ws, &dna, &algorithm, &features);
             println!("[  ✔   ] {} naprawiony algorytmem {}", file_name, algorithm);
         }
-        AppEvent::RepairFailure { file_name, dna, algorithm } => {
-            let _ = crate::db::penalize_algorithm(ws, &dna, &algorithm);
+        AppEvent::RepairFailure { file_name, dna, algorithm, features } => {
+            let _ = crate::db::penalize_algorithm(ws, &dna, &algorithm, &features);
             println!("[  ✘   ] {} - algorytm {} zawiódł", file_name, algorithm);
         }
 
@@ -160,13 +160,21 @@ mod tests {
 
     /// Sedno modułu: zdarzenia niosące naukę muszą trafić do bazy. Bez
     /// odbiornika `RepairSuccess` przepadał i przebieg niczego nie uczył.
+    ///
+    /// Sprawdza też, że wektor cech NIESIONY przez zdarzenie trafia do
+    /// kolumny `features_json` — bez tego `BrainCache::feature_store` zostaje
+    /// puste i klasyfikator KNN nigdy się nie trenuje (patrz dokumentacja
+    /// `db::reward_algorithm`).
     #[test]
     fn test_z_odbiorem_zapisuje_nauke_do_bazy() {
         let ws = Workspace::init_testowy("bezglowe_nauka").unwrap();
         crate::db::init_db(&ws).expect("baza musi się utworzyć");
 
+        let cechy = crate::ai::FeatureVector {
+            file_size_mb: 42.0, entropy: 7.2, h264_profile: 100.0, aac_freq: 44100.0, video_audio_ratio: 0.9,
+        };
         z_odbiorem(&ws, |tx| {
-            tx.repair_success("plik.mp4", "DNA_TESTOWE", "Clone");
+            tx.repair_success("plik.mp4", "DNA_TESTOWE", "Clone", cechy.clone());
         });
 
         // Nagroda dla algorytmu jest widoczna w bazie wiedzy.
@@ -180,6 +188,17 @@ mod tests {
             .unwrap_or(0);
 
         assert!(ile > 0, "Zdarzenie RepairSuccess musi zostawić ślad w bazie wiedzy");
+
+        let zapisane_json: String = conn
+            .query_row(
+                "SELECT features_json FROM knowledge_base WHERE dna_signature = ?1",
+                [&"DNA_TESTOWE"],
+                |r| r.get(0),
+            )
+            .expect("features_json musi zostać zapisane");
+        let odczytane: crate::ai::FeatureVector = serde_json::from_str(&zapisane_json).unwrap();
+        assert_eq!(odczytane, cechy, "wektor cech niesiony przez zdarzenie musi trafić do bazy nietknięty");
+
         let _ = std::fs::remove_dir_all(&ws.root_dir);
     }
 

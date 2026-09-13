@@ -23,6 +23,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use mp4_doctor::ai::FeatureVector;
 use mp4_doctor::event::{
     channel, AppEvent, LogLevel, LogMessage, SanitizerMetrics, StatUpdate, WorkerStatus,
 };
@@ -36,6 +37,14 @@ use mp4_doctor::{
     autopilot, db, dna, get_thread_count, god_mode, scanner, set_thread_count, training_ground,
     validator, SHUTDOWN_FLAG,
 };
+
+/// Wektor cech do testów, które nie sprawdzają jego treści — tylko to, że
+/// `reward_algorithm`/`penalize_algorithm`/`AppEvent::RepairSuccess` (od
+/// niedawna wymagające `FeatureVector`, patrz `db::reward_algorithm`)
+/// dostają cokolwiek zamiast się nie kompilować.
+fn cechy_testowe() -> FeatureVector {
+    FeatureVector { file_size_mb: 10.0, entropy: 7.0, h264_profile: 100.0, aac_freq: 44100.0, video_audio_ratio: 0.8 }
+}
 
 // =========================================================================
 // COMMON TEST HARNESS & ISOLATION HELPERS
@@ -633,7 +642,7 @@ pub mod tier1_feature_coverage {
     #[test]
     fn test_tier1_f4_04_training_ground_repair_telemetry() {
         let (tx, rx) = channel();
-        tx.repair_success("test.mp4", "DNA_ABC", "Clone");
+        tx.repair_success("test.mp4", "DNA_ABC", "Clone", cechy_testowe());
         let evt = rx.recv_timeout(Duration::from_millis(100)).unwrap();
         assert!(matches!(evt, AppEvent::RepairSuccess { .. }));
     }
@@ -782,9 +791,10 @@ pub mod tier1_feature_coverage {
     #[test]
     fn test_tier1_f6_05_algorithm_reward_and_penalize() {
         let ws_guard = TestWorkspaceGuard::new("reward_penalize_t1");
-        db::reward_algorithm(&ws_guard.ws, "TEST_DNA", "Native").unwrap();
-        db::reward_algorithm(&ws_guard.ws, "TEST_DNA", "Native").unwrap();
-        db::penalize_algorithm(&ws_guard.ws, "TEST_DNA", "Clone").unwrap();
+        let cechy = cechy_testowe();
+        db::reward_algorithm(&ws_guard.ws, "TEST_DNA", "Native", &cechy).unwrap();
+        db::reward_algorithm(&ws_guard.ws, "TEST_DNA", "Native", &cechy).unwrap();
+        db::penalize_algorithm(&ws_guard.ws, "TEST_DNA", "Clone", &cechy).unwrap();
 
         let cache = db::build_brain_cache(&ws_guard.ws).unwrap();
         assert!(cache.algorithms.contains_key("TEST_DNA"));
@@ -1731,9 +1741,10 @@ pub mod tier2_boundary_corner {
         for i in 0..4 {
             let ws_c = Arc::clone(&ws);
             handles.push(thread::spawn(move || {
+                let cechy = cechy_testowe();
                 for j in 0..50 {
                     let dna = format!("DNA_{}_{}", i, j);
-                    db::reward_algorithm(&ws_c, &dna, "Native").unwrap();
+                    db::reward_algorithm(&ws_c, &dna, "Native", &cechy).unwrap();
                 }
             }));
         }
@@ -2494,6 +2505,7 @@ pub mod tier3_pairwise_combinations {
             file_name: "video_corrupt.mp4".to_string(),
             dna: "DNA_GOD_PAIR".to_string(),
             algorithm: "Native".to_string(),
+            features: cechy_testowe(),
         }).unwrap();
         app.event_sender.success("GOD_MODE", "Repair completed successfully");
 
