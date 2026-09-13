@@ -69,10 +69,9 @@ rawloader = "0.37.2"
 mp4 = "0.14.0"
 matroska = "0.30.1"
 
-# --- Rdzeń naprawy MP4 (port silników z projektu mp4_doctor) ---
-# `byteorder` - zapis big-endian przy budowie atomów ISOBMFF.
-# `memchr` - szybkie wyszukiwanie sygnatur w buforze przy skanowaniu NAL.
-byteorder = "1.5.0"
+# `memchr` - szybkie wyszukiwanie sygnatur w buforze przy skanowaniu NAL
+# (jpeg_splice). Zapis ISOBMFF (dawniej `byteorder`) żyje teraz wyłącznie
+# w `mp4_engines`, który deklaruje tę zależność u siebie.
 memchr = "2.8.3"
 
 [dev-dependencies]
