@@ -2,9 +2,9 @@
 
 //! # Śledzenie Zajętości Logicznych Slotów Puli Rayon (Wariant A)
 //!
-//! **STATUS: MODUŁ EKSPERYMENTALNY, JESZCZE NIEWPIĘTY W ŻADNĄ FAZĘ.**
-//! Zbudowany i przetestowany samodzielnie, na żądanie, jako krok pośredni
-//! przed ewentualną integracją z panelem live którejś z faz.
+//! **STATUS: WPIĘTY** we wszystkie fazy równoległe (2-7, 9-19) do panelu
+//! live "Wariant A". Nagłówek wcześniej twierdził „jeszcze niewpięty w żadną
+//! fazę" — to przestało być prawdą od czasu integracji opisanej niżej.
 //!
 //! ## Kluczowe zastrzeżenie (przeczytaj przed użyciem)
 //!

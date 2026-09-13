@@ -1,9 +1,12 @@
 // src/video_image.rs
 
-//! # Diagnostyka Kontenerów Wideo (MP4/MOV/M4V) — Moduł Eksperymentalny
+//! # Diagnostyka Kontenerów Wideo (MP4/MOV/M4V)
 //!
-//! **STATUS: SAMODZIELNY MODUŁ, JESZCZE NIEWPIĘTY W ŻADNĄ FAZĘ.**
-//! Ten sam wzorzec co `raw_image` (DNG) i `heic_image` (HEIC).
+//! **STATUS: WPIĘTY.** Używany przez `phases::phase19_video`,
+//! `phases::repair_modules::mod` (gałąź ISOBMFF `weryfikuj_naprawiony_plik`)
+//! i `logging`. Nagłówek wcześniej twierdził „jeszcze niewpięty w żadną
+//! fazę" — to przestało być prawdą, ten sam wzorzec co `raw_image` (DNG) i
+//! `heic_image` (HEIC).
 //!
 //! ## Co ten moduł ROBI, a czego NIE robi
 //!
