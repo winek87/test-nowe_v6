@@ -359,12 +359,8 @@ mod tests {
             v
         }
 
-        /// Buduje pudełko ISOBMFF.
         fn pudelko(typ: &[u8; 4], tresc: &[u8]) -> Vec<u8> {
-            let mut out = ((8 + tresc.len()) as u32).to_be_bytes().to_vec();
-            out.extend_from_slice(typ);
-            out.extend_from_slice(tresc);
-            out
+            crate::test_fixtures::box_isobmff(typ, tresc)
         }
 
         let bajty = std::fs::read("image/test_fixture.heic").expect("fixture musi istnieć");

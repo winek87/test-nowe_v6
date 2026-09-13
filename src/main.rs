@@ -20,6 +20,9 @@ mod raster_splice;
 mod zip_splice;
 mod tar_archive;
 
+#[cfg(test)]
+mod test_fixtures;
+
 mod thread_activity;
 mod db;
 mod diag;

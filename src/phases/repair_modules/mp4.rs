@@ -793,10 +793,7 @@ mod tests {
     /// stco wskazującym wewnątrz pliku.
     fn budowa_spojnego_mp4() -> Vec<u8> {
         fn box_(typ: &[u8; 4], tresc: &[u8]) -> Vec<u8> {
-            let mut b = ((tresc.len() + 8) as u32).to_be_bytes().to_vec();
-            b.extend_from_slice(typ);
-            b.extend_from_slice(tresc);
-            b
+            crate::test_fixtures::box_isobmff(typ, tresc)
         }
 
         let mut stco = vec![0u8; 4];

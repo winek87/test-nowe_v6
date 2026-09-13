@@ -171,14 +171,8 @@ pub fn verify_video_bytes(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// Buduje minimalny box ISOBMFF: 4 bajty rozmiaru (big-endian) + 4 bajty
-    /// typu + dane.
     fn build_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let size = (8 + payload.len()) as u32;
-        let mut out = size.to_be_bytes().to_vec();
-        out.extend_from_slice(box_type);
-        out.extend_from_slice(payload);
-        out
+        crate::test_fixtures::box_isobmff(box_type, payload)
     }
 
     fn build_ftyp() -> Vec<u8> {

@@ -1559,39 +1559,8 @@ mod tests {
 
     const TAR_BLOK: usize = 512;
 
-    /// Buduje nagłówek tar z prawidłowo policzoną sumą kontrolną. Pole sumy
-    /// liczy się jako spacje (0x20) — wypełniamy je spacjami PRZED sumowaniem,
-    /// więc zwykła suma bajtów daje wynik zgodny ze specyfikacją.
-    fn tar_naglowek(nazwa: &str, rozmiar: u64) -> Vec<u8> {
-        let mut h = vec![0u8; TAR_BLOK];
-        let n = nazwa.len().min(100);
-        h[..n].copy_from_slice(&nazwa.as_bytes()[..n]);
-
-        let pole_rozmiaru = format!("{:011o}\0", rozmiar);
-        h[124..124 + pole_rozmiaru.len()].copy_from_slice(pole_rozmiaru.as_bytes());
-
-        h[257..262].copy_from_slice(b"ustar");
-        h[262] = b' ';
-        h[148..156].copy_from_slice(b"        ");
-
-        let suma: u32 = h.iter().map(|&b| b as u32).sum();
-        let pole_sumy = format!("{:06o}\0 ", suma);
-        h[148..148 + pole_sumy.len()].copy_from_slice(pole_sumy.as_bytes());
-        h
-    }
-
-    /// Składa kompletne, zdrowe archiwum tar (wpisy + znacznik końca).
     fn tar_archiwum(wpisy: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (nazwa, dane) in wpisy {
-            out.extend(tar_naglowek(nazwa, dane.len() as u64));
-            let bloki = dane.len().div_ceil(TAR_BLOK);
-            let mut wyrownane = dane.to_vec();
-            wyrownane.resize(bloki * TAR_BLOK, 0);
-            out.extend(wyrownane);
-        }
-        out.extend_from_slice(&[0u8; TAR_BLOK * 2]);
-        out
+        crate::test_fixtures::zbuduj_tar(wpisy)
     }
 
     #[test]

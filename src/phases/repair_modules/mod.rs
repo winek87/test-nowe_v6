@@ -685,21 +685,13 @@ mod tests {
     // ------------------------------------------------------------------
 
     use tempfile::tempdir;
+    use crate::test_fixtures::zapisz;
 
-    fn zapisz(dir: &Path, nazwa: &str, dane: &[u8]) -> PathBuf {
-        let p = dir.join(nazwa);
-        std::fs::write(&p, dane).unwrap();
-        p
-    }
-
-    /// Buduje prawdziwy, dekodowalny PNG.
+    /// Buduje prawdziwy, dekodowalny PNG 4×4 — cienka nakładka nad
+    /// `crate::test_fixtures::prawdziwy_png`, bo tutejsze testy zawsze chcą
+    /// tego samego, najmniejszego sensownego rozmiaru.
     fn prawdziwy_png() -> Vec<u8> {
-        let obraz = image::RgbImage::new(4, 4);
-        let mut bajty = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(obraz)
-            .write_to(&mut bajty, image::ImageFormat::Png)
-            .unwrap();
-        bajty.into_inner()
+        crate::test_fixtures::prawdziwy_png(4, 4)
     }
 
     #[test]

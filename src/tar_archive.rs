@@ -268,12 +268,15 @@ pub fn verify_tar_bytes(bytes: &[u8]) -> bool {
 // TESTY JEDNOSTKOWE
 // ============================================================================
 
+/// Budowniczy prawdziwych archiwów TAR do testów — jedyna kopia w crate'cie
+/// (patrz `crate::test_fixtures`, które tylko deleguje tutaj). Mieszka obok
+/// reszty logiki formatu TAR, tym samym wzorcem co `png_repair::pomoce_testowe`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod pomoce_testowe {
     use super::*;
 
     /// Buduje poprawny nagłówek tar z prawidłowo policzoną sumą kontrolną.
-    fn build_header(name: &str, size: u64) -> Vec<u8> {
+    pub fn build_header(name: &str, size: u64) -> Vec<u8> {
         let mut h = vec![0u8; BLOCK_SIZE];
         h[..name.len().min(100)].copy_from_slice(&name.as_bytes()[..name.len().min(100)]);
         let size_field = format!("{:011o}\0", size);
@@ -287,7 +290,7 @@ mod tests {
         h
     }
 
-    fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, data) in entries {
             out.extend(build_header(name, data.len() as u64));
@@ -299,6 +302,12 @@ mod tests {
         out.extend_from_slice(&[0u8; BLOCK_SIZE * 2]);
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::pomoce_testowe::{build_header, build_tar};
 
     /// Psuje sumę kontrolną nagłówka wpisu o podanym indeksie.
     fn corrupt_header(tar: &[u8], entry_idx: usize) -> Vec<u8> {

@@ -135,12 +135,16 @@ pub fn verify_zip_bytes(bytes: &[u8]) -> bool {
 // TESTY JEDNOSTKOWE
 // ============================================================================
 
+/// Budowniczy prawdziwych archiwów ZIP do testów — jedyna kopia w crate'cie
+/// (patrz `crate::test_fixtures`, które tylko deleguje tutaj). Mieszka obok
+/// reszty logiki formatu ZIP, tym samym wzorcem co `png_repair::pomoce_testowe`
+/// i `jpeg_splice::pomoce_testowe`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod pomoce_testowe {
     use super::*;
 
     /// Buduje prawdziwe archiwum ZIP z podanych par (nazwa, treść).
-    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = ZipWriter::new(Cursor::new(&mut buf));
@@ -152,6 +156,12 @@ mod tests {
         }
         buf
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::pomoce_testowe::build_zip;
 
     /// Psuje jeden bajt pod podanym offsetem — symuluje uszkodzenie
     /// strumienia skompresowanego (CRC przestanie się zgadzać przy odczycie).

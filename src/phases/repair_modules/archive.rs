@@ -292,21 +292,10 @@ mod tests {
         std::fs::write(sciezka, dane).unwrap();
     }
 
-    /// Buduje prawdziwe archiwum ZIP o podanych wpisach.
+    /// Buduje prawdziwe archiwum ZIP o podanych wpisach — patrz
+    /// `crate::test_fixtures::zbuduj_zip` (jedyna implementacja w crate'cie).
     fn zbuduj_zip(wpisy: &[(&str, &[u8])]) -> Vec<u8> {
-        use std::io::Write;
-        use zip::write::SimpleFileOptions;
-
-        let mut bufor = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut bufor));
-            for (nazwa, dane) in wpisy {
-                w.start_file(*nazwa, SimpleFileOptions::default()).unwrap();
-                w.write_all(dane).unwrap();
-            }
-            w.finish().unwrap();
-        }
-        bufor
+        crate::test_fixtures::zbuduj_zip(wpisy)
     }
 
     #[test]
