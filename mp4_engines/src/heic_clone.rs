@@ -21,9 +21,27 @@
 //! ## Dlaczego tu NIE trzeba przepisywać offsetów
 //!
 //! Wynik składamy jako: **wszystkie atomy dawcy sprzed `mdat`, skopiowane
-//! bajt w bajt** + **atom `mdat` z pliku uszkodzonego**. Dzięki temu `mdat`
-//! ląduje pod DOKŁADNIE tym samym offsetem, co u dawcy, więc offsety w `iloc`
-//! pozostają poprawne bez żadnej ingerencji.
+//! bajt w bajt** + **DANE `mdat` z pliku uszkodzonego, pod nagłówkiem
+//! zbudowanym w STYLU DAWCY** (patrz niżej, dlaczego nagłówek, a nie same
+//! dane, decyduje). Dzięki temu dane `mdat` lądują pod DOKŁADNIE tym samym
+//! offsetem, co u dawcy, więc offsety w `iloc` pozostają poprawne bez żadnej
+//! ingerencji w samą tablicę.
+//!
+//! ### Pułapka, którą to omija: szerokość nagłówka `mdat`
+//!
+//! `iloc` dawcy jest skalibrowany względem tego, GDZIE U DAWCY zaczynają się
+//! DANE `mdat` — czyli `mdat_dawcy.offset + mdat_dawcy.header_size`, gdzie
+//! `header_size` to 8 albo 16 bajtów, zależnie od tego, czy box używa
+//! zwykłego, czy rozszerzonego (`largesize`) rozmiaru. Sam box `mdat` w
+//! WYNIKU zawsze zaczyna się pod `mdat_dawcy.offset` (bo prefiks dawcy jest
+//! kopiowany bajt w bajt) — ale gdyby WYNIK przejął nagłówek `mdat` PLIKU
+//! USZKODZONEGO (jak we wcześniejszej wersji tego modułu) zamiast zbudować
+//! własny w stylu dawcy, a te dwa headery różniłyby się szerokością (8 vs 16
+//! B — różne narzędzia/kodery różnie kodują ten sam rozmiar), DANE lądowałyby
+//! pod innym offsetem niż zakłada `iloc` — WSZYSTKIE extenty przesunięte o
+//! różnicę szerokości nagłówków, cicho, bez żadnego błędu. Dlatego ta funkcja
+//! zawsze SYNTETYZUJE nagłówek `mdat` wyniku w stylu dawcy, zamiast kopiować
+//! cudzy.
 //!
 //! To nie jest uproszczenie, a świadomie dobrany wariant. W badanym pliku
 //! `iloc` ma wersję 1, offsety 4-bajtowe i 34 elementy — z czego 33 extenty
@@ -135,13 +153,62 @@ pub fn zloz_bajty(uszkodzony: &[u8], dawca: &[u8]) -> io::Result<Vec<u8>> {
     // gwarantuje, że offsety w `iloc` pozostają poprawne, także te wskazujące
     // poza `mdat`.
     let prefiks = &dawca[..mdat_dawcy.offset];
-    let mdat_uszkodzonego_bajty = &uszkodzony[mdat_uszkodzonego.offset..dane_do_uszk];
+    // TYLKO dane (bez nagłówka) pliku uszkodzonego — nagłówek wyniku budujemy
+    // sami, w stylu DAWCY, patrz dokumentacja modułu ("Pułapka... szerokość
+    // nagłówka mdat"). Kopiowanie cudzego nagłówka byłoby bezpieczne tylko
+    // przy przypadkowej zgodności szerokości obu nagłówków.
+    let dane_mdat = &uszkodzony[dane_od_uszk..dane_do_uszk];
 
-    let mut wynik = Vec::with_capacity(prefiks.len() + mdat_uszkodzonego_bajty.len());
+    let naglowek_mdat = zbuduj_naglowek_mdat(mdat_dawcy.header_size, dlugosc_uszk)?;
+
+    let mut wynik = Vec::with_capacity(prefiks.len() + naglowek_mdat.len() + dane_mdat.len());
     wynik.extend_from_slice(prefiks);
-    wynik.extend_from_slice(mdat_uszkodzonego_bajty);
+    wynik.extend_from_slice(&naglowek_mdat);
+    wynik.extend_from_slice(dane_mdat);
 
     Ok(wynik)
+}
+
+/// Buduje nagłówek boxu `mdat` (rozmiar + typ, [+ largesize]) w STYLU DAWCY
+/// (`header_size` dawcy: 8 albo 16 bajtów), dla danych o długości `dlugosc`.
+///
+/// `header_size == 8` wymaga, żeby CAŁY box (nagłówek + dane) zmieścił się w
+/// 32-bitowym polu rozmiaru — dla zdjęć HEIC/HEIF (limit tego modułu to 256
+/// MB, patrz [`LIMIT_W_RAM`]) to w praktyce zawsze prawda, ale
+/// `zloz_bajty` jest funkcją PUBLICZNĄ i wywoływalną bezpośrednio na
+/// dowolnych bajtach (m.in. w testach), więc kontrola musi być jawna, a nie
+/// założona.
+fn zbuduj_naglowek_mdat(header_size: usize, dlugosc: usize) -> io::Result<Vec<u8>> {
+    match header_size {
+        8 => {
+            let rozmiar_boxu = 8u64 + dlugosc as u64;
+            let Ok(rozmiar_32) = u32::try_from(rozmiar_boxu) else {
+                return Err(blad(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dawca używa 8-bajtowego nagłówka mdat, ale dane uszkodzonego pliku ({} B) \
+                         nie mieszczą się w 32-bitowym polu rozmiaru - przeszczep wymagałby \
+                         nagłówka innej szerokości niż u dawcy, co unieważniłoby offsety iloc",
+                        dlugosc
+                    ),
+                ));
+            };
+            let mut naglowek = rozmiar_32.to_be_bytes().to_vec();
+            naglowek.extend_from_slice(b"mdat");
+            Ok(naglowek)
+        }
+        16 => {
+            let rozmiar_boxu = 16u64 + dlugosc as u64;
+            let mut naglowek = 1u32.to_be_bytes().to_vec(); // size32 == 1 -> largesize niżej
+            naglowek.extend_from_slice(b"mdat");
+            naglowek.extend_from_slice(&rozmiar_boxu.to_be_bytes());
+            Ok(naglowek)
+        }
+        inny => Err(blad(
+            io::ErrorKind::InvalidData,
+            format!("nagłówek mdat dawcy ma nietypową szerokość {} B (oczekiwano 8 albo 16)", inny),
+        )),
+    }
 }
 
 /// Wykonuje przeszczep i zapisuje wynik na dysk.
@@ -157,7 +224,7 @@ pub fn repair(broken_file: &str, donor_file: &str, output_file: &str) -> io::Res
     let wynik = zloz_bajty(&uszkodzony, &dawca)?;
 
     tracing::debug!(
-        "🖼️ [HEIC-CLONE] Złożono {} B (prefiks dawcy + mdat pliku uszkodzonego). Zapis: {}",
+        "🖼️ [HEIC-CLONE] Złożono {} B (prefiks dawcy + nagłówek mdat w stylu dawcy + dane pliku uszkodzonego). Zapis: {}",
         wynik.len(), output_file
     );
 
@@ -187,6 +254,18 @@ mod tests {
         plik.extend(atom(b"meta", meta_tresc));
         plik.extend(atom(b"mdat", mdat_dane));
         plik
+    }
+
+    /// Buduje atom z ROZSZERZONYM (16-bajtowym, `largesize`) nagłówkiem -
+    /// wyłącznie do testowania odporności na niezgodność szerokości
+    /// nagłówka `mdat` między dawcą a plikiem uszkodzonym.
+    fn atom_largesize(typ: &[u8; 4], tresc: &[u8]) -> Vec<u8> {
+        let rozmiar = 16u64 + tresc.len() as u64;
+        let mut b = 1u32.to_be_bytes().to_vec(); // size32 == 1 -> largesize
+        b.extend_from_slice(typ);
+        b.extend_from_slice(&rozmiar.to_be_bytes());
+        b.extend_from_slice(tresc);
+        b
     }
 
     // ------------------------------------------------------------------
@@ -308,6 +387,107 @@ mod tests {
         let uszkodzony = heic(b"INDEKS", &[0xBBu8; 32]);
         assert!(zloz_bajty(&uszkodzony, b"to zupelnie nie jest kontener").is_err());
         assert!(zloz_bajty(&uszkodzony, b"").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA: szerokość nagłówka mdat (8 vs 16 bajtów, largesize)
+    //
+    // `iloc` dawcy jest skalibrowany względem GDZIE U DAWCY zaczynają się
+    // DANE mdat - `offset + header_size` DAWCY. Wcześniejsza wersja tego
+    // modułu kopiowała nagłówek mdat PLIKU USZKODZONEGO razem z danymi;
+    // gdyby szerokości nagłówków się różniły, dane lądowałyby pod INNYM
+    // offsetem niż zakłada iloc - wszystkie extenty przesunięte o różnicę
+    // (typowo 8 bajtów), cicho, bez błędu. Żaden test korzystający wyłącznie
+    // z `atom()` (zawsze 8-bajtowy nagłówek) tego nie wykrywał - to właśnie
+    // ten ślepy punkt testy niżej zamykają.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_dane_laduja_sie_pod_offsetem_naglowka_dawcy_mimo_roznej_szerokosci_naglowkow() {
+        // Dawca: mdat z ROZSZERZONYM (16-bajtowym) nagłówkiem.
+        let mut dawca = atom(b"ftyp", b"heic\x00\x00\x00\x00");
+        dawca.extend(atom(b"meta", b"INDEKS-DAWCY"));
+        let mdat_dawcy_offset = dawca.len();
+        dawca.extend(atom_largesize(b"mdat", &[0xAAu8; 40]));
+
+        // Uszkodzony: mdat ze ZWYKŁYM (8-bajtowym) nagłówkiem, dane dłuższe
+        // (dozwolone - patrz `test_dluzszy_mdat_uszkodzonego_jest_dopuszczalny`).
+        let mut uszkodzony = atom(b"ftyp", b"heic\x00\x00\x00\x00");
+        uszkodzony.extend(atom(b"meta", b"cokolwiek"));
+        uszkodzony.extend(atom(b"mdat", &[0xBBu8; 100]));
+
+        let wynik = zloz_bajty(&uszkodzony, &dawca)
+            .expect("przeszczep między różnymi szerokościami nagłówka mdat musi się udać");
+
+        // Nagłówek mdat DAWCY ma 16 bajtów -> dane MUSZĄ zacząć się pod
+        // mdat_dawcy_offset + 16, niezależnie od tego, że plik uszkodzony
+        // miał nagłówek 8-bajtowy.
+        let oczekiwany_offset_danych = mdat_dawcy_offset + 16;
+        assert_eq!(
+            &wynik[oczekiwany_offset_danych..oczekiwany_offset_danych + 100],
+            &[0xBBu8; 100],
+            "dane muszą wylądować dokładnie pod offsetem, jakiego oczekuje iloc dawcy (styl nagłówka DAWCY)"
+        );
+
+        // Sam box mdat w wyniku musi mieć szerokość nagłówka DAWCY (16 B) -
+        // czyli pole size32 na pozycji mdat_dawcy_offset musi być równe 1.
+        let size32_wyniku = u32::from_be_bytes(
+            wynik[mdat_dawcy_offset..mdat_dawcy_offset + 4].try_into().unwrap()
+        );
+        assert_eq!(size32_wyniku, 1, "wynik musi użyć rozszerzonego nagłówka, tak jak dawca");
+    }
+
+    /// To samo w drugą stronę: dawca ma ZWYKŁY (8-bajtowy) nagłówek, plik
+    /// uszkodzony ROZSZERZONY (16-bajtowy) - wynik musi i tak użyć stylu
+    /// dawcy (8 bajtów), nie stylu pliku uszkodzonego.
+    #[test]
+    fn test_dane_laduja_sie_pod_offsetem_naglowka_dawcy_gdy_uszkodzony_ma_szerszy_naglowek() {
+        let mut dawca = atom(b"ftyp", b"heic\x00\x00\x00\x00");
+        dawca.extend(atom(b"meta", b"INDEKS"));
+        let mdat_dawcy_offset = dawca.len();
+        dawca.extend(atom(b"mdat", &[0xAAu8; 40]));
+
+        let mut uszkodzony = atom(b"ftyp", b"heic\x00\x00\x00\x00");
+        uszkodzony.extend(atom(b"meta", b"cokolwiek"));
+        uszkodzony.extend(atom_largesize(b"mdat", &[0xBBu8; 100]));
+
+        let wynik = zloz_bajty(&uszkodzony, &dawca).expect("przeszczep musi się udać");
+
+        let oczekiwany_offset_danych = mdat_dawcy_offset + 8;
+        assert_eq!(&wynik[oczekiwany_offset_danych..oczekiwany_offset_danych + 100], &[0xBBu8; 100]);
+
+        let size32_wyniku = u32::from_be_bytes(
+            wynik[mdat_dawcy_offset..mdat_dawcy_offset + 4].try_into().unwrap()
+        );
+        assert_eq!(size32_wyniku, 108, "wynik musi użyć zwykłego 8-bajtowego nagłówka, tak jak dawca (nie largesize)");
+    }
+
+    #[test]
+    fn test_zbuduj_naglowek_mdat_standardowy() {
+        let n = zbuduj_naglowek_mdat(8, 100).unwrap();
+        assert_eq!(n.len(), 8);
+        assert_eq!(u32::from_be_bytes(n[0..4].try_into().unwrap()), 108);
+        assert_eq!(&n[4..8], b"mdat");
+    }
+
+    #[test]
+    fn test_zbuduj_naglowek_mdat_rozszerzony() {
+        let n = zbuduj_naglowek_mdat(16, 1000).unwrap();
+        assert_eq!(n.len(), 16);
+        assert_eq!(u32::from_be_bytes(n[0..4].try_into().unwrap()), 1);
+        assert_eq!(&n[4..8], b"mdat");
+        assert_eq!(u64::from_be_bytes(n[8..16].try_into().unwrap()), 1016);
+    }
+
+    /// Skrajny przypadek: nagłówek DAWCY jest zwykły (8 B), ale dane pliku
+    /// uszkodzonego są za duże, żeby zmieścić CAŁY box w 32-bitowym polu
+    /// rozmiaru. Przeszczep musiałby użyć INNEJ szerokości nagłówka niż
+    /// dawca - a to właśnie unieważnia offsety iloc, więc odrzucamy z jasnym
+    /// błędem zamiast produkować strukturalnie fałszywy plik.
+    #[test]
+    fn test_zbuduj_naglowek_mdat_odrzuca_gdy_dane_nie_miesza_sie_w_32_bitach() {
+        let e = zbuduj_naglowek_mdat(8, (u32::MAX as usize) + 1).unwrap_err();
+        assert!(e.to_string().contains("32-bitowym"), "błąd musi nazwać przyczynę: {}", e);
     }
 
     // ------------------------------------------------------------------
