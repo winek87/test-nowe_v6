@@ -187,7 +187,15 @@ pub fn run(
         let execution_result = match algo.as_str() {
             "Clone" => {
                 if let Some(donor) = find_donor(ws, &dna_sig, cache, event_sender, thread_id) {
-                    let donor_name = Path::new(&donor).file_name().unwrap().to_string_lossy();
+                    // Ten sam wzorzec co przy `broken_file` wyżej: ścieżka
+                    // dawcy nie jest tu literałem programisty, tylko wynikiem
+                    // `find_donor`/cache'a - w skrajnym przypadku (np. wpis
+                    // `donors_cache` zasilony przez zsynchronizowaną,
+                    // niezaufaną bazę roju) `unwrap()` na `file_name()`
+                    // panikowałby na źle sformowanej ścieżce.
+                    let donor_name = Path::new(&donor).file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| donor.clone());
                     event_sender.update_thread(thread_id, format!("🧬 Clone: Wstrzykuję dawcę '{}'...", donor_name));
                     engine_clone::repair(broken_file, &donor, out_str)
                 } else {
@@ -271,7 +279,13 @@ pub fn run(
     if !global_donors.is_empty() {
         let total_donors = global_donors.len();
         for (i, foreign_donor) in global_donors.iter().enumerate() {
-            let donor_name = Path::new(foreign_donor).file_name().unwrap().to_string_lossy();
+            // Ścieżki tutaj pochodzą z `donors_cache` (ewentualnie
+            // zasilanej synchronizacją z serwerem roju) lub z przeszukania
+            // dysku - ten sam powód co przy `find_donor` wyżej, żeby nie
+            // ufać bezwarunkowo `unwrap()`.
+            let donor_name = Path::new(foreign_donor).file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| foreign_donor.clone());
             let progress_msg = format!("🧪 Bruteforce [{}/{}]: Przymierzam nagłówek '{}'...", i + 1, total_donors, donor_name);
             event_sender.update_thread(thread_id, &progress_msg);
             event_sender.debug("BRUTEFORCE", progress_msg);
@@ -282,7 +296,19 @@ pub fn run(
             if engine_clone::repair(broken_file, foreign_donor, out_str).is_ok() {
                 if validator::is_healthy_video(out_str) {
                     event_sender.update_thread(thread_id, format!("🧟 SUKCES! Plik zmartwychwstał używając moov nr {}!", i + 1));
-                    event_sender.repair_success(&file_name, &dna_sig, "Bruteforce");
+                    // CELOWO bez `event_sender.repair_success(..., "Bruteforce")`:
+                    // to jedyne miejsce w tej kaskadzie, gdzie nazwa algorytmu
+                    // NIE JEST jedną z gałęzi rozpoznawanych w `match algo.as_str()`
+                    // wyżej (`Clone`/`Native`/`Recontainer`). Zapisanie jej jako
+                    // nauczonego algorytmu zatruwało `get_best_algorithms` dla
+                    // TEJ sygnatury DNA na zawsze: kolejne przebiegi dostawały
+                    // `algorithms == ["Bruteforce"]`, kaskada nie miała jak tego
+                    // wykonać (`_ => continue`), i tak wpadały w pełny bruteforce
+                    // ponownie — nauka nigdy nie przyspieszała kolejnych prób,
+                    // wbrew obietnicy silnika samouczącego się. Bez tego zapisu
+                    // `get_best_algorithms` wraca do domyślnej trójki
+                    // (Clone/Native/Recontainer), która ma choć szansę zadziałać
+                    // szybciej przy innym zestawie dawców.
                     event_sender.success("AUTOPILOT", format!("Bruteforce: Sukces z dawcą moov #{} dla {}!", i + 1, file_name));
                     return Ok(());
                 }

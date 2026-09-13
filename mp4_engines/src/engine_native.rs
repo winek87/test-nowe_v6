@@ -819,18 +819,30 @@ pub fn repair(
                     }
                 }
 
+                // Okna o stałej długości (36/20/8) sondują SPS/PPS zanim
+                // znana jest jego prawdziwa granica (kolejny start code).
+                // Blisko końca bufora tych bajtów może po prostu ZABRAKNĄĆ -
+                // strumień uszkodzony/ucięty tuż po nagłówku SPS/PPS to
+                // dokładnie ten przypadek, który ten silnik ma przeżyć, a nie
+                // spanikować na nim. `buffer.get(..)` zamiast indeksowania
+                // zwraca `None` zamiast panikować, gdy okno wychodzi poza
+                // bufor.
                 if config.sps.is_empty() && nal_type == 7 {
-                    let sps_data = buffer[i+start_len..i+start_len+36].to_vec(); 
-                    if let Some((w, h)) = parse_sps_resolution(&sps_data) {
-                        let msg = format!("🎯 Native: Zdekodowano matrycę: {}x{}", w, h);
-                        tracing::debug!("{}", msg); update_ui(msg); 
-                        config.width = w; config.height = h;
+                    if let Some(sps_data) = buffer.get(i+start_len..i+start_len+36) {
+                        if let Some((w, h)) = parse_sps_resolution(sps_data) {
+                            let msg = format!("🎯 Native: Zdekodowano matrycę: {}x{}", w, h);
+                            tracing::debug!("{}", msg); update_ui(msg);
+                            config.width = w; config.height = h;
+                        }
                     }
-                    config.sps = buffer[i+start_len..i+start_len+20].to_vec(); 
+                    if let Some(sps) = buffer.get(i+start_len..i+start_len+20) {
+                        config.sps = sps.to_vec();
+                    }
                 }
-                if config.pps.is_empty() && nal_type == 8 {
-                    config.pps = buffer[i+start_len..i+start_len+8].to_vec();
-                }
+                if config.pps.is_empty() && nal_type == 8
+                    && let Some(pps) = buffer.get(i+start_len..i+start_len+8) {
+                        config.pps = pps.to_vec();
+                    }
 
                 last_nal_start = Some((current_nal_absolute, start_len as u32, nal_type));
                 
@@ -844,10 +856,17 @@ pub fn repair(
                 let mut is_valid_adts = false;
                 if frame_size > 6 && freq_idx < 13 && channels > 0 {
                     let next_i = i + frame_size as usize;
-                    if next_i < valid_data_size {
+                    // `+ 1` bo sprawdzenie niżej czyta DWA bajty (`next_i` i
+                    // `next_i+1`) - `next_i < valid_data_size` gwarantowało
+                    // tylko pierwszy z nich. Ucięty strumień, którego kolejny
+                    // domniemany nagłówek ADTS ląduje dokładnie na
+                    // przedostatnim bajcie bufora, indeksował poza zakres.
+                    if next_i + 1 < valid_data_size {
                         if buffer[next_i] == 0xFF && (buffer[next_i+1] & 0xF0) == 0xF0 {
                             is_valid_adts = true;
                         }
+                    } else if next_i < valid_data_size {
+                        is_valid_adts = true; // Ostatni bajt bufora - nie da się sprawdzić dalej.
                     } else {
                         is_valid_adts = true; // Koniec bufora
                     }
@@ -1473,6 +1492,79 @@ mod tests {
 
         let wynik = repair(wejscie.to_str().unwrap(), wyjscie.to_str().unwrap(), None);
         assert!(wynik.is_err(), "bez jednostek NAL nie ma czego odbudowywać");
+    }
+
+    /// REGRESJA: sonda SPS (`buffer[i+start_len..i+start_len+36]`) czytana
+    /// bezwarunkowym indeksowaniem, gdy start code + bajt typu 7 (SPS)
+    /// pojawia się BLISKO KOŃCA pliku. Strażnik pętli głównej
+    /// (`i < valid_data_size.saturating_sub(8)`) NIE chroni przed tym - trzyma
+    /// tylko 8-bajtowy margines, a sonda sięga 36 bajtów naprzód. Dokładnie
+    /// taki plik - ucięty tuż po nagłówku SPS - jest codziennym materiałem
+    /// tego narzędzia z definicji.
+    ///
+    /// Pod starym, bezwarunkowym indeksowaniem to panikowało (`slice index
+    /// out of range`). Dziś `buffer.get(..)` ma zwrócić `None` i pozwolić
+    /// funkcji zakończyć się normalnie (błędem, nie paniką) - stąd
+    /// `catch_unwind`: sedno testu to BRAK PANIKI, niezależnie od tego, czy
+    /// ostateczny wynik to `Ok` czy `Err` (może zależeć od obecności ffmpeg
+    /// jako mechanizmu awaryjnego).
+    #[test]
+    fn test_repair_nie_panikuje_na_sps_ucietym_blisko_konca_bufora() {
+        let dir = tempfile::tempdir().unwrap();
+        let zepsuty = dir.path().join("zepsuty.h264");
+        let wynik_path = dir.path().join("wynik.mp4");
+
+        // Start code (4B) + bajt NAL typu 7 (0x67 = dolne 5 bitów = 0b00111 = 7),
+        // po którym zostaje ledwie 10 bajtów - dalekie od potrzebnych 36.
+        let mut dane = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+        dane.extend_from_slice(&[0xAA; 10]);
+        std::fs::write(&zepsuty, &dane).unwrap();
+
+        let wynik_panic = std::panic::catch_unwind(|| {
+            repair(zepsuty.to_str().unwrap(), wynik_path.to_str().unwrap(), None)
+        });
+        assert!(
+            wynik_panic.is_ok(),
+            "silnik Native spanikował na ucietym nagłówku SPS blisko końca bufora zamiast zwrócić błąd"
+        );
+    }
+
+    /// REGRESJA: off-by-one przy sprawdzaniu KOLEJNEGO nagłówka ADTS.
+    ///
+    /// Skrojony tak, żeby domniemany "kolejny nagłówek" (`next_i = i +
+    /// frame_size`) wypadał DOKŁADNIE na ostatnim bajcie bufora
+    /// (`valid_data_size - 1`). Stary warunek `next_i < valid_data_size`
+    /// przepuszczał to dalej i czytał `buffer[next_i+1]` - jeden bajt POZA
+    /// buforem. Ucięty strumień audio, którego ostatnia ramka ADTS kończy się
+    /// dosłownie na granicy pliku, jest dokładnie tym scenariuszem.
+    #[test]
+    fn test_repair_nie_panikuje_gdy_kolejny_naglowek_adts_wypada_na_ostatnim_bajcie() {
+        let dir = tempfile::tempdir().unwrap();
+        let zepsuty = dir.path().join("zepsuty.aac");
+        let wynik_path = dir.path().join("wynik.mp4");
+
+        // Nagłówek ADTS na i=0, tak dobrany, żeby frame_size == 19: skoro
+        // bufor ma DOKŁADNIE 20 bajtów, `next_i = 0 + 19 = 19` to ostatni
+        // ważny indeks - `buffer[next_i+1]` (bajt 20.) leży już poza buforem.
+        let mut dane = vec![
+            0xFFu8, // sync 1
+            0xF1,   // sync 2 (górny nibl = 0xF)
+            0x0D,   // freq_idx=3, bit0 kanałów=1
+            0x40,   // wysokie bity frame_size=0, bit1 kanałów=1 (channels=5)
+            0x02,   // środkowe bity frame_size
+            0x60,   // niskie bity frame_size -> razem frame_size = 19
+        ];
+        dane.extend_from_slice(&[0u8; 14]); // dopełnienie do 20 bajtów razem
+        assert_eq!(dane.len(), 20, "test zależy od DOKŁADNEJ długości bufora");
+        std::fs::write(&zepsuty, &dane).unwrap();
+
+        let wynik_panic = std::panic::catch_unwind(|| {
+            repair(zepsuty.to_str().unwrap(), wynik_path.to_str().unwrap(), None)
+        });
+        assert!(
+            wynik_panic.is_ok(),
+            "silnik Native spanikował na nagłówku ADTS wypadającym na ostatnim bajcie bufora"
+        );
     }
 
     /// Wywołanie zwrotne postępu jest opcjonalne — silnik musi działać tak

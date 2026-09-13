@@ -78,6 +78,22 @@ fn wczytaj_do_weryfikacji(sciezka: &Path, rozmiar: u64) -> std::result::Result<V
     }
 }
 
+/// Sprawdza, czy plik składa się WYŁĄCZNIE z bajtów zerowych — strumieniowo,
+/// stałym buforem, bez wczytywania całości do RAM. Jedyna kontrola, jakiej
+/// potrzebuje gałąź domyślna [`weryfikuj_naprawiony_plik`] (brak metody
+/// weryfikacji dla formatu), więc nie ma powodu ściągać nawet 512 MB pliku
+/// do pamięci tylko po to, żeby zapytać "czy to same zera".
+fn plik_same_zera(sciezka: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut plik = std::fs::File::open(sciezka)?;
+    let mut bufor = [0u8; 64 * 1024];
+    loop {
+        let wczytano = plik.read(&mut bufor)?;
+        if wczytano == 0 { return Ok(true); }
+        if bufor[..wczytano].iter().any(|&b| b != 0) { return Ok(false); }
+    }
+}
+
 /// Weryfikuje naprawiony plik metodą właściwą dla JEGO rozszerzenia.
 ///
 /// ## Dlaczego to istnieje
@@ -210,11 +226,11 @@ pub fn weryfikuj_naprawiony_plik(sciezka: &Path) -> WynikWeryfikacji {
     // empirycznie na plikach z ffmpeg: dla obu zapytanie o strumień `v:0`
     // zwraca wymiary, więc ffmpeg-owy sędzia ich nie odrzuci.
     //
-    // `.mj2` (Motion JPEG 2000) NIE jest tu wpisany świadomie: ffmpeg 7.1 nie
-    // ma muxera `mj2`, więc nie dało się zbudować materiału dowodowego, a
+    // TODO(.mj2): Motion JPEG 2000 NIE jest tu wpisany świadomie — ffmpeg 7.1
+    // nie ma muxera `mj2`, więc nie dało się zbudować materiału dowodowego, a
     // fałszywe odrzucenie kosztuje usunięcie naprawionego pliku (`sprzataj`).
-    // Zostaje w gałęzi domyślnej ze SŁABĄ gwarancją, aż będzie czym to
-    // potwierdzić.
+    // Zostaje w gałęzi domyślnej ze SŁABĄ gwarancją, aż pojawi się prawdziwy
+    // `image/test_fixture.mj2`. Pozycja 1 w `TODO.md` w korzeniu projektu.
     if matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "3gp" | "3g2" | "f4v") {
         // Ta sama weryfikacja, jakiej używają moduły MP4 — z automatycznym
         // zejściem do kontroli strukturalnej, gdy w systemie nie ma `ffmpeg`.
@@ -304,13 +320,18 @@ pub fn weryfikuj_naprawiony_plik(sciezka: &Path) -> WynikWeryfikacji {
         // Brak metody dla formatu: NIE udajemy dowodu. Sprawdzamy tylko, że
         // wynik nie jest oczywistym śmieciem, i jawnie meldujemy słabość
         // gwarancji, żeby log operacyjny nie wprowadzał w błąd.
-        _ => {
-            let bajty = match wczytaj_do_weryfikacji(sciezka, rozmiar) { Ok(b) => b, Err(w) => return w };
-            if bajty.iter().all(|&b| b == 0) {
-                return Err("naprawiony plik zawiera wyłącznie bajty zerowe".to_string());
-            }
-            Ok("brak metody weryfikacji dla tego formatu - sprawdzono niepustość i brak samych zer (gwarancja SŁABA)")
-        }
+        //
+        // Kontrola STRUMIENIOWA, nie `wczytaj_do_weryfikacji`: ta gałąź
+        // (jedyna prawdziwie generyczna - trafia do niej KAŻDY nieobsłużony
+        // format) sprawdza wyłącznie "same zera czy nie", więc nie ma powodu
+        // trzymać całego pliku (do 512 MB) w RAM na czas kontroli. Faza 17
+        // przetwarza pliki równolegle na puli Rayon, więc bez strumieniowania
+        // szczyt zużycia pamięci byłby wielokrotnością tego limitu.
+        _ => match plik_same_zera(sciezka) {
+            Ok(true) => Err("naprawiony plik zawiera wyłącznie bajty zerowe".to_string()),
+            Ok(false) => Ok("brak metody weryfikacji dla tego formatu - sprawdzono niepustość i brak samych zer (gwarancja SŁABA)"),
+            Err(e) => Err(format!("nie udało się odczytać naprawionego pliku: {}", e)),
+        },
     }
 }
 

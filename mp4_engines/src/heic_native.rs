@@ -256,8 +256,13 @@ impl<'a> CzytnikBitow<'a> {
         while self.bit()? == 0 {
             zer += 1;
             // Kod dłuższy niż 32 bity zer to na pewno nie poprawny SPS, a
-            // rozjechane parsowanie - lepiej zawieść niż pętlić.
-            if zer > 32 {
+            // rozjechane parsowanie - lepiej zawieść niż pętlić. Próg to
+            // `>= 32`, NIE `> 32`: `zer == 32` przepuszczony dalej dawał
+            // `1u32 << 32` niżej - przesunięcie o pełną szerokość typu, co
+            // panikuje w kompilacji debug (`cargo test`) i daje błędną
+            // wartość w release. 32-bitowy akumulator `u32` i tak nie mieści
+            // wartości wymagającej 32 wiodących zer.
+            if zer >= 32 {
                 return None;
             }
         }
@@ -360,8 +365,16 @@ pub fn parsuj_sps(nal_sps: &[u8]) -> Option<OpisSps> {
             _ => (1, 1), // 4:4:4 i monochrom
         };
 
-        szerokosc = szerokosc.saturating_sub(pod_szer * (lewy + prawy));
-        wysokosc = wysokosc.saturating_sub(pod_wys * (gorny + dolny));
+        // Liczone w u64: `lewy`/`prawy`/`gorny`/`dolny` pochodzą z `ue()` na
+        // NIEZAUFANYCH bajtach SPS i mogą być bliskie u32::MAX. Poprzednie
+        // `pod_szer * (lewy + prawy)` liczyło w u32 - dodawanie i mnożenie
+        // mogły przepełnić TYP ZANIM `saturating_sub` dostał szansę cokolwiek
+        // ochronić (panika w debug, cicho złe wymiary w release). W u64 ani
+        // dodawanie, ani mnożenie dwóch wartości u32 nie przepełnia.
+        let ciecie_szer = (pod_szer as u64) * (lewy as u64 + prawy as u64);
+        let ciecie_wys = (pod_wys as u64) * (gorny as u64 + dolny as u64);
+        szerokosc = (szerokosc as u64).saturating_sub(ciecie_szer) as u32;
+        wysokosc = (wysokosc as u64).saturating_sub(ciecie_wys) as u32;
     }
 
     let glebia_luma_minus8 = r.ue()?;
@@ -809,6 +822,27 @@ mod tests {
         assert_eq!(CzytnikBitow::nowy(&zera).ue(), None);
     }
 
+    /// REGRESJA na off-by-one w progu `zer >= 32` (wcześniej `zer > 32`).
+    ///
+    /// DOKŁADNIE 32 wiodące bity zerowe, potem terminator '1' i tyle danych,
+    /// żeby `u(32)` miało co czytać. Pod starym progiem (`zer > 32`) `zer==32`
+    /// PRZECHODZIŁO dalej i trafiało na `1u32 << 32` - przesunięcie o pełną
+    /// szerokość typu, panikujące w kompilacji debug (czyli w `cargo test`).
+    /// Test `..._nie_petli_na_smieciach` powyżej tego NIE łapał: same zera
+    /// zwracają `None` już w PĘTLI liczącej zera, zanim kod doszedłby do
+    /// przesunięcia.
+    #[test]
+    fn test_kod_golomba_odrzuca_dokladnie_32_bity_zerowe_zamiast_panikowac() {
+        let mut dane = vec![0u8; 4]; // 32 bity zerowe
+        dane.push(0xFF); // terminator '1' + wypełnienie
+        dane.extend_from_slice(&[0xFF; 8]); // dane pod ewentualne u(32)
+
+        assert_eq!(
+            CzytnikBitow::nowy(&dane).ue(), None,
+            "32 wiodące zera to kod na granicy pojemności u32 - musi zostać odrzucony, nie spanikować"
+        );
+    }
+
     #[test]
     fn test_usuwanie_bajtow_zapobiegania_emulacji() {
         assert_eq!(usun_zapobieganie_emulacji(&[0x00, 0x00, 0x03, 0x01]), vec![0x00, 0x00, 0x01]);
@@ -839,6 +873,84 @@ mod tests {
     fn test_parsowanie_sps_odrzuca_smieci() {
         assert!(parsuj_sps(&[0x42, 0x01]).is_none(), "za krótki NAL");
         assert!(parsuj_sps(&[0x42, 0x01, 0x00, 0x00, 0x00, 0x00]).is_none(), "same zera nie są SPS-em");
+    }
+
+    /// Zapisywacz bitów odwrotny do [`CzytnikBitow`] — WYŁĄCZNIE do budowy
+    /// syntetycznych SPS-ów w testach. Pozwala zakodować dowolną wartość
+    /// polem Exp-Golomb (`ue`), zamiast ręcznie liczyć bity dla każdego testu
+    /// z osobna.
+    struct ZapisBitow { bity: Vec<bool> }
+    impl ZapisBitow {
+        fn nowy() -> Self { Self { bity: Vec::new() } }
+        fn bit(&mut self, b: bool) { self.bity.push(b); }
+        fn u(&mut self, wartosc: u32, ile: u32) {
+            // `ile` bywa większe niż 32 (wypełnienie pól bez znaczenia, np.
+            // 96-bitowe `profile_tier_level`) - bity powyżej szerokości `u32`
+            // są zawsze zerowe, więc samo przesunięcie musi być pominięte,
+            // inaczej `wartosc >> i` dla `i >= 32` panikuje tak samo, jak
+            // produkcyjny kod, który ten plik testuje.
+            for i in (0..ile).rev() {
+                let bit = if i < 32 { ((wartosc >> i) & 1) == 1 } else { false };
+                self.bit(bit);
+            }
+        }
+        /// Koduje `wartosc` jako Exp-Golomb bez znaku (`ue(v)`), odwrotność
+        /// [`CzytnikBitow::ue`].
+        fn ue(&mut self, wartosc: u32) {
+            let temp = wartosc as u64 + 1;
+            let bity_temp = 64 - temp.leading_zeros();
+            for _ in 0..bity_temp - 1 { self.bit(false); }
+            for i in (0..bity_temp).rev() { self.bit(((temp >> i) & 1) == 1); }
+        }
+        fn bajty(&self) -> Vec<u8> {
+            let mut out = vec![0u8; self.bity.len().div_ceil(8)];
+            for (i, &b) in self.bity.iter().enumerate() {
+                if b { out[i / 8] |= 1 << (7 - (i % 8)); }
+            }
+            out
+        }
+    }
+
+    /// REGRESJA na przepełnienie arytmetyki okna zgodności
+    /// (`ciecie_szer`/`ciecie_wys` w `parsuj_sps`).
+    ///
+    /// Buduje SYNTETYCZNY, ale bitowo POPRAWNY SPS z absurdalnie dużymi
+    /// offsetami okna zgodności (bliskimi granicy, jaką w ogóle da się
+    /// zakodować przez `ue()` po naprawie progu `zer >= 32` - patrz
+    /// `test_kod_golomba_odrzuca_dokladnie_32_bity_zerowe...`). Pod starym
+    /// kodem `pod_szer * (lewy + prawy)` liczonym w `u32` to przepełniało TYP
+    /// zanim `saturating_sub` dostał szansę cokolwiek ochronić - panika w
+    /// kompilacji debug, cicho złe wymiary w release. Test dowodzi, że
+    /// funkcja dziś ani nie panikuje, ani nie zwraca wymiarów WIĘKSZYCH niż
+    /// oryginalne (obcinanie może tylko zmniejszać, nigdy zwiększać).
+    #[test]
+    fn test_parsowanie_sps_nie_przepelnia_sie_na_absurdalnym_oknie_zgodnosci() {
+        let mut w = ZapisBitow::nowy();
+        w.u(0, 4); // sps_video_parameter_set_id
+        w.u(0, 3); // sps_max_sub_layers_minus1 = 0 (upraszcza profile_tier_level)
+        w.u(0, 1); // sps_temporal_id_nesting_flag
+        w.u(0, 96); // profile_tier_level (96 bitów przy max_sub_layers_minus1 == 0) - treść bez znaczenia, jest pomijana
+        w.ue(0); // sps_seq_parameter_set_id
+        w.ue(1); // chroma_format_idc = 1 (4:2:0) -> pod_szer = pod_wys = 2, maksymalizuje ryzyko przepełnienia
+        w.ue(100); // pic_width_in_luma_samples
+        w.ue(100); // pic_height_in_luma_samples
+        w.bit(true); // conformance_window_flag = 1
+        w.ue(0x7FFF_FFFF); // conf_win_left_offset - blisko granicy kodowalnej przez ue()
+        w.ue(0x7FFF_FFFF); // conf_win_right_offset
+        w.ue(0); // conf_win_top_offset
+        w.ue(0); // conf_win_bottom_offset
+
+        let mut nal_sps = vec![0x42, 0x01]; // 2-bajtowy nagłówek NAL, pomijany przez parsuj_sps
+        nal_sps.extend(w.bajty());
+        nal_sps.extend_from_slice(&[0xFF; 32]); // zapas na dalsze pola, które funkcja mogłaby jeszcze przeczytać
+
+        // Sedno testu: wywołanie nie może spanikować. Jeśli parsowanie mimo
+        // to dojdzie do końca, obcięte wymiary nie mogą przekroczyć
+        // oryginalnych - inaczej przepełnienie ucieklo z powrotem do wyniku.
+        if let Some(opis) = parsuj_sps(&nal_sps) {
+            assert!(opis.szerokosc <= 100, "obcinanie nie może ZWIĘKSZYĆ szerokości: {}", opis.szerokosc);
+            assert!(opis.wysokosc <= 100, "obcinanie nie może ZWIĘKSZYĆ wysokości: {}", opis.wysokosc);
+        }
     }
 
     // ------------------------------------------------------------------

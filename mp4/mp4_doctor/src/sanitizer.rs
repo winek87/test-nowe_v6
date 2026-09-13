@@ -104,6 +104,11 @@ fn run_ffmpeg(tx: &EventSender, args: Vec<&str>, pass: u8) -> Result<(), String>
     for line in reader.split(b'\r') {
         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             let _ = cmd.kill();
+            // `kill()` tylko WYSYŁA sygnał - bez `wait()` proces zostaje
+            // zombie (zajmuje wpis w tabeli procesów) aż do wyjścia z całego
+            // programu. Przy wielokrotnym Ctrl+C w trakcie sesji to realny
+            // wyciek zasobu systemowego, nie tylko higiena.
+            let _ = cmd.wait();
             tx.warn("SANITIZER", "Przerwano sanityzację przez użytkownika (Ctrl+C)");
             return Err("Przerwano przez użytkownika (Ctrl+C)".to_string());
         }

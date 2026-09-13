@@ -63,7 +63,14 @@ pub fn parse_top_level_boxes(bytes: &[u8]) -> Vec<BoxInfo> {
         } else {
             (size32, 8)
         };
-        if size < header_size || offset + size > bytes.len() { break; }
+        // `size` przy 64-bitowym `largesize` pochodzi WPROST z pliku - może
+        // być bliskie u64::MAX. Zwykłe `offset + size` przepełniłoby `usize`:
+        // panika w kompilacji debug (a więc w `cargo test`), a w release -
+        // gdzie ten projekt NIE nadpisuje domyślnego `overflow-checks` -
+        // ciche zawinięcie, które mogłoby dać `offset + size <= bytes.len()`
+        // fałszywie prawdziwe i przepuścić box o spreparowanym rozmiarze.
+        let Some(koniec) = offset.checked_add(size) else { break };
+        if size < header_size || koniec > bytes.len() { break; }
         out.push(BoxInfo { box_type, offset, size, header_size });
         offset += size;
     }
@@ -92,7 +99,11 @@ fn collect_nested(bytes: &[u8], start: usize, end: usize, target: &[u8; 4], out:
             (big, 16)
         } else if size32 == 0 { (end - offset, 8) } else { (size32, 8) };
 
-        if size < header_size || offset + size > end { break; }
+        // Ta sama ochrona przed przepełnieniem `usize` co w
+        // `parse_top_level_boxes` - `size` z 64-bitowego `largesize` jest
+        // niezaufane i może być bliskie u64::MAX.
+        let Some(koniec) = offset.checked_add(size) else { break };
+        if size < header_size || koniec > end { break; }
         let info = BoxInfo { box_type, offset, size, header_size };
         if &box_type == target { out.push(info); }
         if CONTAINERS.contains(&&box_type) {
@@ -226,7 +237,10 @@ pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
             (rozmiar32, 8u64)
         };
 
-        if rozmiar < dlugosc_naglowka || offset + rozmiar > dlugosc {
+        // `rozmiar` przy rozszerzonym rozmiarze pochodzi wprost z pliku i może
+        // być bliskie u64::MAX - zwykłe dodawanie przepełniłoby licznik.
+        let Some(nowy_offset) = offset.checked_add(rozmiar) else { break };
+        if rozmiar < dlugosc_naglowka || nowy_offset > dlugosc {
             // Uszkodzony nagłówek albo atom wychodzący za plik — dalej iść nie
             // ma sensu, bo łańcuch jest już niewiarygodny.
             break;
@@ -236,7 +250,7 @@ pub fn rozmiar_danych_mdat(plik: &std::path::Path) -> Option<u64> {
             return Some(rozmiar - dlugosc_naglowka);
         }
 
-        offset += rozmiar;
+        offset = nowy_offset;
     }
 
     None
@@ -536,6 +550,60 @@ mod tests {
         let boxes = parse_top_level_boxes(&mp4);
         let types: Vec<String> = boxes.iter().map(|b| b.type_str()).collect();
         assert_eq!(types, vec!["ftyp", "mdat", "moov"]);
+    }
+
+    /// Buduje nagłówek boxu z ROZSZERZONYM rozmiarem 64-bitowym
+    /// (`size32 == 1`), o dowolnej, także absurdalnej wartości `largesize`.
+    /// Do testowania odporności na spreparowane/uszkodzone nagłówki - w
+    /// przeciwieństwie do `make_box`, nie wymaga prawdziwej zawartości
+    /// o zgodnej długości.
+    fn make_box_largesize(box_type: &[u8; 4], largesize: u64) -> Vec<u8> {
+        let mut out = 1u32.to_be_bytes().to_vec();
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(&largesize.to_be_bytes());
+        out
+    }
+
+    /// REGRESJA: box z `largesize` bliskim u64::MAX nie może przepełnić
+    /// `usize` przy `offset + size`. Przed poprawką panikowało w kompilacji
+    /// debug (a więc w `cargo test`) i mogło ciszej przepuścić box
+    /// o spreparowanym rozmiarze w release (patrz komentarz przy
+    /// `checked_add` w `parse_top_level_boxes`).
+    #[test]
+    fn test_parse_top_level_boxes_nie_przepelnia_sie_na_absurdalnym_largesize() {
+        let zly = make_box_largesize(b"free", u64::MAX - 4);
+        let boxes = parse_top_level_boxes(&zly);
+        assert!(boxes.is_empty(), "box o niemożliwym rozmiarze nie może zostać zaakceptowany");
+    }
+
+    /// To samo dla `collect_nested`, wołanego rekurencyjnie wewnątrz
+    /// kontenerów `moov/trak/mdia/minf/stbl` - inna funkcja, ten sam wzorzec
+    /// przepełnienia.
+    #[test]
+    fn test_collect_nested_nie_przepelnia_sie_na_absurdalnym_largesize() {
+        let zly_stbl = make_box_largesize(b"stco", u64::MAX - 4);
+        let stbl = make_box(b"stbl", &zly_stbl);
+        let minf = make_box(b"minf", &stbl);
+        let mdia = make_box(b"mdia", &minf);
+        let trak = make_box(b"trak", &mdia);
+        let moov = make_box(b"moov", &trak);
+
+        let mut out = Vec::new();
+        collect_nested(&moov, 0, moov.len(), b"stco", &mut out);
+        assert!(out.is_empty(), "stco o niemożliwym rozmiarze nie może zostać zaakceptowany");
+    }
+
+    /// REGRESJA na tej samej klasie błędu w `rozmiar_danych_mdat`, który
+    /// czyta bezpośrednio z pliku (nie z bufora w pamięci) i ma własną,
+    /// osobną pętlę z tym samym wzorcem `offset + rozmiar`.
+    #[test]
+    fn test_rozmiar_danych_mdat_nie_przepelnia_sie_na_absurdalnym_largesize() {
+        let dir = tempfile::tempdir().unwrap();
+        let plik = dir.path().join("zly.mp4");
+        std::fs::write(&plik, make_box_largesize(b"free", u64::MAX - 4)).unwrap();
+
+        // Nie może ani panikować, ani zwrócić fałszywego `mdat`.
+        assert!(rozmiar_danych_mdat(&plik).is_none());
     }
 
     #[test]

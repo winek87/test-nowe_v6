@@ -310,18 +310,55 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
                 if !module.applies_to(&ctx) { continue; }
 
                 let Some(katalog) = katalog_wyjsciowy.as_deref() else { break };
-                let Some((new_path, log)) = module.repair(&full_path, &ctx, twin_full.as_deref(), katalog) else { continue };
+
+                // Panika OSŁONIĘTA: te moduły są ręcznie pisanymi parserami
+                // formatów binarnych (mkv/png/splice/...) operującymi na
+                // ZNISZCZONYCH plikach z definicji - `unwrap()`/indeksowanie
+                // spoza zakresu w JEDNYM module nie może ubić całego wątku
+                // Rayon, a przez `thread::scope` w `menu::actions` - całej
+                // aplikacji w środku sesji operatora. Panika jest traktowana
+                // jak zwykła porażka TEGO modułu: próbujemy kolejnego.
+                //
+                // RESZTKOWE RYZYKO: jeśli moduł panikuje PO fizycznym
+                // zapisaniu pliku wyjściowego, ale PRZED jego zwróceniem, ten
+                // plik zostaje osierocony w `katalog_wyjsciowy` - nieznany pod
+                // żadną nazwą tej funkcji, więc nie da się go tu posprzątać
+                // bez rozszerzania API modułu. Dostrzegalny przez
+                // `workspace_cleanup`, nie przez bazę danych.
+                let proba_naprawy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    module.repair(&full_path, &ctx, twin_full.as_deref(), katalog)
+                }));
+
+                let (new_path, log) = match proba_naprawy {
+                    Ok(Some(wynik)) => wynik,
+                    Ok(None) => continue, // porażka fizyczna - kolejny moduł
+                    Err(_) => {
+                        if let Ok(mut f) = opr_log.lock() {
+                            let _ = writeln!(
+                                f, "[✖] [{}] {} | PANIKA W MODULE NAPRAWCZYM (repair) - pominięto, próbuję kolejnego",
+                                module.id(), task.rel_path
+                            );
+                        }
+                        continue;
+                    }
+                };
 
                 // OBOWIĄZKOWA WERYFIKACJA WYNIKU (patrz `RepairModule::verify`).
                 // Bez niej naprawiony plik szedł do bazy i dalej do Złotej
                 // Kopii bez żadnego dowodu sprawności — a Faza 9 pomija dla
-                // takich plików nawet kontrolę rozmiaru.
-                match module.verify(&new_path, &ctx) {
-                    Ok(dowod) => {
+                // takich plików nawet kontrolę rozmiaru. Osłonięta panice z
+                // tego samego powodu co `repair` powyżej - weryfikacja
+                // dekoduje/parsuje ten sam niezaufany plik.
+                let proba_weryfikacji = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    module.verify(&new_path, &ctx)
+                }));
+
+                match proba_weryfikacji {
+                    Ok(Ok(dowod)) => {
                         result_opt = Some((module.id(), new_path, format!("{} | Weryfikacja: {}", log, dowod)));
                         break;
                     }
-                    Err(powod) => {
+                    Ok(Err(powod)) => {
                         // Niesprawny wynik NIE MOŻE zostać na dysku: wyglądałby
                         // na gotową naprawę przy ręcznej analizie i przy
                         // kolejnym mapowaniu struktury.
@@ -336,6 +373,21 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
                         }
                         // Próbujemy KOLEJNEGO pasującego modułu - tak samo jak
                         // przy porażce fizycznej samej naprawy.
+                    }
+                    Err(_) => {
+                        // Panika w środku weryfikacji: traktujemy tak samo jak
+                        // odrzucenie - plik nie ma dowodu sprawności, więc nie
+                        // może zostać ani na dysku pod nazwą finalną, ani w
+                        // bazie.
+                        let _ = fs::remove_file(&new_path);
+                        stats.rejected_by_verification.fetch_add(1, Ordering::Relaxed);
+
+                        if let Ok(mut f) = opr_log.lock() {
+                            let _ = writeln!(
+                                f, "[✖] [{}] {} | PANIKA PODCZAS WERYFIKACJI - plik usunięty, próbuję kolejnego modułu",
+                                module.id(), task.rel_path
+                            );
+                        }
                     }
                 }
             }
@@ -408,8 +460,16 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
             for (k, v) in local_module_counts.drain() { *g_map.entry(k).or_insert(0) += v; }
         }
 
-        if !results.is_empty() {
-            let _ = tx_db.send(ScanMsg::Chunk(results));
+        if !results.is_empty() && tx_db.send(ScanMsg::Chunk(results)).is_err() {
+            // Odbiorca (wątek zapisu do bazy) już nie żyje - typowo dlatego,
+            // że transakcja SQLite zawiodła i wątek zakończył się błędem
+            // (patrz `db_thread` niżej). Bez tego sygnału pozostałe chunki
+            // kontynuowałyby PEŁNĄ fizyczną naprawę (dekodowanie, ffmpeg,
+            // zapis na dysk) dla tysięcy plików, których wynik i tak trafi do
+            // nikąd - `CANCEL_SIGNAL` jest już odpytywane w tej samej pętli
+            // (patrz góra `process_repair_stream`), więc ustawienie go tutaj
+            // zatrzymuje resztę wsadu zamiast mielić go na darmo.
+            CANCEL_SIGNAL.store(true, Ordering::Relaxed);
         }
     });
 
