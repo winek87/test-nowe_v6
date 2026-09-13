@@ -41,8 +41,12 @@ pub mod tui;
 // bo to testy INTEGRACYJNE: sterują aplikacją wyłącznie przez publiczne API
 // (`App`, `View`, `Modal`, `MAX_EVENTS_PER_TICK`), więc nic nie tracą na tym,
 // że nie widzą wnętrza biblioteki.
-#[cfg(test)]
-pub mod test_native;
+// `test_native` usunięty: było to ręczne narzędzie diagnostyczne silnika
+// Zero-Donor, którego nic nie wywoływało. Jego zadanie przejęły testy samego
+// silnika w `mp4_engines::engine_native` (27 testów, w tym e2e na materiale
+// z prawdziwego kodera). Przy okazji znika źródło śmieci: `run_diagnostic`
+// zapisywał `debug_broken.mp4` i `debug_fixed.mp4` pod ścieżką WZGLĘDNĄ,
+// czyli do katalogu uruchomienia.
 
 // --- GLOBAL SHUTDOWN FLAG ---
 lazy_static! {

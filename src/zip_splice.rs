@@ -317,4 +317,26 @@ mod tests {
         let spliced = splice_zip(&base, &base).expect("dwie zdrowe kopie powinny się złożyć");
         assert!(verify_zip_bytes(&spliced));
     }
+
+    /// Archiwum z PRAWDZIWEGO archiwizatora, nie zbudowane w pamięci przez
+    /// crate `zip`. Różne implementacje inaczej zapisują EOCD i nagłówki
+    /// lokalne, więc syntetyczne archiwum nie dowodzi zgodności z materiałem
+    /// z zewnątrz.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.zip. Uruchom z --ignored."]
+    fn test_prawdziwe_archiwum_przechodzi_weryfikacje() {
+        let bajty = std::fs::read("image/test_fixture.zip").expect("fixture musi istnieć");
+        assert!(verify_zip_bytes(&bajty), "Zdrowe archiwum z archiwizatora musi przejść CRC32");
+    }
+
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.zip. Uruchom z --ignored."]
+    fn test_uciete_prawdziwe_archiwum_jest_odrzucone() {
+        let pelny = std::fs::read("image/test_fixture.zip").expect("fixture musi istnieć");
+        let uciety = &pelny[..pelny.len() / 2];
+        assert!(
+            !verify_zip_bytes(uciety),
+            "Ucięte archiwum traci katalog centralny i MUSI zostać odrzucone"
+        );
+    }
 }

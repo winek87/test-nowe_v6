@@ -473,4 +473,31 @@ mod tests {
             WeryfikacjaHeic::Odrzucony
         );
     }
+
+    /// AVIF to ten sam kontener HEIF, ale INNY KODEK — dekoduje go `dav1d`,
+    /// nie `libde265`. Bez tego fixture'a cała ścieżka AVIF była nietknięta
+    /// przez testy, mimo że `is_heic_extension` ją obejmuje.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.avif oraz pluginu dav1d. Uruchom z --ignored."]
+    fn test_piksele_avif_dekoduja_sie_drugim_kodekiem() {
+        let bajty = std::fs::read("image/test_fixture.avif").expect("fixture musi istnieć");
+        assert_eq!(
+            verify_heic_pixels(&bajty),
+            WeryfikacjaHeic::PikseleZdekodowane,
+            "Zdrowy AVIF musi przejść pełne dekodowanie pikseli"
+        );
+    }
+
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.avif. Uruchom z --ignored."]
+    fn test_uszkodzony_avif_jest_odrzucony() {
+        let mut bajty = std::fs::read("image/test_fixture.avif").expect("fixture musi istnieć");
+        let pozycja = (0..bajty.len().saturating_sub(4))
+            .find(|&i| &bajty[i..i + 4] == b"mdat")
+            .expect("fixture musi mieć pudełko mdat");
+        for b in bajty[pozycja + 4..].iter_mut() {
+            *b = 0x5A;
+        }
+        assert_eq!(verify_heic_pixels(&bajty), WeryfikacjaHeic::Odrzucony);
+    }
 }

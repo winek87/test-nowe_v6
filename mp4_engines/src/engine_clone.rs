@@ -86,9 +86,54 @@ pub fn repair(broken_file: &str, donor_file: &str, output_file: &str) -> io::Res
 
     // Gdzie znajdzie się payload mdat w naszym nowym pliku?
     let new_mdat_payload_offset = moov_data.len() as i64 + mdat_header_size as i64;
-    
-    // Zmienna na wyliczoną deltę
-    let mut shift_delta: Option<i64> = None;
+
+    // =========================================================================
+    // WYZNACZENIE DELTY — NA PODSTAWIE UKŁADU DAWCY, NIE PIERWSZEGO WPISU
+    //
+    // NAPRAWIONY BŁĄD (znaleziony na prawdziwym pliku .3gp z dwiema ścieżkami):
+    // wcześniej delta była liczona JEDNORAZOWO z pierwszego wpisu PIERWSZEJ
+    // napotkanej tablicy `stco`, przy milczącym założeniu, że pierwszy kawałek
+    // tej ścieżki leży dokładnie na początku danych `mdat`. Dla pliku
+    // jednościeżkowego to prawda — i dlatego wada nie wychodziła w testach,
+    // które używały materiału bez dźwięku.
+    //
+    // Przy dwóch ścieżkach założenie pada. Zmierzone na `image/test_fixture.3gp`
+    // (H.263 + AAC): dane `mdat` zaczynają się na offsecie 44, ale pierwsza
+    // tablica `stco` (wideo) ma pierwszy offset 615, a dopiero druga (audio)
+    // ma 44. Silnik liczył więc deltę mniejszą o 571 bajtów i przesuwał o tyle
+    // OBIE ścieżki — wynik otwierał się w ffprobe (nagłówki były spójne), ale
+    // dekodowanie sypało się na obu strumieniach. Praktycznie każde nagranie z
+    // kamery ma obraz i dźwięk, więc wada dotyczyła większości realnego
+    // materiału.
+    //
+    // Poprawna delta jest znana WPROST: cały blok `mdat` przenosi się w całości,
+    // więc wystarczy różnica położenia jego danych. Offsety w tablicach pochodzą
+    // z moov DAWCY, więc punktem odniesienia jest układ dawcy, nie pacjenta.
+    let donor_mdat = find_box(&mut ref_file, b"mdat")?;
+    let shift_delta: Option<i64> = match donor_mdat {
+        Some(info) => {
+            ref_file.seek(SeekFrom::Start(info.offset))?;
+            let mut hdr = [0u8; 8];
+            ref_file.read_exact(&mut hdr)?;
+            let donor_header_size: u64 =
+                if u32::from_be_bytes(hdr[0..4].try_into().unwrap()) == 1 { 16 } else { 8 };
+            let donor_payload = (info.offset + donor_header_size) as i64;
+            let delta = new_mdat_payload_offset - donor_payload;
+            tracing::debug!(
+                "🎯 [CLONE-STCO] Delta z układu dawcy: dane mdat {} -> {} (przesunięcie {} bajtów).",
+                donor_payload, new_mdat_payload_offset, delta
+            );
+            Some(delta)
+        }
+        None => {
+            // Dawca bez `mdat` to materiał, którego nie powinno tu być, ale
+            // przerwanie naprawy byłoby regresją wobec dotychczasowego
+            // zachowania. Zostaje stara heurystyka kotwicy z pierwszego wpisu.
+            tracing::warn!("⚠️ [CLONE-STCO] Dawca nie ma atomu mdat - wracam do heurystyki kotwicy.");
+            None
+        }
+    };
+    let mut shift_delta = shift_delta;
 
     // Funkcja pomocnicza: znajdowanie pierwszego adresu i wyliczanie delty
     let mut i = 0;

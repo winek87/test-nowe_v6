@@ -87,7 +87,49 @@ struct Cli {
     autopilot: Option<String>,
 }
 
+/// Mówi wprost, gdzie trafią przestrzenie robocze, gdy NIE jest to domyślne
+/// `workspaces` obok katalogu uruchomienia.
+///
+/// Powód: `.cargo/config.toml` w korzeniu workspace'u ustawia
+/// `MP4_DOCTOR_KATALOG_PRZESTRZENI` dla każdego procesu uruchamianego przez
+/// cargo — także dla `cargo run`. Bez tej informacji programista szukałby
+/// swojego projektu w `./workspaces` i go tam nie znalazł.
+/// Kieruje przestrzenie ZWYKŁEGO uruchomienia do własnego podkatalogu.
+///
+/// `.cargo/config.toml` ustawia `MP4_DOCTOR_KATALOG_PRZESTRZENI` dla każdego
+/// procesu spod cargo, więc `cargo run` i testy trafiałyby do jednego worka —
+/// a sprzątanie po testach kasowałoby projekty programisty. Rozdzielamy to:
+/// testy mają podkatalog `testy`, zwykłe uruchomienia `uruchomienia`.
+///
+/// Gdy zmienna wskazuje już katalog testowy, NIE przekierowujemy: to znaczy,
+/// że binarkę uruchomił test jako podproces i ma pracować tam, gdzie rodzic.
+/// Zbudowana binarka uruchomiona wprost nie widzi zmiennej i zachowuje
+/// dotychczasowe `./workspaces`.
+fn ustaw_katalog_uruchomien() {
+    let Some(wskazany) = std::env::var_os(workspace::ZMIENNA_KATALOGU_PRZESTRZENI) else {
+        return;
+    };
+    if wskazany.is_empty() {
+        return;
+    }
+    let sciezka = std::path::PathBuf::from(wskazany);
+    if sciezka.file_name().and_then(|n| n.to_str()) == Some("testy") {
+        return;
+    }
+    let _ = workspace::ustaw_katalog_przestrzeni(sciezka.join(workspace::PODKATALOG_URUCHOMIEN));
+}
+
+fn zamelduj_katalog_przestrzeni() {
+    let katalog = workspace::katalog_przestrzeni();
+    if katalog != std::path::Path::new("workspaces") {
+        println!("📁 Przestrzenie robocze: {}", katalog.display());
+    }
+}
+
 fn run_headless(cli: Cli) {
+    ustaw_katalog_uruchomien();
+    zamelduj_katalog_przestrzeni();
+
     if let Some(thread_override) = cli.threads {
         set_thread_count(thread_override);
     }

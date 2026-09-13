@@ -2,10 +2,11 @@
 
 //! # Dekodowanie Formatów RAW (DNG i pochodne) — Moduł Eksperymentalny
 //!
-//! **STATUS: SAMODZIELNY MODUŁ, JESZCZE NIEWPIĘTY W ŻADNĄ FAZĘ.** Zbudowany
-//! i przetestowany osobno (na żądanie, ten sam wzorzec co `thread_activity`),
-//! zanim podejmiemy decyzję o integracji z Fazą 13 (żywa diagnostyka obrazów)
-//! i ewentualnie Fazą 18 (Smart Splice).
+//! **STATUS: WPIĘTY.** Faza 13 (żywa diagnostyka) woła [`decode_raw_file`],
+//! a `phases::repair_modules::weryfikuj_naprawiony_plik` używa
+//! [`verify_raw_bytes`] jako obowiązkowej weryfikacji po naprawie dla całej
+//! rodziny RAW — w tym dla wyniku modułu `dng_structural`. Nagłówek mówił
+//! wcześniej „JESZCZE NIEWPIĘTY W ŻADNĄ FAZĘ", co przestało być prawdą.
 //!
 //! ## Dlaczego DNG, a nie HEIC/HEIF
 //!
@@ -256,5 +257,76 @@ mod tests {
         assert!(info.width > 0);
         assert!(info.height > 0);
         println!("✔ Zdekodowano: {}x{}, {} składowych/piksel, model: {:?}", info.width, info.height, info.components_per_pixel, info.camera_model);
+    }
+
+    // ------------------------------------------------------------------
+    // RODZINA RAW POZA DNG
+    //
+    // Plików NEF/CR2/ARW/ORF/PEF/SRW/RW2 NIE DA SIĘ WYGENEROWAĆ: to zamknięte
+    // formaty aparatów i żadne dostępne narzędzie ich nie ZAPISUJE (rawloader,
+    // dcraw i LibRaw wyłącznie czytają). Muszą przyjść z prawdziwego sprzętu.
+    //
+    // Test niżej jest przygotowany z wyprzedzeniem: sprawdza DNG, który mamy,
+    // a każdy dołożony plik z rodziny obejmuje automatycznie, bez żadnej zmiany
+    // w kodzie. Wystarczy wrzucić `image/test_fixture.<ext>`.
+    // ------------------------------------------------------------------
+
+    /// Rozszerzenia, dla których `dng_structural` deklaruje obsługę.
+    const RODZINA_RAW: &[&str] = &["dng", "nef", "cr2", "arw", "orf", "pef", "srw", "rw2"];
+
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.dng; pliki NEF/CR2/ARW/ORF/PEF/SRW/RW2 obejmuje automatycznie, jeśli je dołożysz. Uruchom z --ignored."]
+    fn test_rawloader_czyta_kazdy_dostepny_plik_rodziny() {
+        let mut sprawdzone = Vec::new();
+
+        for ext in RODZINA_RAW {
+            let sciezka = format!("image/test_fixture.{}", ext);
+            let Ok(bajty) = std::fs::read(&sciezka) else { continue };
+
+            assert!(
+                verify_raw_bytes(&bajty),
+                "Zdrowy plik {} musi się zdekodować przez rawloader — to warunek \
+                 obowiązkowej weryfikacji Fazy 17 dla tego formatu",
+                sciezka
+            );
+            sprawdzone.push(*ext);
+        }
+
+        // DNG mamy na pewno; gdyby zniknął, test przestałby cokolwiek mierzyć.
+        assert!(
+            sprawdzone.contains(&"dng"),
+            "Brak image/test_fixture.dng — bez niego ten test niczego nie sprawdza"
+        );
+
+        println!("Sprawdzone formaty rodziny RAW: {:?}", sprawdzone);
+        let brakujace: Vec<&&str> = RODZINA_RAW.iter().filter(|e| !sprawdzone.contains(e)).collect();
+        if !brakujace.is_empty() {
+            println!(
+                "Bez pokrycia (brak fixture'a, patrz TODO.md): {:?}",
+                brakujace
+            );
+        }
+    }
+
+    /// Uszkodzony plik z rodziny RAW MUSI zostać odrzucony — inaczej bramka
+    /// Fazy 17 przepuściłaby nieudane złożenie.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.dng; pozostałe formaty rodziny obejmuje automatycznie. Uruchom z --ignored."]
+    fn test_rawloader_odrzuca_uszkodzony_plik_kazdego_formatu() {
+        let mut sprawdzone = 0;
+
+        for ext in RODZINA_RAW {
+            let Ok(pelny) = std::fs::read(format!("image/test_fixture.{}", ext)) else { continue };
+            // Ucięcie do połowy: nagłówek zostaje, dane pikseli przepadają.
+            let uciety = &pelny[..pelny.len() / 2];
+
+            assert!(
+                !verify_raw_bytes(uciety),
+                "Ucięty plik .{} MUSI zostać odrzucony przez rawloader", ext
+            );
+            sprawdzone += 1;
+        }
+
+        assert!(sprawdzone > 0, "Brak jakiegokolwiek pliku rodziny RAW do sprawdzenia");
     }
 }

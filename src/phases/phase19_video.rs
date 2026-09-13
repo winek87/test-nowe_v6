@@ -400,7 +400,22 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         stats.ok.fetch_add(1, Ordering::Relaxed);
                         stats.total_duration_sec.fetch_add(info.duration_ms / 1000, Ordering::Relaxed);
                         SideVideoResult {
-                            id: task.id, ok: Some(true), reason: None,
+                            id: task.id,
+                            ok: Some(true),
+                            // Opis tekstowy TAKŻE przy sukcesie — tak jak w
+                            // gałęziach TS, FLV i Matroski. Wcześniej zostawało
+                            // tu `None`, bo ISOBMFF wypełnia w zamian
+                            // `duration_ms` i `track_count`, których tamte trzy
+                            // nie mają. Dane owszem były, ale raport operacyjny
+                            // czyta kolumnę `reason` i dla kontenerów MP4
+                            // pokazywał pustkę przy sprawnych plikach, a opis
+                            // przy pozostałych formatach — czytający nie miał
+                            // jak odróżnić „brak danych" od „inny nośnik danych".
+                            reason: Some(format!(
+                                "Kontener spójny: {} ścieżek, {} s",
+                                info.track_count,
+                                info.duration_ms / 1000
+                            )),
                             duration_ms: Some(info.duration_ms as i64),
                             track_count: Some(info.track_count as i64),
                             io_error: Some(false),
@@ -1174,21 +1189,24 @@ mod tests {
     /// należy chronić.
     #[test]
     #[ignore = "Wymaga image/test_fixture.mp4 i test_fixture.flv. Uruchom z --ignored."]
-    fn test_opis_sukcesu_jest_zapisywany_tylko_przez_czesc_galezi() {
+    fn test_opis_sukcesu_jest_zapisywany_przez_kazda_galaz() {
         let dir = tempfile::tempdir().unwrap();
 
         let mut sprawdzone = 0;
-        for (zrodlo, spodziewany_opis) in [("test_fixture.mp4", false), ("test_fixture.flv", true)] {
+        // ISOBMFF, FLV i Matroska — trzy różne gałęzie, ta sama umowa.
+        for zrodlo in ["test_fixture.mp4", "test_fixture.flv", "test_fixture_real.mkv"] {
             let sciezka = Path::new("image").join(zrodlo);
             if !sciezka.exists() { continue; }
             fs::copy(&sciezka, dir.path().join(zrodlo)).unwrap();
 
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, zrodlo, true)], true);
             assert_eq!(wyniki[0].ok, Some(true), "{} musi być sprawny", zrodlo);
-            assert_eq!(
-                wyniki[0].reason.is_some(), spodziewany_opis,
-                "{}: opis przy sukcesie obecny = {:?}, spodziewano się {}",
-                zrodlo, wyniki[0].reason, spodziewany_opis
+            assert!(
+                wyniki[0].reason.as_ref().is_some_and(|r| !r.is_empty()),
+                "{}: każda gałąź musi opisać sukces, inaczej raport operacyjny \
+                 pokazuje pustkę dla części formatów i czytający nie wie, czy to \
+                 brak danych, czy inny nośnik informacji",
+                zrodlo
             );
             sprawdzone += 1;
         }

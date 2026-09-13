@@ -57,8 +57,30 @@ use super::{RepairContext, RepairModule, WynikWeryfikacji};
 use crate::mp4_repair::{engine_clone, engine_native, engine_recontainer, validator};
 use std::path::{Path, PathBuf};
 
-/// Rozszerzenia KONTENERÓW ISOBMFF.
-const ROZSZERZENIA_MP4: &[&str] = &["mp4", "mov", "m4v"];
+/// Rozszerzenia KONTENERÓW ISOBMFF **NIOSĄCYCH OBRAZ**.
+///
+/// ## Dlaczego lista jest dłuższa niż `mp4/mov/m4v`
+///
+/// Silniki (`engine_clone`, `engine_native`, `engine_recontainer`) operują na
+/// pudełkach ISOBMFF — `ftyp`, `moov`, `mdat` — a nie na rozszerzeniu nazwy.
+/// `.3gp`, `.3g2` i `.f4v` to ten sam kontener, więc ograniczenie do trzech
+/// nazw było ograniczeniem NAZWY, nie możliwości.
+///
+/// Ta lista musi pokrywać się z gałęzią ISOBMFF w
+/// [`super::weryfikuj_naprawiony_plik`]. Przez pewien czas nie pokrywała się:
+/// weryfikacja obejmowała już `.3gp`/`.3g2`/`.f4v`, a naprawa nie — więc
+/// Faza 17 potrafiła sprawdzić wynik dla tych plików, ale nie miała czym go
+/// wytworzyć i zostawał sam ślepy `splice`. Pilnuje tego test
+/// `test_lista_rozszerzen_pokrywa_sie_z_weryfikacja`.
+///
+/// ## Czego tu świadomie NIE MA
+///
+/// `.m4a` i `.m4b` to ten sam kontener, ale BEZ ścieżki obrazu. Wszystkie trzy
+/// moduły weryfikują wynik przez [`weryfikuj_wideo`], a ten w trybie z ffmpeg
+/// żąda strumienia `v:0` z wymiarami. Poprawnie naprawiony plik audio zostałby
+/// więc uznany za zepsuty i USUNIĘTY — sprawdzone empirycznie: dla `.m4a`
+/// zapytanie ffprobe o `v:0` zwraca pusty wynik.
+const ROZSZERZENIA_MP4: &[&str] = &["mp4", "mov", "m4v", "3gp", "3g2", "f4v"];
 
 /// Rozszerzenia SUROWYCH strumieni elementarnych H.264 (Annex B).
 ///
@@ -353,8 +375,47 @@ mod tests {
 
     #[test]
     fn test_stosuje_sie_do_wszystkich_rozszerzen_isobmff() {
-        for ext in ["mp4", "mov", "m4v"] {
+        for ext in ["mp4", "mov", "m4v", "3gp", "3g2", "f4v"] {
             assert!(Mp4NativeModule.applies_to(&ctx(ext, Some(false), None, None)), "ext {}", ext);
+        }
+    }
+
+    /// Naprawa i weryfikacja MUSZĄ obejmować ten sam zbiór rozszerzeń.
+    ///
+    /// Przez pewien czas się rozjeżdżały: weryfikacja znała już `.3gp`/`.3g2`/
+    /// `.f4v`, a naprawa nie — więc Faza 17 potrafiła sprawdzić wynik dla tych
+    /// plików, ale nie miała czym go wytworzyć. Ten test wychwyci powtórkę.
+    #[test]
+    fn test_lista_rozszerzen_pokrywa_sie_z_weryfikacja() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for ext in ROZSZERZENIA_MP4 {
+            // Śmieci z danym rozszerzeniem muszą zostać ODRZUCONE przez
+            // weryfikację. Gałąź domyślna by je przyjęła (niepuste, nie same
+            // zera), więc odrzucenie dowodzi, że format ma własną gałąź.
+            let p = dir.path().join(format!("smieci.{}", ext));
+            std::fs::write(&p, b"to zupelnie nie jest kontener isobmff").unwrap();
+
+            assert!(
+                super::super::weryfikuj_naprawiony_plik(&p).is_err(),
+                ".{} jest w ROZSZERZENIA_MP4, ale weryfikacja nie ma dla niego gałęzi \
+                 - moduł wytworzyłby wynik, którego nikt nie potrafi sprawdzić", ext
+            );
+        }
+    }
+
+    /// `.m4a`/`.m4b` NIE MOGĄ trafić do tych modułów: ich `verify` żąda od
+    /// ffprobe strumienia obrazu, więc poprawnie naprawiony plik audio
+    /// zostałby odrzucony i usunięty.
+    #[test]
+    fn test_kontenery_audio_sa_poza_zakresem() {
+        for ext in ["m4a", "m4b"] {
+            for m in wszystkie() {
+                assert!(
+                    !m.applies_to(&ctx(ext, Some(false), Some(false), Some("Nagłówek"))),
+                    "{} nie może zgłaszać się do .{}", m.id(), ext
+                );
+            }
         }
     }
 
@@ -760,5 +821,75 @@ mod tests {
         let dowod = weryfikuj_wideo(&plik).expect("prawdziwe wideo musi przejść");
         assert!(dowod.contains("MOCNA"), "z ffmpeg gwarancja musi być mocna: {}", dowod);
         assert!(dowod.contains("dekodowanie"), "dowód musi nazwać metodę: {}", dowod);
+    }
+
+    /// Dowód, że rozszerzenie listy nie jest samą deklaracją: prawdziwy plik
+    /// `.3gp` z ffmpeg, pozbawiony atomu `moov`, zostaje odzyskany przez
+    /// przeszczep z bliźniaczej kopii i przechodzi PEŁNE dekodowanie klatek.
+    ///
+    /// Przed rozszerzeniem `ROZSZERZENIA_MP4` moduł w ogóle nie zgłaszał się do
+    /// tego pliku, mimo że weryfikacja już go obejmowała.
+    ///
+    /// REGRESJA NA WADĘ SILNIKA. Ten fixture ma DWIE ścieżki (H.263 + AAC) i
+    /// właśnie on obnażył błąd w `engine_clone`: delta przesunięcia tablic
+    /// `stco` była liczona z pierwszego wpisu pierwszej tablicy, przy założeniu
+    /// że ten kawałek leży na początku danych `mdat`. Tu leży na offsecie 615,
+    /// a dane zaczynają się na 44 — silnik mylił się o 571 bajtów na OBU
+    /// ścieżkach. Materiał jednościeżkowy tej wady nie pokazywał, więc
+    /// dotychczasowe testy jej nie widziały, mimo że dotyczyła praktycznie
+    /// każdego nagrania z kamery (obraz + dźwięk).
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.3gp oraz ffmpeg/ffprobe. Uruchom z --ignored."]
+    fn test_e2e_clone_odzyskuje_prawdziwy_3gp() {
+        let dir = tempfile::tempdir().unwrap();
+        let wynik = katalog_wynikow(dir.path());
+
+        let dawca = dir.path().join("dawca.3gp");
+        std::fs::copy("image/test_fixture.3gp", &dawca).expect("fixture musi istnieć");
+
+        let zepsuty = dir.path().join("zepsuty.3gp");
+        usun_moov(&dawca, &zepsuty);
+
+        let kontekst = ctx("3gp", Some(false), None, None);
+
+        // Kontrola sensu testu: bez `moov` plik NIE MOŻE przechodzić weryfikacji.
+        assert!(
+            Mp4CloneModule.verify(&zepsuty, &kontekst).is_err(),
+            "Test bez sensu: plik pozbawiony moov musi być odrzucany"
+        );
+
+        let (plik, log) = Mp4CloneModule
+            .repair(&zepsuty, &kontekst, Some(&dawca), &wynik)
+            .expect("przeszczep moov musi się udać dla identycznego materiału .3gp");
+
+        assert!(log.contains("moov"), "log powinien nazwać wykonaną operację: {}", log);
+        assert_eq!(
+            plik.extension().and_then(|e| e.to_str()), Some("3gp"),
+            "Wynik musi zachować rozszerzenie wejścia, inaczej weryfikacja dobierze złą metodę"
+        );
+        assert!(
+            Mp4CloneModule.verify(&plik, &kontekst).is_ok(),
+            "Naprawiony .3gp musi przejść pełne dekodowanie klatek"
+        );
+    }
+
+    /// To samo dla `.f4v` — trzeci z dołożonych formatów.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.f4v oraz ffmpeg/ffprobe. Uruchom z --ignored."]
+    fn test_e2e_clone_odzyskuje_prawdziwy_f4v() {
+        let dir = tempfile::tempdir().unwrap();
+        let wynik = katalog_wynikow(dir.path());
+
+        let dawca = dir.path().join("dawca.f4v");
+        std::fs::copy("image/test_fixture.f4v", &dawca).expect("fixture musi istnieć");
+        let zepsuty = dir.path().join("zepsuty.f4v");
+        usun_moov(&dawca, &zepsuty);
+
+        let kontekst = ctx("f4v", Some(false), None, None);
+        let (plik, _log) = Mp4CloneModule
+            .repair(&zepsuty, &kontekst, Some(&dawca), &wynik)
+            .expect("przeszczep moov musi się udać dla .f4v");
+
+        assert!(Mp4CloneModule.verify(&plik, &kontekst).is_ok());
     }
 }

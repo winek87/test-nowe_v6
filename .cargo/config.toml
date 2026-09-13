@@ -1,0 +1,37 @@
+# Konfiguracja cargo dla całego workspace'u.
+
+# ============================================================================
+# KATALOG PRZESTRZENI ROBOCZYCH mp4_doctor
+# ============================================================================
+#
+# ## Problem
+#
+# `mp4_doctor` tworzy przestrzenie robocze w katalogu `workspaces` podanym
+# ŚCIEŻKĄ WZGLĘDNĄ, a `cargo test` ustawia katalog roboczy na katalog pakietu.
+# Każdy przebieg testów odkładał więc w `mp4/mp4_doctor/workspaces/` bazy
+# `knowledge_base.db`, pliki dawców i katalogi o nazwach wylosowanych przez
+# testy fuzzujące pole „nazwa nowego projektu" — narosło tego 73 pliki.
+#
+# ## Dlaczego akurat tutaj, a nie w kodzie testów
+#
+# Część tych przestrzeni tworzy KOD PRODUKCYJNY (`tui::app` obsługujący modal
+# nowego projektu), uruchamiany przez testy sterujące interfejsem. Żaden
+# zabieg w kodzie testowym nie obejmie tej ścieżki niezawodnie, bo nie ma
+# gwarancji, który test wykona się pierwszy. `[env]` ustawia zmienną dla
+# KAŻDEGO procesu uruchamianego przez cargo — także dla binarek testowych
+# i dla podprocesów, które część testów odpala przez `Command`.
+#
+# ## Zakres działania
+#
+# Dotyczy wyłącznie procesów uruchamianych przez cargo (`cargo test`,
+# `cargo run`). Zbudowana binarka uruchomiona wprost zachowuje się jak
+# dotąd. Weryfikator wskazuje katalog jawnie przez
+# `workspace::ustaw_katalog_przestrzeni`, co ma pierwszeństwo przed tą
+# zmienną — patrz `workspace::katalog_przestrzeni`.
+#
+# `relative = true` rozwija ścieżkę względem katalogu nadrzędnego tego pliku,
+# czyli korzenia workspace'u — nie względem katalogu uruchomienia. Katalog
+# `target/` jest wytworem budowania: leży poza drzewem źródeł i czyści go
+# `cargo clean`.
+[env]
+MP4_DOCTOR_KATALOG_PRZESTRZENI = { value = "target/przestrzenie_robocze", relative = true }

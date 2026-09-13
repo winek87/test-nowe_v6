@@ -742,4 +742,41 @@ mod tests {
         assert_eq!(wynik[4], 0xAA, "pakiety obecne w obu kopiach zostają z A");
         assert_eq!(wynik[4 * TS_PACKET_SIZE + 4], 0xBB, "brakujące pakiety pochodzą z B");
     }
+
+    /// Prawdziwy strumień z ffmpeg — siatka 188 bajtów.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.ts. Uruchom z --ignored."]
+    fn test_prawdziwy_ts_jest_spojny() {
+        let bajty = std::fs::read("image/test_fixture.ts").expect("fixture musi istnieć");
+        let a = analyze_ts(&bajty).expect("plik musi zostać rozpoznany jako TS");
+
+        assert_eq!(a.packet_size, TS_PACKET_SIZE, "Zwykły .ts to siatka 188 bajtów");
+        assert!(a.is_healthy(), "Świeżo zmuxowany strumień musi być spójny: {}", a.describe());
+    }
+
+    /// Wariant Blu-ray: 4-bajtowy znacznik czasu przed każdym pakietem.
+    /// Ścieżka 192-bajtowa nie miała dotąd ŻADNEGO testu na prawdziwym pliku —
+    /// tylko na pakietach budowanych w kodzie testu.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.m2ts. Uruchom z --ignored."]
+    fn test_prawdziwy_m2ts_jest_rozpoznany_jako_siatka_192() {
+        let bajty = std::fs::read("image/test_fixture.m2ts").expect("fixture musi istnieć");
+        let a = analyze_ts(&bajty).expect("plik musi zostać rozpoznany jako M2TS");
+
+        assert_eq!(a.packet_size, M2TS_PACKET_SIZE, "M2TS to siatka 192 bajtów");
+        assert!(a.is_healthy(), "Strumień musi być spójny: {}", a.describe());
+    }
+
+    /// Oba warianty niosą TEN SAM materiał, więc muszą dać tę samą liczbę
+    /// pakietów i strumieni — dowód, że prefiks czasowy jest poprawnie
+    /// pomijany, a nie liczony jako dane.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.ts i image/test_fixture.m2ts. Uruchom z --ignored."]
+    fn test_oba_warianty_daja_ten_sam_obraz_strumienia() {
+        let ts = analyze_ts(&std::fs::read("image/test_fixture.ts").unwrap()).unwrap();
+        let m2ts = analyze_ts(&std::fs::read("image/test_fixture.m2ts").unwrap()).unwrap();
+
+        assert_eq!(ts.total_packets, m2ts.total_packets, "Ta sama liczba pakietów");
+        assert_eq!(ts.describe(), m2ts.describe(), "Ten sam opis strumienia");
+    }
 }

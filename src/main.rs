@@ -16,6 +16,7 @@ mod dng_repair;
 mod dng_splice;
 mod jpeg_splice;
 mod png_repair;
+mod raster_splice;
 mod zip_splice;
 mod tar_archive;
 

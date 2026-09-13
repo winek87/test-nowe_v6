@@ -314,33 +314,61 @@ fn rozstrzygnij_katalog(
 /// wyłącznie od PID procesu), więc równoległe wywołania z wielu testów zapisują
 /// identyczny bajt w bajt łańcuch.
 pub fn katalog_przestrzeni_dla_testow() -> PathBuf {
-    // Gdy otoczenie już wskazuje katalog, honorujemy je zamiast nadpisywać.
-    // Pod `cargo test` robi to `.cargo/config.toml` w korzeniu workspace'u i
-    // jest to wskazanie MOCNIEJSZE od tej funkcji, bo obejmuje także kod
-    // produkcyjny sterowany przez testy (modal nowego projektu w `tui::app`)
-    // oraz podprocesy — czyli ścieżki, których żaden `init_testowy` nie tknie.
-    if let Some(ze_srodowiska) = std::env::var_os(ZMIENNA_KATALOGU_PRZESTRZENI)
-        && !ze_srodowiska.is_empty()
-    {
-        let katalog = PathBuf::from(ze_srodowiska);
-        let _ = fs::create_dir_all(&katalog);
-        return katalog;
-    }
-
-    // Zapasowo — gdyby testy uruchomiono z pominięciem konfiguracji cargo.
-    let katalog = std::env::temp_dir()
-        .join("mp4_doctor_testy")
-        .join(std::process::id().to_string());
+    let katalog = katalog_testowy();
 
     let _ = fs::create_dir_all(&katalog);
 
+    // Zmienna, nie tylko wartość zwracana: podprocesy uruchamiane przez testy
+    // (`Command::new(bin)` z `--workspace`) muszą trafić DOKŁADNIE tu, a
+    // dziedziczą wyłącznie środowisko.
+    //
     // SAFETY: patrz sekcja „Bezpieczeństwo wielowątkowe" w dokumentacji.
     unsafe {
         std::env::set_var(ZMIENNA_KATALOGU_PRZESTRZENI, &katalog);
     }
 
-    sprzataj_stare_katalogi_testowe();
+    // Sprzątamy KORZEŃ, nie tylko własny podkatalog: przestrzenie o losowych
+    // nazwach tworzy kod produkcyjny sterowany przez testy (modal nowego
+    // projektu w `tui::app`), a on czyta `katalog_przestrzeni()` wprost — więc
+    // ląduje obok, zanim którykolwiek test zdąży wywołać tę funkcję.
+    if let Some(korzen) = katalog.parent() {
+        sprzataj_stare_katalogi_testowe(korzen);
+    }
     katalog
+}
+
+/// Nazwa podkatalogu oddzielającego przestrzenie TESTOWE od tych, które
+/// tworzy normalne uruchomienie programu.
+const PODKATALOG_TESTOWY: &str = "testy";
+
+/// Podkatalog przestrzeni zakładanych przez ZWYKŁE uruchomienie programu spod
+/// cargo (`cargo run`). Sprzątanie po testach nigdy go nie dotyka — patrz
+/// [`sprzataj_stare_katalogi_testowe`] i `main::ustaw_katalog_uruchomien`.
+pub const PODKATALOG_URUCHOMIEN: &str = "uruchomienia";
+
+/// Wyznacza katalog przestrzeni testowych.
+///
+/// ## Dlaczego osobny podkatalog, a nie wprost katalog z konfiguracji
+///
+/// `.cargo/config.toml` ustawia [`ZMIENNA_KATALOGU_PRZESTRZENI`] dla KAŻDEGO
+/// procesu uruchamianego przez cargo — także dla `cargo run`. Gdyby testy
+/// sprzątały bezpośrednio w tym katalogu, skasowałyby przestrzenie robocze
+/// założone przez programistę przy zwykłym uruchomieniu. Podkatalog `testy`
+/// rozdziela jedno od drugiego: sprzątamy wyłącznie własne śmieci.
+///
+/// Funkcja jest idempotentna — powtórne wywołanie nie dokłada kolejnego
+/// poziomu zagnieżdżenia.
+fn katalog_testowy() -> PathBuf {
+    let baza = match std::env::var_os(ZMIENNA_KATALOGU_PRZESTRZENI) {
+        Some(z) if !z.is_empty() => PathBuf::from(z),
+        // Zapasowo — gdyby testy uruchomiono z pominięciem konfiguracji cargo.
+        _ => std::env::temp_dir().join("mp4_doctor_testy"),
+    };
+
+    if baza.file_name().and_then(|n| n.to_str()) == Some(PODKATALOG_TESTOWY) {
+        return baza;
+    }
+    baza.join(PODKATALOG_TESTOWY)
 }
 
 /// Usuwa katalogi testowe zostawione przez WCZEŚNIEJSZE przebiegi, żeby
@@ -349,16 +377,16 @@ pub fn katalog_przestrzeni_dla_testow() -> PathBuf {
 /// Próg 6 godzin, a nie „wszystko poza moim": dwa równoległe `cargo test`
 /// mogłyby sobie nawzajem skasować przestrzenie w trakcie pracy. Sprzątanie
 /// jest best-effort — żaden błąd nie ma prawa wywrócić testu.
-fn sprzataj_stare_katalogi_testowe() {
+fn sprzataj_stare_katalogi_testowe(katalog: &Path) {
     const PROG_SEKUND: u64 = 6 * 60 * 60;
 
-    let Ok(wpisy) = fs::read_dir(std::env::temp_dir().join("mp4_doctor_testy")) else {
+    let Ok(wpisy) = fs::read_dir(katalog) else {
         return;
     };
-    let moj = std::process::id().to_string();
 
     for wpis in wpisy.flatten() {
-        if wpis.file_name().to_string_lossy() == moj {
+        // Przestrzenie z `cargo run` należą do programisty, nie do testów.
+        if wpis.file_name().to_string_lossy() == PODKATALOG_URUCHOMIEN {
             continue;
         }
         let wiek = wpis
@@ -521,5 +549,88 @@ mod tests {
         let ws = Workspace::init_testowy("proba_gc_pusta").unwrap();
         assert_eq!(ws.optimize_storage().unwrap(), (0, 0));
         let _ = fs::remove_dir_all(&ws.root_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // ROZDZIELENIE PRZESTRZENI TESTOWYCH OD ZWYKŁYCH
+    // ------------------------------------------------------------------
+
+    /// Testy sprzątają po sobie kasując zawartość swojego katalogu. Gdyby
+    /// dzieliły go z `cargo run`, skasowałyby przestrzenie założone przez
+    /// programistę przy zwykłym uruchomieniu.
+    #[test]
+    fn test_katalog_testowy_jest_podkatalogiem_zwyklego() {
+        let testowy = katalog_testowy();
+        assert_eq!(
+            testowy.file_name().and_then(|n| n.to_str()),
+            Some(PODKATALOG_TESTOWY),
+            "Katalog testowy musi być wydzielonym podkatalogiem: {:?}", testowy
+        );
+    }
+
+    /// Powtórne wywołanie nie może dokładać kolejnego poziomu zagnieżdżenia —
+    /// funkcja jest wołana z każdego testu osobno.
+    #[test]
+    fn test_wyznaczanie_katalogu_testowego_nie_zagniezdza_sie() {
+        let raz = katalog_testowy();
+        let dwa = katalog_testowy();
+        assert_eq!(raz, dwa);
+        assert!(
+            !raz.to_string_lossy().contains(&format!("{0}/{0}", PODKATALOG_TESTOWY)),
+            "Podwójne zagnieżdżenie: {:?}", raz
+        );
+    }
+
+    /// Sprzątanie dotyka WYŁĄCZNIE wskazanego katalogu i tylko wpisów starszych
+    /// niż próg — świeża praca innego, równoległego przebiegu musi przetrwać.
+    #[test]
+    fn test_sprzatanie_nie_rusza_swiezych_wpisow() {
+        let katalog = std::env::temp_dir().join(format!("mp4_doctor_sprzat_{}", std::process::id()));
+        let _ = fs::create_dir_all(katalog.join("swiezy"));
+
+        sprzataj_stare_katalogi_testowe(&katalog);
+
+        assert!(katalog.join("swiezy").exists(), "Świeży wpis nie może zostać skasowany");
+        let _ = fs::remove_dir_all(&katalog);
+    }
+
+    #[test]
+    fn test_sprzatanie_nieistniejacego_katalogu_nie_panikuje() {
+        sprzataj_stare_katalogi_testowe(Path::new("/nie/ma/takiego/katalogu"));
+    }
+
+    /// Sprzątanie po testach NIE MOŻE ruszać przestrzeni założonych przez
+    /// zwykłe uruchomienie programu — to projekty programisty, nie śmieci.
+    #[test]
+    fn test_sprzatanie_omija_katalog_uruchomien() {
+        let katalog = std::env::temp_dir().join(format!("mp4_doctor_ochrona_{}", std::process::id()));
+        let chroniony = katalog.join(PODKATALOG_URUCHOMIEN);
+        let _ = fs::create_dir_all(&chroniony);
+
+        // Cofamy czas modyfikacji daleko poza próg sprzątania.
+        let stary = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        let _ = filetime_ustaw(&chroniony, stary);
+
+        sprzataj_stare_katalogi_testowe(&katalog);
+
+        assert!(
+            chroniony.exists(),
+            "Katalog `{}` musi przetrwać sprzątanie niezależnie od wieku", PODKATALOG_URUCHOMIEN
+        );
+        let _ = fs::remove_dir_all(&katalog);
+    }
+
+    /// Ustawia czas modyfikacji katalogu. Bez zewnętrznej zależności —
+    /// korzystamy z `utimensat` przez `std::fs::File::set_times`.
+    fn filetime_ustaw(sciezka: &Path, czas: std::time::SystemTime) -> std::io::Result<()> {
+        let plik = fs::File::open(sciezka)?;
+        plik.set_times(fs::FileTimes::new().set_modified(czas))
+    }
+
+    /// Testy i zwykłe uruchomienia mają ROZŁĄCZNE podkatalogi — to warunek
+    /// tego, żeby sprzątanie było bezpieczne.
+    #[test]
+    fn test_podkatalogi_testow_i_uruchomien_sa_rozlaczne() {
+        assert_ne!(PODKATALOG_TESTOWY, PODKATALOG_URUCHOMIEN);
     }
 }

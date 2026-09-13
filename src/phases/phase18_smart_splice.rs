@@ -208,13 +208,19 @@ fn build_candidates(ext: &str, bytes_a: &[u8], bytes_b: &[u8]) -> Vec<Vec<u8>> {
             crate::zip_splice::splice_zip(bytes_a, bytes_b).into_iter().collect()
         }
         "tar" => crate::tar_archive::splice_tar(bytes_a, bytes_b).into_iter().collect(),
+        // GIF/BMP/WEBP: złożenie metadane + dane obrazu. Te formaty nie mają
+        // sum kontrolnych per blok, więc rozstrzyga dekoder — patrz
+        // `crate::raster_splice`.
+        _ if crate::raster_splice::obslugiwane_rozszerzenie(ext) => {
+            crate::raster_splice::splice_raster(ext, bytes_a, bytes_b)
+        }
         _ => Vec::new(),
     }
 }
 
 /// Obowiązkowa weryfikacja złożonego kandydata — ROZGAŁĘZIONA PER FORMAT,
 /// bo każdy ma inny sposób udowodnienia sprawności:
-/// - obrazy (JPG/PNG) → realne dekodowanie pikseli ([`verify_image_bytes`]),
+/// - obrazy (JPG/PNG/GIF/BMP/WEBP) → realne dekodowanie pikseli ([`verify_image_bytes`]),
 /// - archiwa ZIP-podobne → otwarcie + odczyt KAŻDEGO wpisu, co crate `zip`
 ///   weryfikuje przez CRC32 ([`crate::zip_splice::verify_zip_bytes`]).
 ///
@@ -803,4 +809,41 @@ mod tests {
         assert_eq!(line, "Wątki składania (Wariant A): {R:1} {G:2}");
     }
 
+
+    // ------------------------------------------------------------------
+    // ZAKRES FORMATÓW SKŁADANYCH
+    // ------------------------------------------------------------------
+
+    /// Strażnik wpięcia: format obsługiwany przez `raster_splice` MUSI być
+    /// widziany przez `build_candidates`. Sam moduł składający, do którego
+    /// nic nie prowadzi, byłby martwym kodem.
+    #[test]
+    fn test_formaty_rastrowe_sa_wpiete_w_generator_kandydatow() {
+        // Dwie różniące się, poprawne strukturalnie atrapy BMP.
+        let atrapa = |wypelnienie: u8| {
+            let mut b = vec![wypelnienie; 200];
+            b[0..2].copy_from_slice(b"BM");
+            b[2..6].copy_from_slice(&200u32.to_le_bytes());
+            b[10..14].copy_from_slice(&54u32.to_le_bytes());
+            b
+        };
+
+        let kandydaci = build_candidates("bmp", &atrapa(0xAA), &atrapa(0xBB));
+        assert!(
+            !kandydaci.is_empty(),
+            "Faza 18 musi generować kandydatów dla formatów z `raster_splice`"
+        );
+    }
+
+    /// Weryfikacja kandydata dla tych formatów idzie przez realne dekodowanie
+    /// pikseli — najmocniejszy dostępny dowód.
+    #[test]
+    fn test_kandydat_rastrowy_jest_weryfikowany_dekodowaniem() {
+        for ext in ["gif", "bmp", "webp"] {
+            assert!(
+                !verify_candidate(ext, b"to zupelnie nie jest obraz"),
+                ".{}: śmieci nie mogą przejść weryfikacji", ext
+            );
+        }
+    }
 }
