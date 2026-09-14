@@ -45,8 +45,17 @@ pub fn find_donor(
     event_sender.update_thread(thread_id, format!("Szukam dawcy w chmurze: {}", human_name));
 
     let temp_enc_path = ws.root_dir.join(format!("temp_download_{}.enc", dna_sig));
+    // `--connect-timeout`/`--max-time`: bez nich `curl` czeka W NIESKOŃCZONOŚĆ
+    // na serwer, który jest osiągalny sieciowo, ale nie odpowiada (przeciążony,
+    // pół-otwarte TCP) - odkryte w niezależnym code review po wpięciu tej
+    // ścieżki w automatyczny, równoległy pipeline (Weryfikator, Faza 17):
+    // `CANCEL_SIGNAL` tamtego pipeline'u sprawdzany jest między zadaniami, nie
+    // przerywa zadania JUŻ wykonywanego, więc zawieszony `curl` blokowałby
+    // wątek na zawsze, bez możliwości anulowania z UI.
     let curl_status = std::process::Command::new("curl")
         .arg("-s")
+        .arg("--connect-timeout").arg("5")
+        .arg("--max-time").arg("15")
         .arg("-o").arg(temp_enc_path.to_str().unwrap())
         .arg("-w").arg("%{http_code}")
         .arg(format!("http://127.0.0.1:3000/v1/swarm/donor/{}", dna_sig))

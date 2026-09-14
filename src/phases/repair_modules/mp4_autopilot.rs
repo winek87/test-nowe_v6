@@ -55,8 +55,44 @@ const PROJEKT_AUTOMATYCZNY: &str = "faza17_automatyczny";
 /// Otwiera (lub zakłada) dedykowaną przestrzeń automatycznego przebiegu, pod
 /// katalogiem już wskazanym przez [`mp4_doctor::workspace::ustaw_katalog_przestrzeni`]
 /// (wołane raz, na wejściu do [`super::super::phase17_repair::run`]).
+///
+/// `output_dir` jest tu WSPÓLNY dla całego projektu — POPRAWNY dla
+/// `db_path`/`donors_dir` (baza wiedzy i pula dawców MAJĄ być współdzielone
+/// między plikami, o to w nich chodzi), ale NIEBEZPIECZNY jako miejsce
+/// zapisu wyników: `autopilot::run` nazywa swój plik wynikowy wyłącznie po
+/// nazwie pliku źródłowego (`{Algorytm}_{nazwa}.mp4`, bez katalogu), więc
+/// dwa RÓŻNE pliki dowodowe o tej samej nazwie (typowe: `IMG_0001.mp4` w
+/// dwóch różnych folderach korpusu) przetwarzane równolegle przez Rayon
+/// pisałyby pod TĘ SAMĄ ścieżkę. [`przestrzen_dla_pliku`] naprawia to,
+/// nadpisując `output_dir` unikalnym podkatalogiem per plik źródłowy —
+/// użyj TEJ funkcji do zapisu wyników, nie tej.
 fn przestrzen_automatyczna() -> std::io::Result<Workspace> {
     Workspace::init(PROJEKT_AUTOMATYCZNY)
+}
+
+/// Jak [`przestrzen_automatyczna`], ale z `output_dir` przekierowanym do
+/// unikalnego podkatalogu skrótu PEŁNEJ ścieżki `source` — patrz dokumentacja
+/// [`przestrzen_automatyczna`] dla uzasadnienia. `db_path`/`donors_dir`
+/// zostają WSPÓLNE (dzielona nauka i pula dawców), zmienia się wyłącznie
+/// miejsce zapisu wyniku.
+fn przestrzen_dla_pliku(source: &Path) -> std::io::Result<Workspace> {
+    let baza = przestrzen_automatyczna()?;
+    let output_dir = baza.output_dir.join(unikalny_podkatalog(source));
+    std::fs::create_dir_all(&output_dir)?;
+
+    Ok(Workspace { output_dir, ..baza })
+}
+
+/// Skrót PEŁNEJ ścieżki `source` jako nazwa podkatalogu — wydzielone z
+/// [`przestrzen_dla_pliku`] jako czysta funkcja (bez I/O, bez stanu
+/// globalnego), żeby dało się ją przetestować bez dotykania
+/// `OnceLock`a `mp4_doctor::workspace` (patrz testy `utils.rs`/
+/// `phase17_repair.rs` na ten sam temat).
+fn unikalny_podkatalog(source: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Cichy odbiornik zdarzeń autopilota: zapisuje naukę do bazy identycznie
@@ -80,33 +116,46 @@ fn zapisz_nauke(ws: &Workspace, zdarzenie: AppEvent) {
 /// Uruchamia `autopilot::run`, odbierając jego zdarzenia CICHO — wzorowane
 /// na [`mp4_doctor::bezglowe::z_odbiorem`], ale bezpieczne do wołania z
 /// wnętrza aktywnego ekranu ratatui (patrz dokumentacja modułu).
+///
+/// ## Dlaczego wątek odbiornika NIE jest joinowany
+///
+/// `bezglowe::z_odbiorem` joinuje po zamknięciu kanału (`drop(nadajnik)`),
+/// zakładając że to jedyny nadajnik. Fałszywe założenie: `find_donor` przy
+/// udanym pobraniu dawcy z Roju odpala WŁASNY, odłączony wątek czyszczący
+/// (`std::thread::sleep(30s)` przed usunięciem tymczasowego pliku), który
+/// trzyma WŁASNY klon `EventSender` przez pełne 30 sekund. Dopóki ten
+/// odłączony wątek nie zaśnie i nie porzuci klonu, kanał się nie zamyka —
+/// `join()` tutaj blokowałby wątek Rayon do 30s PO zakończeniu naprawy, za
+/// każdym razem gdy trafi się dawca z chmury. Wątek odbiornika żyje więc
+/// dalej w tle, niejoinowany — jego jedyna praca to zapis do SQLite, bez
+/// żadnego stanu współdzielonego z resztą Fazy 17.
 fn uruchom_cicho(ws: &Workspace, plik: &str, cache: &mp4_doctor::db::BrainCache) -> Result<(), String> {
     let (nadajnik, odbiornik) = mp4_doctor::event::channel();
     let ws_watku = ws.clone();
 
-    let watek = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         while let Ok(zdarzenie) = odbiornik.recv() {
             zapisz_nauke(&ws_watku, zdarzenie);
         }
     });
 
-    let wynik = mp4_doctor::autopilot::run(ws, plik, cache, &nadajnik, 0);
-
-    // Zamknięcie nadajnika kończy pętlę odbiornika — bez tego `join` wisiałby
-    // w nieskończoność (ten sam powód co w `bezglowe::z_odbiorem`).
-    drop(nadajnik);
-    let _ = watek.join();
-
-    wynik
+    mp4_doctor::autopilot::run(ws, plik, cache, &nadajnik, 0)
 }
 
 /// `autopilot::run` zapisuje zwycięski plik pod `ws.output_dir` nazwany
 /// `{Algorytm}_{nazwa_pliku_zrodlowego}.mp4` (kaskada) albo
 /// `Frankenstein_{nazwa_pliku_zrodlowego}.mp4` (bruteforce) — funkcja nie
-/// zwraca, który to plik, więc szukamy go po sufiksie nazwy. Skoro
-/// `ws.output_dir` należy WYŁĄCZNIE do tego projektu i nazwa pliku
-/// źródłowego jest w niej unikalna, jednoznacznie identyfikuje zwycięzcę
-/// nawet przy wielu plikach naprawianych równolegle w tym samym projekcie.
+/// zwraca, który to plik, więc szukamy go po sufiksie nazwy.
+///
+/// BEZPIECZNE wyłącznie dlatego, że `ws` tutaj to zawsze wynik
+/// [`przestrzen_dla_pliku`] — `output_dir` unikalny DLA TEGO source, więc w
+/// katalogu mogą leżeć wyłącznie wyniki NALEŻĄCE do niego (różne algorytmy
+/// tej samej naprawy, nigdy pliki innego pliku źródłowego). Dopasowanie po
+/// samym sufiksie nazwy w katalogu WSPÓLNYM dla wielu plików (dawniej: cały
+/// `output_dir` projektu) było błędem — dwa różne pliki dowodowe o tej samej
+/// nazwie z różnych folderów korpusu (typowe w praktyce) mogłyby się
+/// wzajemnie podmienić. Nie wołaj tej funkcji z `ws` pochodzącym z
+/// [`przestrzen_automatyczna`] wprost.
 fn znajdz_wynik(ws: &Workspace, nazwa_zrodlowa: &str) -> Option<PathBuf> {
     let sufiks = format!("_{}.mp4", nazwa_zrodlowa);
     std::fs::read_dir(&ws.output_dir).ok()?
@@ -141,7 +190,11 @@ impl RepairModule for Mp4AutopilotModule {
         let zrodlo = source.to_str()?;
         let nazwa_zrodlowa = source.file_name()?.to_str()?;
 
-        let ws = przestrzen_automatyczna().ok()?;
+        // `output_dir` unikalny dla TEGO source — patrz dokumentacja
+        // `przestrzen_dla_pliku`: bez tego dwa różne pliki dowodowe o tej
+        // samej nazwie (różne foldery korpusu) mogłyby dzielić jeden plik
+        // wynikowy przy równoległym przetwarzaniu przez Rayon.
+        let ws = przestrzen_dla_pliku(source).ok()?;
         let cache = mp4_doctor::db::build_brain_cache(&ws).ok()?;
 
         uruchom_cicho(&ws, zrodlo, &cache).ok()?;
@@ -150,11 +203,24 @@ impl RepairModule for Mp4AutopilotModule {
         let cel = super::mp4::sciezka_wyniku(source, katalog_wyjsciowy, "autopilot")?;
 
         // Autopilot pisze do WŁASNEGO katalogu wyjściowego (`ws.output_dir`),
-        // nieznanego reszcie Fazy 17 — kopiujemy zwycięski plik pod ścieżkę
-        // wskazaną przez orkiestrator (`katalog_wyjsciowy`) i sprzątamy
-        // oryginał, żeby nie zostawić go osieroconym poza księgowaniem Fazy 17.
-        std::fs::copy(&wynik_autopilota, &cel).ok()?;
-        let _ = std::fs::remove_file(&wynik_autopilota);
+        // nieznanego reszcie Fazy 17 — przenosimy zwycięski plik pod ścieżkę
+        // wskazaną przez orkiestrator. `rename` najpierw: atomowe i tanie
+        // (bez podwójnego zapisu materiału wideo) w obrębie tego samego
+        // systemu plików, gdzie zwykle leżą oba katalogi (pod `target_path`).
+        // `copy`+`remove` to zapasowa ścieżka dla `EXDEV` (różne punkty
+        // montowania) — a gdy i ta zawiedzie, logujemy PRZED `None`, żeby
+        // porzucony plik w `ws.output_dir` był widoczny w dzienniku, a nie
+        // tylko cichym „naprawa się nie udała".
+        if std::fs::rename(&wynik_autopilota, &cel).is_err() {
+            if let Err(e) = std::fs::copy(&wynik_autopilota, &cel) {
+                tracing::warn!(
+                    plik = %source.display(), wynik_autopilota = %wynik_autopilota.display(), blad = %e,
+                    "mp4_autopilot: nie udało się przenieść wyniku - zostaje osierocony w ws.output_dir"
+                );
+                return None;
+            }
+            let _ = std::fs::remove_file(&wynik_autopilota);
+        }
 
         Some((cel, "Odzyskano kaskadą ucząca się mp4_doctor (KNN + pula dawców/Rój) po porażce Clone/Native/Recontainer.".to_string()))
     }
@@ -197,6 +263,24 @@ mod tests {
     fn test_identyfikator_i_nazwa_sa_stabilne_i_opisowe() {
         assert_eq!(Mp4AutopilotModule.id(), "mp4_autopilot");
         assert!(Mp4AutopilotModule.display_name().to_lowercase().contains("autopilot"));
+    }
+
+    /// REGRESJA: dwa różne pliki dowodowe o TEJ SAMEJ nazwie z różnych
+    /// folderów korpusu (typowy przypadek w dużym zbiorze odzyskanych
+    /// plików) muszą dostać RÓŻNE podkatalogi wynikowe — inaczej
+    /// `znajdz_wynik` mogłoby dopasować wynik naprawy JEDNEGO pliku
+    /// dowodowego jako wynik dla DRUGIEGO. Wykryte w niezależnym code
+    /// review (Gemini): pierwsza wersja liczyła cały `ws.output_dir` po
+    /// samym sufiksie nazwy pliku, bez katalogu.
+    #[test]
+    fn test_unikalny_podkatalog_rozroznia_pliki_o_tej_samej_nazwie() {
+        let a = Path::new("/korpus/folder1/IMG_0001.mp4");
+        let b = Path::new("/korpus/folder2/IMG_0001.mp4");
+        assert_ne!(unikalny_podkatalog(a), unikalny_podkatalog(b));
+
+        // Stabilność: ten sam plik zawsze daje ten sam podkatalog (ważne przy
+        // ponownym przebiegu Fazy 17 na tym samym korpusie).
+        assert_eq!(unikalny_podkatalog(a), unikalny_podkatalog(a));
     }
 
     /// Plik bez żadnej wydobywalnej sygnatury DNA (pusty/nieistniejący) musi
