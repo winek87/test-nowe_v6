@@ -351,14 +351,13 @@ impl RepairModule for Mp4RecontainerModule {
 /// jedyna kopia w crate'cie (patrz [`mp4_autopilot`](super::mp4_autopilot),
 /// która reużywa go dla WŁASNEGO testu e2e zamiast duplikować wywołania
 /// `ffmpeg`). Ten sam wzorzec co `png_repair::pomoce_testowe`.
+///
+/// `ffmpeg_dostepny` NIE mieszka tutaj — to sprawdzenie potrzebne jest
+/// identycznie w `stream.rs` (koduje TS/FLV), więc jedyna kopia żyje w
+/// [`crate::test_fixtures::ffmpeg_dostepny`].
 #[cfg(test)]
 pub(super) mod pomoce_testowe {
     use std::path::{Path, PathBuf};
-
-    pub fn ffmpeg_dostepny() -> bool {
-        std::process::Command::new("ffmpeg").arg("-version").output()
-            .map(|o| o.status.success()).unwrap_or(false)
-    }
 
     pub fn wygeneruj_mp4(katalog: &Path, nazwa: &str) -> PathBuf {
         let cel = katalog.join(nazwa);
@@ -395,7 +394,8 @@ pub(super) mod pomoce_testowe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::pomoce_testowe::{ffmpeg_dostepny, wygeneruj_mp4, usun_moov, katalog_wynikow};
+    use super::pomoce_testowe::{wygeneruj_mp4, usun_moov, katalog_wynikow};
+    use crate::test_fixtures::ffmpeg_dostepny;
 
     fn ctx(ext: &'static str, video_ok: Option<bool>, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {

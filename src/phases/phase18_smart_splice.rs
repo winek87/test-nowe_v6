@@ -483,7 +483,7 @@ mod tests {
     // przeniesieniu do `png_repair` to one pilnują, że przeprowadzka niczego
     // nie zmieniła w zachowaniu.
     use crate::png_repair::{
-        crc32, parse_png_chunks, CANONICAL_IEND, PNG_SIGNATURE,
+        crc32, parse_png_chunks, write_png_chunk, CANONICAL_IEND, PngChunk, PNG_SIGNATURE,
     };
 
     // ------------------------------------------------------------------
@@ -507,13 +507,7 @@ mod tests {
 
     fn build_png_chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        out.extend_from_slice(ctype);
-        out.extend_from_slice(data);
-        let mut crc_input = Vec::new();
-        crc_input.extend_from_slice(ctype);
-        crc_input.extend_from_slice(data);
-        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        write_png_chunk(&mut out, &PngChunk { ctype: *ctype, data: data.to_vec(), crc_valid: true });
         out
     }
 
@@ -635,8 +629,7 @@ mod tests {
 
     fn build_minimal_jpeg(sos_header_extra: &[u8], scan_data: &[u8]) -> Vec<u8> {
         let mut out = vec![0xFF, 0xD8]; // SOI
-        // Prosty segment APP0 (JFIF) - typ 0xE0, długość obejmuje siebie
-        out.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00]);
+        out.extend_from_slice(&crate::jpeg_splice::APP0_JFIF_MINIMALNY);
         // Segment SOS
         out.push(0xFF);
         out.push(0xDA);

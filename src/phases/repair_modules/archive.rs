@@ -287,11 +287,6 @@ mod tests {
     // Naprawa
     // ------------------------------------------------------------------
 
-    fn zapisz(sciezka: &Path, dane: &[u8]) {
-        if let Some(r) = sciezka.parent() { std::fs::create_dir_all(r).unwrap(); }
-        std::fs::write(sciezka, dane).unwrap();
-    }
-
     /// Buduje prawdziwe archiwum ZIP o podanych wpisach — patrz
     /// `crate::test_fixtures::zbuduj_zip` (jedyna implementacja w crate'cie).
     fn zbuduj_zip(wpisy: &[(&str, &[u8])]) -> Vec<u8> {
@@ -301,13 +296,11 @@ mod tests {
     #[test]
     fn test_bez_dawcy_oba_moduly_zwracaja_none() {
         let dir = tempfile::tempdir().unwrap();
-        let plik = dir.path().join("archiwum.zip");
-        zapisz(&plik, &zbuduj_zip(&[("a.txt", b"aaa")]));
+        let plik = crate::test_fixtures::zapisz(dir.path(), "archiwum.zip", &zbuduj_zip(&[("a.txt", b"aaa")]));
 
         assert!(ZipSpliceModule.repair(&plik, &ctx("zip", Some(false), None), None, dir.path()).is_none());
 
-        let tar = dir.path().join("archiwum.tar");
-        zapisz(&tar, &vec![0u8; 1024]);
+        let tar = crate::test_fixtures::zapisz(dir.path(), "archiwum.tar", &vec![0u8; 1024]);
         assert!(TarSpliceModule.repair(&tar, &ctx("tar", Some(false), None), None, dir.path()).is_none());
     }
 
@@ -325,10 +318,8 @@ mod tests {
         let srodek = zepsuty.len() / 2;
         for b in &mut zepsuty[srodek..srodek + 8] { *b ^= 0xFF; }
 
-        let p_zepsuty = dir.path().join("archiwum.zip");
-        let p_dawca = dir.path().join("blizniak.zip");
-        zapisz(&p_zepsuty, &zepsuty);
-        zapisz(&p_dawca, &zdrowy);
+        let p_zepsuty = crate::test_fixtures::zapisz(dir.path(), "archiwum.zip", &zepsuty);
+        let p_dawca = crate::test_fixtures::zapisz(dir.path(), "blizniak.zip", &zdrowy);
 
         let kontekst = ctx("zip", Some(false), None);
         assert!(ZipSpliceModule.applies_to(&kontekst), "plik musi się kwalifikować");
@@ -356,18 +347,14 @@ mod tests {
         std::fs::create_dir_all(&wynik).unwrap();
 
         // Ani jeden, ani drugi nie jest archiwum.
-        let plik = dir.path().join("a.zip");
-        let dawca = dir.path().join("b.zip");
-        zapisz(&plik, b"to nie jest zip");
-        zapisz(&dawca, b"to tez nie");
+        let plik = crate::test_fixtures::zapisz(dir.path(), "a.zip", b"to nie jest zip");
+        let dawca = crate::test_fixtures::zapisz(dir.path(), "b.zip", b"to tez nie");
 
         assert!(ZipSpliceModule.repair(&plik, &ctx("zip", Some(false), None), Some(&dawca), &wynik).is_none());
         assert_eq!(std::fs::read_dir(&wynik).unwrap().count(), 0, "po odmowie nie może zostać plik");
 
-        let t1 = dir.path().join("a.tar");
-        let t2 = dir.path().join("b.tar");
-        zapisz(&t1, b"to nie jest tar");
-        zapisz(&t2, b"to tez nie");
+        let t1 = crate::test_fixtures::zapisz(dir.path(), "a.tar", b"to nie jest tar");
+        let t2 = crate::test_fixtures::zapisz(dir.path(), "b.tar", b"to tez nie");
         assert!(TarSpliceModule.repair(&t1, &ctx("tar", Some(false), None), Some(&t2), &wynik).is_none());
         assert_eq!(std::fs::read_dir(&wynik).unwrap().count(), 0);
     }
@@ -381,10 +368,8 @@ mod tests {
         std::fs::create_dir_all(&wynik).unwrap();
 
         let zdrowy = zbuduj_zip(&[("word/document.xml", b"<xml/>")]);
-        let plik = dir.path().join("dokument.docx");
-        let dawca = dir.path().join("dawca.docx");
-        zapisz(&plik, &zdrowy);
-        zapisz(&dawca, &zdrowy);
+        let plik = crate::test_fixtures::zapisz(dir.path(), "dokument.docx", &zdrowy);
+        let dawca = crate::test_fixtures::zapisz(dir.path(), "dawca.docx", &zdrowy);
 
         if let Some((cel, _)) = ZipSpliceModule.repair(&plik, &ctx("docx", Some(false), None), Some(&dawca), &wynik) {
             assert_eq!(cel.extension().and_then(|e| e.to_str()), Some("docx"));
@@ -488,8 +473,7 @@ mod tests {
         assert_eq!(LIMIT_W_RAM, 512 * 1024 * 1024);
 
         let dir = tempfile::tempdir().unwrap();
-        let maly = dir.path().join("maly.zip");
-        zapisz(&maly, b"x");
+        let maly = crate::test_fixtures::zapisz(dir.path(), "maly.zip", b"x");
         assert!(wczytaj_pare(&maly, &maly).is_some(), "mały plik musi przejść bramkę");
 
         assert!(

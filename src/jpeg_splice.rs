@@ -147,6 +147,15 @@ pub const MARKER_DQT: u8 = 0xDB;
 pub const MARKER_DHT: u8 = 0xC4;
 pub const MARKER_SOS: u8 = 0xDA;
 
+/// Minimalny, poprawny segment `APP0`/JFIF (bez `SOI`) — jedyna kopia w
+/// crate'cie. Wcześniej ten sam literał był powielony osobno w
+/// `repair_modules::header_jpg` (naprawa: doklejany przed uciętym plikiem) i
+/// w teście Fazy 18 (`build_minimal_jpeg`, budowa syntetycznego JPEG-a).
+pub(crate) const APP0_JFIF_MINIMALNY: [u8; 18] = [
+    0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F',
+    0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00,
+];
+
 /// Czy znacznik jest segmentem `SOF` (Start Of Frame).
 ///
 /// Zakres `0xC0..=0xCF` to prawie wyłącznie `SOF`, ale z trzema wyjątkami,

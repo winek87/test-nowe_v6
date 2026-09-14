@@ -33,7 +33,8 @@ impl RepairModule for HeaderJpgModule {
             return None;
         }
 
-        let mut fixed_buffer = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00];
+        let mut fixed_buffer = vec![0xFF, 0xD8];
+        fixed_buffer.extend_from_slice(&crate::jpeg_splice::APP0_JFIF_MINIMALNY);
         fixed_buffer.extend_from_slice(&buffer);
 
         let stem = source.file_stem()?.to_str()?;

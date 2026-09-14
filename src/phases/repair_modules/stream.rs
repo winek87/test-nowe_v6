@@ -295,11 +295,7 @@ mod tests {
     // MPEG-TS na materiale z PRAWDZIWEGO kodera
     // ------------------------------------------------------------------
 
-    fn ffmpeg_jest() -> bool {
-        std::process::Command::new("ffmpeg").arg("-version")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false)
-    }
+    use crate::test_fixtures::ffmpeg_dostepny as ffmpeg_jest;
 
     /// Koduje prawdziwy strumień transportowy.
     ///

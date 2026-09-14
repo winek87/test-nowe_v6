@@ -82,3 +82,16 @@ pub(crate) fn box_isobmff(typ: &[u8; 4], tresc: &[u8]) -> Vec<u8> {
     out.extend_from_slice(tresc);
     out
 }
+
+/// Czy binarka `ffmpeg` jest dostępna w `PATH` — bramka dla testów e2e, które
+/// kodują prawdziwy materiał (`mp4`, `stream`) zamiast składać go ręcznie
+/// bajt po bajcie.
+pub(crate) fn ffmpeg_dostepny() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

@@ -266,7 +266,8 @@ mod tests {
     // rozważy Rój).
     // ------------------------------------------------------------------
 
-    use super::super::mp4::pomoce_testowe::{ffmpeg_dostepny, wygeneruj_mp4, usun_moov, katalog_wynikow};
+    use super::super::mp4::pomoce_testowe::{wygeneruj_mp4, usun_moov, katalog_wynikow};
+    use crate::test_fixtures::ffmpeg_dostepny;
 
     #[test]
     #[ignore = "Wymaga ffmpeg do wygenerowania materiału. Uruchom z --ignored."]
