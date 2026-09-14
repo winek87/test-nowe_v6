@@ -86,6 +86,7 @@ pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
     let max_path_len = area.width.saturating_sub(25) as usize;
     let ufs_trunc = truncate_path(&app.ustawienia.ufs_path, max_path_len);
     let scr_trunc = truncate_path(&app.ustawienia.script_path, max_path_len);
+    let target_trunc = truncate_path(&app.ustawienia.target_path, max_path_len);
     let log_trunc = truncate_path(&app.ustawienia.log_path, max_path_len);
 
     let db_info = format!("{} ({:.1} MB | Zabezpieczone: {})", app.ustawienia.db_file_name, app.db_file_size_mb, app.db_records_count);
@@ -102,6 +103,10 @@ pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled(" [ 📂 ] Skrypt Aut.:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(scr_trunc, Style::default().fg(Color::Yellow))
+        ]),
+        Line::from(vec![
+            Span::styled(" [ 🎯 ] Ścieżka Docelowa: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(target_trunc, Style::default().fg(Color::Magenta))
         ]),
         Line::from(vec![
             Span::styled(" [ 📚 ] Baza Danych:  ", Style::default().fg(Color::DarkGray)),
@@ -241,19 +246,22 @@ mod tests {
         assert!(widok.contains("RAM"), "Brak sekcji RAM:\n{}", widok);
     }
 
-    /// Panel pokazuje ŹRÓDŁA, bazę, logi i parametry pracy. Ścieżki docelowej
-    /// (`target_path`) w nim nie ma — to nie przeoczenie testu, tylko zakres
-    /// tego panelu.
+    /// Panel pokazuje źródła (UFS/Skrypt), ŚCIEŻKĘ DOCELOWĄ, bazę, logi i
+    /// parametry pracy — `target_path` była jedynym polem tej klasy pominiętym
+    /// w tym panelu (operator widział ją tylko w ekranie Ustawień), naprawione
+    /// na wyraźną prośbę.
     #[test]
-    fn test_panel_sciezek_pokazuje_zrodla_i_parametry() {
+    fn test_panel_sciezek_pokazuje_zrodla_cel_i_parametry() {
         let mut u = Ustawienia::default();
         u.ufs_path = "/moje/zrodlo/ufs".to_string();
+        u.target_path = "/moje/miejsce/docelowe".to_string();
         u.io_mode = "SEQUENTIAL".to_string();
         u.max_threads = 0;
 
         let widok = wyrenderuj(140, 14, &mut u, draw_paths_panel);
 
         assert!(widok.contains("/moje/zrodlo/ufs"), "Brak ścieżki UFS:\n{}", widok);
+        assert!(widok.contains("/moje/miejsce/docelowe"), "Brak ścieżki docelowej:\n{}", widok);
         assert!(widok.contains("SEKWENCYJNY"), "Tryb I/O musi być rozwinięty do słowa:\n{}", widok);
         assert!(widok.contains("AUTO"), "Zero wątków musi być pokazane jako AUTO:\n{}", widok);
     }

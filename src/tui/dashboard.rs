@@ -26,7 +26,7 @@ pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
             Constraint::Length(1),  // 0: Tytuł
             Constraint::Length(3),  // 1: Zasoby systemowe (CPU/RAM)
             Constraint::Length(8),  // 2: Tablica Dysków
-            Constraint::Length(10), // 3: Ścieżki i Parametry (7 stałych linii + 1 warunkowa "DNG do przeglądu" + obramowanie)
+            Constraint::Length(11), // 3: Ścieżki i Parametry (8 stałych linii, w tym Ścieżka Docelowa, + 1 warunkowa "DNG do przeglądu" + obramowanie)
             // Menu: `Min(0)`, nie `Min(13)`. Sztywny próg powodował, że na
             // niskim terminalu suma ograniczeń przekraczała wysokość ekranu.
             // Przy `Min(0)` lista kompresuje się do dostępnego miejsca, a
