@@ -358,34 +358,58 @@ mod tests {
     /// powstawały tam, skąd odpalono program — obok cudzych plików i z dala od
     /// `target_path`, gdzie Weryfikator trzyma wszystkie pozostałe wytwory.
     ///
-    /// UWAGA: katalog jest procesowym `OnceLock` ustawianym RAZ, więc taki test
-    /// może istnieć tylko JEDEN w tej binarce. Kolejny nie miałby czego ustawić.
+    /// UWAGA: katalog jest procesowym `OnceLock`, więc PIERWSZE wskazanie w
+    /// tej binarce wygrywa na zawsze — niezależnie, z którego testu przyjdzie.
+    ///
+    /// Od czasu, gdy `phases::phase17_repair::run` zaczęła sama wskazywać ten
+    /// katalog (żeby moduł `mp4_autopilot` dzielił pulę dawców z ręcznym menu
+    /// „[25] MP4 DOCTOR"), ten test PRZESTAŁ być jedynym wywołującym w
+    /// binarce `weryfikator` — testy `phase17_repair` też wołają `run()`, a
+    /// kolejność testów w jednym binarze nie jest gwarantowana. Test nie może
+    /// więc już zakładać, że TO ON ustawi katalog jako pierwszy — sprawdza
+    /// więc oba możliwe wyniki wyścigu, zamiast zakładać jeden z nich.
     #[test]
     fn test_katalog_przestrzeni_mp4_doctor_daje_sie_wskazac() {
         let dir = tempfile::tempdir().unwrap();
         let cel = dir.path().join("_mp4_doctor");
 
         let ustawiono = mp4_doctor::workspace::ustaw_katalog_przestrzeni(cel.clone());
-        assert!(ustawiono, "pierwsze wskazanie musi się udać");
-        assert_eq!(mp4_doctor::workspace::katalog_przestrzeni(), cel);
 
-        // Jednorazowość: drugie wskazanie nie może podmienić katalogu w
-        // trakcie pracy, bo unieważniłoby już otwarte ścieżki.
-        assert!(
-            !mp4_doctor::workspace::ustaw_katalog_przestrzeni(dir.path().join("inny")),
-            "drugie wskazanie musi zostać odrzucone"
-        );
-        assert_eq!(mp4_doctor::workspace::katalog_przestrzeni(), cel, "katalog nie mógł się zmienić");
+        if ustawiono {
+            // Wygraliśmy wyścig: pełna asercja, tak jak wcześniej.
+            assert_eq!(mp4_doctor::workspace::katalog_przestrzeni(), cel);
 
-        // I skutek praktyczny: przestrzeń robocza powstaje pod wskazanym
-        // katalogiem, razem z plikiem bazy wiedzy.
-        let ws = mp4_doctor::workspace::Workspace::init("sprawa_testowa")
-            .expect("przestrzeń robocza musi się utworzyć");
+            // Jednorazowość: drugie wskazanie nie może podmienić katalogu w
+            // trakcie pracy, bo unieważniłoby już otwarte ścieżki.
+            assert!(
+                !mp4_doctor::workspace::ustaw_katalog_przestrzeni(dir.path().join("inny")),
+                "drugie wskazanie musi zostać odrzucone"
+            );
+            assert_eq!(mp4_doctor::workspace::katalog_przestrzeni(), cel, "katalog nie mógł się zmienić");
 
-        assert!(ws.root_dir.starts_with(&cel), "korzeń przestrzeni: {}", ws.root_dir.display());
-        assert!(ws.db_path.starts_with(&cel), "baza wiedzy: {}", ws.db_path.display());
-        assert!(ws.root_dir.exists(), "katalogi muszą powstać fizycznie");
-        assert!(cel.join("sprawa_testowa").exists(), "przestrzeń musi leżeć pod WSKAZANYM katalogiem");
+            // I skutek praktyczny: przestrzeń robocza powstaje pod wskazanym
+            // katalogiem, razem z plikiem bazy wiedzy.
+            let ws = mp4_doctor::workspace::Workspace::init("sprawa_testowa")
+                .expect("przestrzeń robocza musi się utworzyć");
+
+            assert!(ws.root_dir.starts_with(&cel), "korzeń przestrzeni: {}", ws.root_dir.display());
+            assert!(ws.db_path.starts_with(&cel), "baza wiedzy: {}", ws.db_path.display());
+            assert!(ws.root_dir.exists(), "katalogi muszą powstać fizycznie");
+            assert!(cel.join("sprawa_testowa").exists(), "przestrzeń musi leżeć pod WSKAZANYM katalogiem");
+        } else {
+            // Przegraliśmy wyścig z innym testem tej samej binarki (np.
+            // `phase17_repair`'owym `run()`) — katalog jest już zajęty przez
+            // kogoś innego. Sprawdzamy tylko, że odczyt daje spójny,
+            // faktycznie istniejący katalog, a nie NASZ `cel` — bo `cel`
+            // nigdy nie wygrał.
+            let aktywny = mp4_doctor::workspace::katalog_przestrzeni();
+            assert_ne!(aktywny, cel, "skoro przegraliśmy, katalog NIE MOŻE być naszym `cel`");
+
+            let ws = mp4_doctor::workspace::Workspace::init("sprawa_testowa_przegrany_wyscig")
+                .expect("przestrzeń robocza musi się utworzyć nawet po przegranym wyścigu");
+            assert!(ws.root_dir.starts_with(&aktywny), "korzeń przestrzeni: {}", ws.root_dir.display());
+            assert!(ws.root_dir.exists(), "katalogi muszą powstać fizycznie");
+        }
 
         // Asercję w formie „nic nie powstało w ./workspaces" świadomie
         // odrzuciłem: zależy od całej historii procesu i katalogu roboczego,

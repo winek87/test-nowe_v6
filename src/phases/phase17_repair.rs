@@ -534,6 +534,14 @@ pub fn select_active_module_ids() -> Option<Vec<&'static str>> {
 pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>, active_module_ids: Vec<&'static str>) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
+    // Wskazuje `mp4_doctor` gdzie zakładać przestrzenie robocze — identycznie
+    // jak `menu::actions::run_mp4_doctor_with_ui` dla ręcznego wejścia „[25]
+    // MP4 DOCTOR", więc oba wejścia (ręczne i automatyczny moduł
+    // `mp4_autopilot`) dzielą tę samą globalną pulę dawców pod
+    // `target_path/_mp4_doctor`. Jednorazowe (`OnceLock`) — bezpieczne przy
+    // powtórnym wejściu w tę fazę w tej samej sesji.
+    mp4_doctor::workspace::ustaw_katalog_przestrzeni(PathBuf::from(&config.target_path).join("_mp4_doctor"));
+
     let modules = repair_modules::all_modules();
     let active_modules: Vec<&dyn RepairModule> = modules.iter()
         .filter(|m| active_module_ids.contains(&m.id()))

@@ -100,6 +100,18 @@ impl BrainCache {
 pub fn init_db(ws: &Workspace) -> SqlResult<Connection> {
     let conn = Connection::open(&ws.db_path)?;
 
+    // WAL + busy_timeout: do niedawna ta baza miała wyłącznie odbiorców
+    // jednowątkowych (CLI/TUI). Wpięcie autopilota w automatyczny pipeline
+    // Fazy 17 (Weryfikator) oznacza, że wiele wątków Rayon otwiera i pisze do
+    // TEJ SAMEJ bazy jednocześnie — bez WAL domyślny tryb rollback-journal
+    // zwraca `SQLITE_BUSY` natychmiast przy każdej kolizji zapisu (domyślny
+    // busy_timeout SQLite to 0), a wywołujący (`bezglowe::obsluz_zdarzenie`)
+    // po cichu odrzuca błąd (`let _ = ...`) — nauka ginęłaby bez śladu pod
+    // obciążeniem równoległym. WAL pozwala jednemu pisarzowi współistnieć z
+    // wieloma czytelnikami, a `busy_timeout` każe czekać zamiast od razu
+    // poddawać się przy rzadszej kolizji pisarz-pisarz.
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
+
     // Tabele przechowujące wiedzę i pamięć dawców
     conn.execute(
         "CREATE TABLE IF NOT EXISTS knowledge_base (

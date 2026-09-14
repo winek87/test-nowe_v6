@@ -34,6 +34,7 @@ mod heic;
 mod jpeg;
 mod mkv;
 mod mp4;
+mod mp4_autopilot;
 mod png;
 mod splice;
 mod stream;
@@ -636,6 +637,11 @@ pub fn all_modules() -> Vec<Box<dyn RepairModule>> {
         Box::new(mp4::Mp4CloneModule),
         Box::new(mp4::Mp4NativeModule),
         Box::new(mp4::Mp4RecontainerModule),
+        // Ostatnia szansa dla MP4, gdy WSZYSTKIE trzy silniki wyżej zawiodły:
+        // kaskada ucząca się `mp4_doctor` (KNN + pula dawców, w tym Rój).
+        // Stoi PRZED `splice` z tego samego powodu co silniki wyżej — patrz
+        // nagłówek `mp4.rs`.
+        Box::new(mp4_autopilot::Mp4AutopilotModule),
         Box::new(splice::SpliceModule),
         Box::new(sqlite::SqliteModule),
         Box::new(trailer_trim::TrailerTrimModule),

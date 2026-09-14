@@ -104,7 +104,7 @@ const ROZSZERZENIA_SUROWEGO_H264: &[&str] = &["h264", "264", "avc"];
 /// uszkodzenia. Ale nie jest zależny od jednej, konkretnej fazy, bo wtedy
 /// moduł byłby martwy przy każdym przebiegu bez tamtej fazy (dokładnie ta
 /// pułapka, w którą wpadła naprawa rozszerzeń — patrz nagłówek Fazy 17).
-fn jest_uszkodzonym_mp4(ctx: &RepairContext) -> bool {
+pub(super) fn jest_uszkodzonym_mp4(ctx: &RepairContext) -> bool {
     if !ROZSZERZENIA_MP4.contains(&ctx.ext) {
         return false;
     }
@@ -120,7 +120,7 @@ fn jest_uszkodzonym_mp4(ctx: &RepairContext) -> bool {
 /// pierwsze widać wtedy w logu i na dysku, która strategia dała wynik. Po
 /// drugie nie ma szansy na kolizję, gdy orkiestrator próbuje kolejnego silnika
 /// po odrzuceniu poprzedniego.
-fn sciezka_wyniku(source: &Path, katalog_wyjsciowy: &Path, sufiks: &str) -> Option<PathBuf> {
+pub(super) fn sciezka_wyniku(source: &Path, katalog_wyjsciowy: &Path, sufiks: &str) -> Option<PathBuf> {
     let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
     sciezka_wyniku_z_rozszerzeniem(source, katalog_wyjsciowy, sufiks, &ext)
 }
@@ -347,9 +347,55 @@ impl RepairModule for Mp4RecontainerModule {
     }
 }
 
+/// Budowniczy prawdziwego materiału wideo (przez `ffmpeg`) do testów e2e —
+/// jedyna kopia w crate'cie (patrz [`mp4_autopilot`](super::mp4_autopilot),
+/// która reużywa go dla WŁASNEGO testu e2e zamiast duplikować wywołania
+/// `ffmpeg`). Ten sam wzorzec co `png_repair::pomoce_testowe`.
+#[cfg(test)]
+pub(super) mod pomoce_testowe {
+    use std::path::{Path, PathBuf};
+
+    pub fn ffmpeg_dostepny() -> bool {
+        std::process::Command::new("ffmpeg").arg("-version").output()
+            .map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    pub fn wygeneruj_mp4(katalog: &Path, nazwa: &str) -> PathBuf {
+        let cel = katalog.join(nazwa);
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "quiet", "-y",
+                   "-f", "lavfi", "-i", "testsrc=duration=2:size=128x128:rate=15",
+                   "-pix_fmt", "yuv420p"])
+            .arg(&cel).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok && cel.exists(), "ffmpeg nie wygenerował materiału testowego");
+        cel
+    }
+
+    /// Kopiuje plik, USUWAJĄC z niego atom `moov` — dokładnie to uszkodzenie,
+    /// dla którego istnieje przeszczep.
+    pub fn usun_moov(zrodlo: &Path, cel: &Path) {
+        let bajty = std::fs::read(zrodlo).unwrap();
+        let boxy = crate::mp4_repair::boxes::parse_top_level_boxes(&bajty);
+        let moov = crate::mp4_repair::boxes::find_box(&boxy, b"moov")
+            .expect("wygenerowany plik musi mieć moov");
+
+        let mut wynik = Vec::with_capacity(bajty.len());
+        wynik.extend_from_slice(&bajty[..moov.offset]);
+        wynik.extend_from_slice(&bajty[moov.offset + moov.size..]);
+        std::fs::write(cel, &wynik).unwrap();
+    }
+
+    pub fn katalog_wynikow(dir: &Path) -> PathBuf {
+        let w = dir.join("wyniki");
+        std::fs::create_dir_all(&w).unwrap();
+        w
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::pomoce_testowe::{ffmpeg_dostepny, wygeneruj_mp4, usun_moov, katalog_wynikow};
 
     fn ctx(ext: &'static str, video_ok: Option<bool>, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
@@ -565,41 +611,6 @@ mod tests {
     // pełnym dekodowaniem.
     // ------------------------------------------------------------------
 
-    fn ffmpeg_dostepny() -> bool {
-        std::process::Command::new("ffmpeg").arg("-version").output()
-            .map(|o| o.status.success()).unwrap_or(false)
-    }
-
-    fn wygeneruj_mp4(katalog: &Path, nazwa: &str) -> PathBuf {
-        let cel = katalog.join(nazwa);
-        let ok = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-loglevel", "quiet", "-y",
-                   "-f", "lavfi", "-i", "testsrc=duration=2:size=128x128:rate=15",
-                   "-pix_fmt", "yuv420p"])
-            .arg(&cel).status().map(|s| s.success()).unwrap_or(false);
-        assert!(ok && cel.exists(), "ffmpeg nie wygenerował materiału testowego");
-        cel
-    }
-
-    /// Kopiuje plik, USUWAJĄC z niego atom `moov` — dokładnie to uszkodzenie,
-    /// dla którego istnieje przeszczep.
-    fn usun_moov(zrodlo: &Path, cel: &Path) {
-        let bajty = std::fs::read(zrodlo).unwrap();
-        let boxy = crate::mp4_repair::boxes::parse_top_level_boxes(&bajty);
-        let moov = crate::mp4_repair::boxes::find_box(&boxy, b"moov")
-            .expect("wygenerowany plik musi mieć moov");
-
-        let mut wynik = Vec::with_capacity(bajty.len());
-        wynik.extend_from_slice(&bajty[..moov.offset]);
-        wynik.extend_from_slice(&bajty[moov.offset + moov.size..]);
-        std::fs::write(cel, &wynik).unwrap();
-    }
-
-    fn katalog_wynikow(dir: &Path) -> PathBuf {
-        let w = dir.join("wyniki");
-        std::fs::create_dir_all(&w).unwrap();
-        w
-    }
 
     #[test]
     #[ignore = "Wymaga ffmpeg do wygenerowania materiału. Uruchom z --ignored."]
