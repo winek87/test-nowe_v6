@@ -5,10 +5,12 @@
 //! Dla plików WSPÓLNYCH (obecnych po obu stronach — UFS i Skrypt Autorski),
 //! które OBIE strony nie zdołały poprawnie zdekodować w Fazie 13, próbuje
 //! złożyć JEDNĄ sprawną kopię z dwóch uszkodzonych — biorąc dobre fragmenty
-//! z każdej strony. Dotyczy wyłącznie JPG/JPEG i PNG, bo tylko dla nich mamy
-//! tani i wiarygodny sposób WERYFIKACJI wyniku (ten sam silnik dekodujący co
-//! Faza 13) — bez weryfikacji złożenie plików binarnych jest ślepym
-//! zgadywaniem, które może dać wynik gorszy niż oba oryginały.
+//! z każdej strony. Obsługuje obrazy (JPG/JPEG/PNG/GIF/BMP/WEBP — dla PNG i
+//! JPEG dedykowane, deterministyczne składanie na poziomie bajtów; dla
+//! GIF/BMP/WEBP prostsze podejście dekoduj-i-oceń, patrz niżej) oraz archiwa
+//! (ZIP-pochodne i TAR), bo tylko dla nich mamy tani i wiarygodny sposób
+//! WERYFIKACJI wyniku — bez weryfikacji złożenie plików binarnych jest
+//! ślepym zgadywaniem, które może dać wynik gorszy niż oba oryginały.
 //!
 //! ## Dlaczego PNG i JPEG są traktowane różnie
 //!
@@ -24,6 +26,14 @@
 //! dekodowania. Nie rozstrzygamy z góry, która strona ma dobry nagłówek a
 //! która dobre dane — generujemy OBIE kombinacje i pozwalamy zdecydować
 //! obowiązkowej weryfikacji dekodowaniem — patrz [`splice_jpeg_candidates`].
+//!
+//! **GIF/BMP/WEBP** nie mają sum kontrolnych per blok ani taniej granicy do
+//! wyszukania — składanie na poziomie bajtów nie jest tu wiarygodne. Zamiast
+//! tego `crate::raster_splice` próbuje prostszych kombinacji metadane+dane
+//! obrazu i rozstrzyga wyłącznie przez tę samą obowiązkową weryfikację
+//! dekodowaniem co pozostałe formaty (gwarancja słabsza niż dla PNG/JPEG,
+//! ale nigdy nie gorsza niż oba oryginały, bo bez udanej weryfikacji nic nie
+//! trafia na dysk).
 //!
 //! ## Jedyny wyłącznik bezpieczeństwa: obowiązkowa weryfikacja
 //!
@@ -261,6 +271,31 @@ fn verify_candidate(ext: &str, bytes: &[u8]) -> bool {
 /// Wewnątrz właściwej gałęzi `NULL` nadal oznacza "brak diagnostyki, spróbuj"
 /// — to bezpieczne, bo wynik i tak przechodzi przez obowiązkową weryfikację
 /// dekodowaniem/otwarciem archiwum ([`verify_candidate`]) przed zapisem.
+/// Rozstrzyga, do której kategorii (obraz / archiwum / żadna) należy dane
+/// rozszerzenie — JEDYNY gatekeeper decydujący, które wiersze w ogóle
+/// trafiają do `tasks` w `run()`. Wydzielone jako czysta funkcja, żeby dało
+/// się bezpośrednio przetestować "wpięcie" formatu bez budowania SQLite/`run()`.
+///
+/// REGRESJA (measure twice — druga weryfikacja Gemini, N1): commit
+/// `8bc39ea` dodał `crate::raster_splice` (złożenie GIF/BMP/WEBP przez
+/// dekoduj-i-oceń, patrz `build_candidates`/`verify_candidate` niżej) i
+/// deklarował wprost "Wired into Phase 18 ... matching the existing
+/// JPG/PNG/ZIP/TAR splice pattern" — ale nigdy nie rozszerzył TEGO
+/// gatekeepera (wtedy jeszcze inline w `run()`). Efekt: `raster_splice`
+/// (453 linie, z własnymi testami) był martwym kodem od `8bc39ea` do dziś,
+/// osiągalnym wyłącznie z testów jednostkowych `build_candidates`/
+/// `verify_candidate` w izolacji, nigdy z prawdziwego przebiegu `run()`.
+/// Dane potrzebne do kwalifikacji już istniały (Faza 13 wypełnia
+/// `media_decoded_*`/`pixels_ok_*` też dla gif/bmp/webp — patrz
+/// `phase13.rs`, lista rozszerzeń), więc brakowało wyłącznie jednego
+/// warunku, teraz tu, w jedynym miejscu, które o tym decyduje.
+fn klasyfikuj_rozszerzenie(ext: &str) -> (bool, bool) {
+    let is_image = matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp");
+    let is_archive = crate::zip_splice::is_zip_based_extension(&format!(".{}", ext))
+        || ext == "tar";
+    (is_image, is_archive)
+}
+
 fn qualifies_for_splice(
     is_image: bool,
     is_archive: bool,
@@ -305,6 +340,39 @@ fn unikalna_nazwa_wyniku(rel_path: &str, ext: &str) -> String {
     format!("{}_{:016x}_smartsplice.{}", stem, hash, ext)
 }
 
+/// Licznik do budowy unikalnej nazwy pliku tymczasowego — patrz
+/// [`zapisz_atomowo`]. Ten sam wzorzec co `phase9::TMP_COUNTER`.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Zapisuje `dane` pod `target_path` ATOMOWO: najpierw do pliku tymczasowego
+/// w TYM SAMYM katalogu (gwarantuje `rename` bez kopiowania między systemami
+/// plików), potem `fs::rename` na finalną nazwę. Sprząta plik tymczasowy przy
+/// jakiejkolwiek awarii pośredniej.
+///
+/// REGRESJA (measure twice — druga weryfikacja Gemini, Punkt 3b): wcześniej
+/// `File::create(&target_path)` pisało WPROST pod finalną nazwą — `ENOSPC`
+/// lub inna awaria w połowie `write_all` zostawiała częściowy, uszkodzony
+/// plik pod `target_path`, bez sprzątania (baza i tak poprawnie zapisuje
+/// `smart_splice_path = NULL` dla tego wiersza, więc plik nie jest
+/// referencjonowany — ale zaśmieca przestrzeń roboczą, wykrywalne dopiero
+/// przez `workspace_cleanup`). Ten sam wzorzec tmp+rename co
+/// `phase9::copy_file_and_meta`.
+fn zapisz_atomowo(target_path: &Path, dane: &[u8]) -> std::io::Result<()> {
+    let licznik = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = target_path.with_extension(format!("tmp{}", licznik));
+
+    let wynik = File::create(&tmp_path).and_then(|mut f| f.write_all(dane));
+    match wynik {
+        Ok(()) => fs::rename(&tmp_path, target_path).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        }),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
 // ============================================================================
 // GŁÓWNA PĘTLA PRZETWARZANIA
 // ============================================================================
@@ -346,7 +414,7 @@ fn process_stream(
                             let target_path = target_dir.join(unikalna_nazwa_wyniku(&task.rel_path, &task.ext));
                             if let Some(parent) = target_path.parent() { let _ = fs::create_dir_all(parent); }
 
-                            match File::create(&target_path).and_then(|mut f| f.write_all(&final_bytes)) {
+                            match zapisz_atomowo(&target_path, &final_bytes) {
                                 Ok(()) => {
                                     match task.ext.as_str() {
                                         "png" => { stats.spliced_png.fetch_add(1, Ordering::Relaxed); }
@@ -473,9 +541,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, media_decoded_ufs, media_decoded_script, pixels_ok_ufs, pixels_ok_script, structure_ok_ufs, structure_ok_script) = r;
         let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        let is_image = ext == "jpg" || ext == "jpeg" || ext == "png";
-        let is_archive = crate::zip_splice::is_zip_based_extension(&format!(".{}", ext))
-            || ext == "tar";
+        let (is_image, is_archive) = klasyfikuj_rozszerzenie(&ext);
         if !(is_image || is_archive) {
             continue;
         }
@@ -574,6 +640,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     // Prymitywy PNG sprawdzane bezpośrednio przez testy tej fazy - po
     // przeniesieniu do `png_repair` to one pilnują, że przeprowadzka niczego
     // nie zmieniła w zachowaniu.
@@ -834,6 +901,81 @@ mod tests {
         let jpeg_b = build_minimal_jpeg(b"HDRB", b"DANE_B");
         assert_eq!(build_candidates("jpg", &jpeg_a, &jpeg_b).len(), 2);
         assert_eq!(build_candidates("jpeg", &jpeg_a, &jpeg_b).len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, N1):
+    // klasyfikuj_rozszerzenie — jedyny gatekeeper decydujący, które wiersze
+    // w ogóle trafiają do `tasks` w `run()`. Wcześniej gif/bmp/webp nigdy
+    // nie przechodziły tego warunku mimo że `raster_splice`/`build_candidates`/
+    // `verify_candidate` je poprawnie obsługują - martwy kod.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_klasyfikuj_rozszerzenie_rozpoznaje_formaty_rastrowe_raster_splice() {
+        for ext in ["gif", "bmp", "webp"] {
+            let (is_image, is_archive) = klasyfikuj_rozszerzenie(ext);
+            assert!(is_image, ".{} musi przejść gatekeeper is_image - inaczej raster_splice jest martwym kodem", ext);
+            assert!(!is_archive);
+        }
+    }
+
+    #[test]
+    fn test_klasyfikuj_rozszerzenie_rozpoznaje_jpg_png() {
+        for ext in ["jpg", "jpeg", "png"] {
+            let (is_image, is_archive) = klasyfikuj_rozszerzenie(ext);
+            assert!(is_image);
+            assert!(!is_archive);
+        }
+    }
+
+    #[test]
+    fn test_klasyfikuj_rozszerzenie_rozpoznaje_archiwa() {
+        for ext in ["zip", "docx", "tar"] {
+            let (is_image, is_archive) = klasyfikuj_rozszerzenie(ext);
+            assert!(!is_image);
+            assert!(is_archive);
+        }
+    }
+
+    #[test]
+    fn test_klasyfikuj_rozszerzenie_nieznane_nie_kwalifikuje_sie_do_niczego() {
+        let (is_image, is_archive) = klasyfikuj_rozszerzenie("txt");
+        assert!(!is_image);
+        assert!(!is_archive);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Punkt 3b):
+    // zapisz_atomowo — nigdy nie zostawia częściowego pliku pod finalną nazwą.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_zapisz_atomowo_tworzy_plik_z_dokladna_zawartoscia() {
+        let dir = tempdir().unwrap();
+        let cel = dir.path().join("wynik.png");
+        zapisz_atomowo(&cel, b"tresc splice").unwrap();
+        assert_eq!(std::fs::read(&cel).unwrap(), b"tresc splice");
+    }
+
+    #[test]
+    fn test_zapisz_atomowo_nie_zostawia_pliku_tymczasowego_po_sukcesie() {
+        let dir = tempdir().unwrap();
+        let cel = dir.path().join("wynik.png");
+        zapisz_atomowo(&cel, b"dane").unwrap();
+
+        let pozostale: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(pozostale, vec!["wynik.png".to_string()], "Po sukcesie w katalogu może zostać WYŁĄCZNIE plik finalny, żaden .tmpN");
+    }
+
+    #[test]
+    fn test_zapisz_atomowo_gdy_katalog_docelowy_nie_istnieje_zwraca_blad_bez_panic() {
+        let dir = tempdir().unwrap();
+        let cel = dir.path().join("nieistniejacy_podkatalog").join("wynik.png");
+        assert!(zapisz_atomowo(&cel, b"dane").is_err());
     }
 
     // ------------------------------------------------------------------
