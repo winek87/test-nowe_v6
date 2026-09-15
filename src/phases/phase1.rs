@@ -576,16 +576,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let known_ufs_ref2 = &known_ufs;
     let known_script_ref2 = &known_script;
 
-    std::thread::scope(|s| {
-        let (tx_db, rx_db) = mpsc::sync_channel(200); 
-        
-        let conn_ref = &mut *conn; 
+    // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd SQLite
+    // w tym wątku był wcześniej `.unwrap()`, czyli paniką w wątku pisarza
+    // wewnątrz `thread::scope` — narzędzie forensyczne potrafiące działać
+    // godzinami na dużych korpusach traciłoby CAŁY postęp fazy na jeden
+    // transjentny błąd I/O bazy (dysk pełny, blokada pliku WAL), bez żadnego
+    // komunikatu tłumaczącego operatorowi, co się stało. Ten sam wzorzec co
+    // `phase17_repair::run` — `db_thread` zwraca `Result<()>`, panika jest
+    // przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
+        let (tx_db, rx_db) = mpsc::sync_channel(200);
+
+        let conn_ref = &mut *conn;
         let ufs_ins_ref = &mut ufs_inserted;
         let script_ins_ref = &mut script_inserted;
         let ufs_skip_ref = &mut ufs_skipped;
         let script_skip_ref = &mut script_skipped;
-        
-        let _db_thread = s.spawn(move || {
+
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut last_db_update = Instant::now();
 
             for msg in rx_db {
@@ -596,14 +604,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 };
 
                 if chunk_len > 0 {
-                    let tx_trans = conn_ref.transaction().unwrap();
+                    let tx_trans = conn_ref.transaction()?;
                     {
                         let mut stmt = match &msg {
-                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(INSERT_SQL_UFS).unwrap(),
-                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(INSERT_SQL_SCRIPT).unwrap(),
+                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(INSERT_SQL_UFS)?,
+                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(INSERT_SQL_SCRIPT)?,
                             _ => unreachable!(),
                         };
-                        
+
                         let chunk = match &msg {
                             ScanMsg::UfsChunk(c) => c,
                             ScanMsg::ScriptChunk(c) => c,
@@ -611,10 +619,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         };
 
                         for (rel, _, is_orphan) in chunk {
-                            stmt.execute(params![rel, is_orphan]).unwrap();
+                            stmt.execute(params![rel, is_orphan])?;
                         }
                     }
-                    tx_trans.commit().unwrap();
+                    tx_trans.commit()?;
                 }
 
                 match msg {
@@ -644,6 +652,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let total_saved = *ufs_ins_ref + *script_ins_ref;
             let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: total_saved as u64, message: "Baza danych zsynchronizowana.".to_string() });
             let _ = tx_ui_ref.send(PhaseEvent::UpdateSideText { idx: 2, text: build_sqlite_sync_block(*ufs_ins_ref, *script_ins_ref) });
+            Ok(())
         });
 
         if active_io_mode == "CONCURRENT" {
@@ -689,8 +698,32 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 total_script_orphans = orph;
                 let _ = tx_ui_ref.send(PhaseEvent::Log(format!("✔ Zakończono odczyt I/O na Skrypt Autorski ({} plików)", cnt)));
             }
+            // REGRESJA (measure twice — druga weryfikacja Gemini): obie
+            // powyższe wołania biorą TYLKO `tx_db.clone()` - oryginalny
+            // `tx_db` nigdy nie był przenoszony w tej gałęzi, więc kanał nie
+            // zamykał się, dopóki ta zmienna nie wyszła z zasięgu na końcu
+            // CAŁEGO domknięcia `thread::scope`, czyli PO `db_thread.join()`
+            // niżej - klasyczny deadlock (wątek czeka na zamknięcie kanału,
+            // który sam trzyma otwarty). Jawny `drop` zamyka kanał
+            // deterministycznie, zanim `.join()` zacznie czekać.
+            drop(tx_db);
+        }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 1 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
         }
     });
+    wynik_zapisu?;
 
     // ============================================================================
     // ETAP 4: GENEROWANIE DZIENNIKA KOŃCOWEGO
