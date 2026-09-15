@@ -288,8 +288,44 @@ fn decide_winner(file: &MergeCandidate) -> (&'static str, &'static str) {
 /// (typowy przypadek dla `target_path` przy pierwszym uruchomieniu — nie
 /// można kanonikalizować czegoś, co jeszcze nie istnieje na dysku).
 fn sciezki_bezpieczne(target_path: &Path, ufs_path: &Path, script_path: &Path) -> std::result::Result<(), String> {
+    // REGRESJA (Gemini review — druga weryfikacja): zwykły
+    // `canonicalize().unwrap_or(surowa_sciezka)` zawodzi cicho dla
+    // `target_path`, który typowo JESZCZE NIE ISTNIEJE przy pierwszym
+    // uruchomieniu — funkcja porównywałaby wtedy surowy, potencjalnie
+    // WZGLĘDNY string operatora ze skanonikalizowanymi, BEZWZGLĘDNYMI
+    // ścieżkami źródłowymi. Taka ścieżka nigdy nie spełni `==`/`starts_with`
+    // nawet jeśli faktycznie leży wewnątrz źródła (np. przez symlink) —
+    // walidacja przechodziłaby bezpiecznie WYGLĄDAJĄCO, nic nie sprawdzając.
+    // Naprawa: kanonikalizuj najbliższego ISTNIEJĄCEGO przodka i dołącz do
+    // wyniku resztę składników ścieżki — daje efektywnie bezwzględną,
+    // rozwiązaną ścieżkę nawet dla jeszcze nieutworzonego katalogu liścia.
     fn kanon(p: &Path) -> PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        if let Ok(real) = std::fs::canonicalize(p) {
+            return real;
+        }
+        let mut ogon: Vec<std::ffi::OsString> = Vec::new();
+        let mut biezacy = p;
+        loop {
+            match std::fs::canonicalize(biezacy) {
+                Ok(real) => {
+                    let mut wynik = real;
+                    for skladnik in ogon.iter().rev() {
+                        wynik.push(skladnik);
+                    }
+                    return wynik;
+                }
+                Err(_) => match (biezacy.file_name(), biezacy.parent()) {
+                    (Some(nazwa), Some(rodzic)) if !rodzic.as_os_str().is_empty() => {
+                        ogon.push(nazwa.to_os_string());
+                        biezacy = rodzic;
+                    }
+                    // Żaden przodek nie istnieje (korzeń albo ścieżka względna
+                    // bez wspólnego istniejącego prefiksu) — ostatnia deska
+                    // ratunku, zwracamy ścieżkę jak jest.
+                    _ => return p.to_path_buf(),
+                },
+            }
+        }
     }
 
     let target = kanon(target_path);
@@ -1443,6 +1479,36 @@ mod tests {
         let ufs = target.path().join("podkatalog_zrodlowy");
         std::fs::create_dir_all(&ufs).unwrap();
         assert!(sciezki_bezpieczne(target.path(), &ufs, script.path()).is_err());
+    }
+
+    /// REGRESJA (Gemini review — druga weryfikacja): `target_path` JESZCZE
+    /// NIEISTNIEJĄCY na dysku (typowy przypadek pierwszego uruchomienia) był
+    /// wcześniej porównywany jako surowy string zamiast skanonikalizowanej
+    /// ścieżki, więc zagnieżdżenie wewnątrz źródła przechodziło niewykryte.
+    #[test]
+    fn test_sciezki_bezpieczne_wykrywa_zagniezdzenie_gdy_target_jeszcze_nie_istnieje() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        // Katalog docelowy NIE jest tworzony — tylko wyliczona ścieżka wewnątrz UFS.
+        let target_nieistniejacy = ufs.path().join("jeszcze_nieutworzony_katalog_docelowy");
+        assert!(!target_nieistniejacy.exists(), "test musi sprawdzać ścieżkę, która faktycznie nie istnieje");
+
+        let wynik = sciezki_bezpieczne(&target_nieistniejacy, ufs.path(), script.path());
+        assert!(wynik.is_err(), "zagnieżdżenie musi zostać wykryte nawet gdy target_path jeszcze nie istnieje na dysku");
+    }
+
+    /// Kontrola przeciwna: nieistniejący, ale FAKTYCZNIE rozłączny target_path
+    /// (rodzic istnieje, sam katalog jeszcze nie) musi zostać zaakceptowany —
+    /// naprawa nie może fałszywie odrzucać normalnego, poprawnego przypadku.
+    #[test]
+    fn test_sciezki_bezpieczne_akceptuje_rozlaczny_target_ktory_jeszcze_nie_istnieje() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let rodzic_targetu = tempdir().unwrap();
+        let target_nieistniejacy = rodzic_targetu.path().join("nowy_katalog_docelowy");
+        assert!(!target_nieistniejacy.exists());
+
+        assert!(sciezki_bezpieczne(&target_nieistniejacy, ufs.path(), script.path()).is_ok());
     }
 
     #[test]
