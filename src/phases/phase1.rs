@@ -36,25 +36,72 @@ use std::fs::{self, File};
 
 const CHUNK_SIZE: usize = 200;
 
-// `phase2_done = CASE WHEN found_in_ufs/found_in_script = 0 THEN 0 ELSE phase2_done END`:
+// `phaseN_done = CASE WHEN found_in_ufs/found_in_script = 0 THEN 0 ELSE phaseN_done END`:
 // nazwa kolumny bez kwalifikatora w `ON CONFLICT DO UPDATE` czyta wartość SPRZED
 // tego zapisu — `found_in_ufs/script = 0` znaczy więc "ta strona NIE była wcześniej
 // widziana", czyli ten UPSERT to prawdziwe przejście 0->1 (dysk/skrypt drugiej
 // strony dołączony PO fakcie), a nie zwykłe powtórne skanowanie tej samej,
 // niezmienionej strony korpusu — patrz testy `test_dopisanie_drugiej_strony_...`
 // i `test_powtorny_zapis_tej_samej_strony_...` niżej.
+//
+// REGRESJA (measure twice — druga weryfikacja Gemini, Faza 11 N2 / Faza 14
+// obserwacja #2): pierwotna naprawa resetowała TYLKO `phase2_done` — każda
+// dalsza faza (3-19) miała identyczny problem strukturalny, tylko nikt go
+// jeszcze nie naprawił: plik dopisany PÓŹNIEJ po drugiej stronie korpusu
+// (scenariusz "dysk Skryptu podłączony po fakcie", patrz dokumentacja
+// modułu) mógł już mieć `phaseN_done = 1` z WCZEŚNIEJSZEGO przebiegu, w
+// którym istniał tylko po jednej stronie (`found_in_* = 0` trywialnie
+// spełniało warunek ukończenia po stronie nieobecnej) — druga strona nigdy
+// nie doczekałaby się analizy w żadnej fazie 3-19, bo `WHERE phaseN_done = 0
+// OR phaseN_done IS NULL` na zawsze by ją pomijało. Rozszerzone tu na
+// WSZYSTKIE `phaseN_done` (2 przez 19) — ten sam warunek dla każdej, bo
+// przesłanka ("ta strona jest nowa") jest identyczna niezależnie od fazy.
 const INSERT_SQL_UFS: &str = "
     INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan)
     VALUES (?1, 1, 0, 1, ?2)
     ON CONFLICT(relative_path) DO UPDATE SET found_in_ufs = 1, phase1_done = 1, is_orphan = ?2,
-        phase2_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase2_done END
+        phase2_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase2_done END,
+        phase3_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase3_done END,
+        phase4_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase4_done END,
+        phase5_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase5_done END,
+        phase6_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase6_done END,
+        phase7_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase7_done END,
+        phase8_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase8_done END,
+        phase9_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase9_done END,
+        phase10_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase10_done END,
+        phase11_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase11_done END,
+        phase12_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase12_done END,
+        phase13_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase13_done END,
+        phase14_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase14_done END,
+        phase15_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase15_done END,
+        phase16_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase16_done END,
+        phase17_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase17_done END,
+        phase18_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase18_done END,
+        phase19_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase19_done END
 ";
 
 const INSERT_SQL_SCRIPT: &str = "
     INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan)
     VALUES (?1, 0, 1, 1, ?2)
     ON CONFLICT(relative_path) DO UPDATE SET found_in_script = 1, phase1_done = 1, is_orphan = ?2,
-        phase2_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase2_done END
+        phase2_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase2_done END,
+        phase3_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase3_done END,
+        phase4_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase4_done END,
+        phase5_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase5_done END,
+        phase6_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase6_done END,
+        phase7_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase7_done END,
+        phase8_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase8_done END,
+        phase9_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase9_done END,
+        phase10_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase10_done END,
+        phase11_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase11_done END,
+        phase12_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase12_done END,
+        phase13_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase13_done END,
+        phase14_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase14_done END,
+        phase15_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase15_done END,
+        phase16_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase16_done END,
+        phase17_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase17_done END,
+        phase18_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase18_done END,
+        phase19_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase19_done END
 ";
 
 pub(crate) enum ScanMsg {
@@ -124,6 +171,21 @@ fn hash_path(path: &str) -> u64 {
     hasher.finish()
 }
 
+/// FNV-1a 64-bit — algorytm w pełni opisany specyfikacją (offset/prime niżej
+/// to CAŁA definicja), więc daje BITOWO identyczny wynik na każdej wersji
+/// Rust/toolchaina i każdej platformie, w przeciwieństwie do
+/// `std::collections::hash_map::DefaultHasher` (patrz `sanitize_relative_path`).
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Zamienia ścieżkę względną na string bezpieczny do zapisu w `relative_path`
 /// (kolumna `UNIQUE`).
 ///
@@ -144,15 +206,28 @@ fn hash_path(path: &str) -> u64 {
 /// nigdy nie mogą już wylądować pod tym samym kluczem — kolizja jest
 /// strukturalnie niemożliwa, nie tylko mało prawdopodobna. Poprawne UTF-8
 /// (zdecydowana większość przypadków) przechodzi bez żadnej zmiany.
+///
+/// REGRESJA (measure twice — druga weryfikacja Gemini, N1): sufiks liczony
+/// dawniej przez `DefaultHasher` — dokumentacja `std` wprost zastrzega, że
+/// ten algorytm NIE jest gwarantowany jako ten sam między wersjami
+/// biblioteki standardowej ani platformami. W obrębie JEDNEGO zbudowanego
+/// binarium wynik jest w pełni deterministyczny, ale sufiks ląduje TRWALE
+/// w kolumnie `UNIQUE` — jeśli to samo repozytorium dowodowe zostanie
+/// zeskanowane Fazą 1 dwukrotnie przez DWA RÓŻNE kompilaty (np. po
+/// aktualizacji Rust/toolchaina między sesjami śledztwa), ta sama ścieżka
+/// mogłaby dostać INNY sufiks przy drugim skanie i utworzyć DRUGI,
+/// zduplikowany wiersz zamiast trafić w `ON CONFLICT` na ten sam. `fnv1a_64`
+/// ma w pełni opisaną, stabilną specyfikację — gwarancja idempotencji
+/// deklarowana wyżej jest teraz prawdziwa międzybinarnie, nie tylko
+/// wewnątrzbinarnie.
 fn sanitize_relative_path(rel: &Path) -> String {
     let raw = rel.as_os_str();
     match raw.to_str() {
         Some(s) => s.to_string(),
         None => {
             let lossy = raw.to_string_lossy().into_owned();
-            let mut hasher = DefaultHasher::new();
-            raw.as_encoded_bytes().hash(&mut hasher);
-            format!("{}__nieutf8_{:016x}", lossy, hasher.finish())
+            let hash = fnv1a_64(raw.as_encoded_bytes());
+            format!("{}__nieutf8_{:016x}", lossy, hash)
         }
     }
 }
@@ -761,6 +836,38 @@ mod tests {
         assert_ne!(sa, sb, "różne surowe bajty muszą dać różne klucze relative_path");
     }
 
+    // ------------------------------------------------------------------
+    // fnv1a_64 — REGRESJA (measure twice — druga weryfikacja Gemini, N1):
+    // sufiks anty-kolizyjny ląduje TRWALE w kolumnie UNIQUE bazy, więc musi
+    // mieć w pełni opisaną, międzybinarnie stabilną specyfikację —
+    // `DefaultHasher` (poprzedni algorytm) tego nie gwarantuje.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_fnv1a_64_pusty_input_daje_offset_basis() {
+        // Definicja algorytmu: pętla nad zerem bajtów nie wykonuje żadnej
+        // iteracji, więc wynik to dokładnie offset basis - jedyna wartość
+        // sprawdzalna "z definicji", bez zewnętrznego wektora testowego.
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
+    }
+
+    #[test]
+    fn test_fnv1a_64_jest_deterministyczny() {
+        assert_eq!(fnv1a_64(b"dowolne bajty testowe"), fnv1a_64(b"dowolne bajty testowe"));
+    }
+
+    #[test]
+    fn test_fnv1a_64_rozne_bajty_daja_rozne_hashe() {
+        assert_ne!(fnv1a_64(b"plik_a"), fnv1a_64(b"plik_b"));
+    }
+
+    #[test]
+    fn test_fnv1a_64_wrazliwy_na_kolejnosc_bajtow() {
+        // Lawinowość FNV-1a: zamiana kolejności dwóch bajtów musi zmienić
+        // wynik - inaczej sufiks nie chroniłby przed kolizją anagramów ścieżek.
+        assert_ne!(fnv1a_64(b"ab"), fnv1a_64(b"ba"));
+    }
+
     /// Stabilność między przebiegami Fazy 1: te same surowe bajty muszą
     /// zawsze dać ten sam wynik, inaczej ten sam plik dostawałby nowy wiersz
     /// (duplikat) przy każdym kolejnym skanie.
@@ -1248,5 +1355,58 @@ mod tests {
         wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false); // ponowny skan UFS, found_in_ufs już = 1
 
         assert!(phase2_done(&conn, "plik.jpg"), "brak realnej zmiany found_in_* nie może zresetować phase2_done");
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Faza 11 N2 / Faza
+    // 14 obserwacja #2): reset przy dopisaniu drugiej strony był wcześniej
+    // ograniczony WYŁĄCZNIE do phase2_done — każda dalsza faza (3-19) miała
+    // ten sam strukturalny problem. Sprawdzamy tu reprezentatywną próbkę
+    // (środek zakresu, najnowsza faza, i tę bezpośrednio zgłoszoną w
+    // audycie) zamiast powtarzać identyczny test 18 razy dla każdej kolumny
+    // — logika SQL jest identyczna dla wszystkich (ten sam CASE WHEN,
+    // sklonowany), więc próbka jest reprezentatywna dla całości.
+    // ------------------------------------------------------------------
+
+    fn ustaw_phase_done(conn: &Connection, kolumna: &str, rel: &str, wartosc: bool) {
+        conn.execute(
+            &format!("UPDATE files SET {} = ?1 WHERE relative_path = ?2", kolumna),
+            params![wartosc, rel],
+        ).unwrap();
+    }
+
+    fn phase_done(conn: &Connection, kolumna: &str, rel: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT {} FROM files WHERE relative_path = ?1", kolumna), params![rel], |r| r.get(0),
+        ).unwrap()
+    }
+
+    #[test]
+    fn test_dopisanie_drugiej_strony_resetuje_phase11_i_phase14_i_phase19_done() {
+        for kolumna in ["phase11_done", "phase14_done", "phase19_done"] {
+            let conn = crate::db::init_db(":memory:").unwrap();
+
+            wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false);
+            ustaw_phase_done(&conn, kolumna, "plik.jpg", true); // symuluje wcześniejszy przebieg tej fazy, gdy plik był jeszcze jednostronny
+
+            wstaw(&conn, INSERT_SQL_SCRIPT, "plik.jpg", false); // Skrypt dochodzi PÓŹNIEJ
+
+            assert!(!phase_done(&conn, kolumna, "plik.jpg"), "realna zmiana found_in_script 0->1 musi zresetować {}", kolumna);
+        }
+    }
+
+    #[test]
+    fn test_powtorny_zapis_tej_samej_strony_nie_resetuje_phase11_i_phase14_i_phase19_done() {
+        for kolumna in ["phase11_done", "phase14_done", "phase19_done"] {
+            let conn = crate::db::init_db(":memory:").unwrap();
+
+            wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false);
+            wstaw(&conn, INSERT_SQL_SCRIPT, "plik.jpg", false);
+            ustaw_phase_done(&conn, kolumna, "plik.jpg", true);
+
+            wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false); // ponowny skan UFS, found_in_ufs już = 1
+
+            assert!(phase_done(&conn, kolumna, "plik.jpg"), "brak realnej zmiany found_in_* nie może zresetować {}", kolumna);
+        }
     }
 }
