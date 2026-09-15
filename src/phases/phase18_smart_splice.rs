@@ -587,27 +587,51 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let target_base = PathBuf::from(&config.target_path).join("_smart_splice_repaired");
     let stats = LiveStats::new(rayon::current_num_threads());
 
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): błąd SQLite w
+    // wątku bazy był wcześniej `.unwrap()` (transakcja/prepare/commit) albo,
+    // dla samego zapisu wyniku per plik, cicho POŁYKANY przez `let _ =
+    // stmt.execute(...)` — obie ścieżki są gorsze niż jawna propagacja:
+    // panika ubijała cały wątek pisarza wewnątrz `thread::scope`, a ciche
+    // `let _ =` gubiło zapis BEZ ŚLADU, nawet w logu. Ten sam wzorzec co
+    // `phase17_repair::run`/`phase1::run` — `db_thread` zwraca `Result<()>`,
+    // panika jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db): (mpsc::SyncSender<SpliceResult>, mpsc::Receiver<SpliceResult>) = mpsc::sync_channel(100);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
-        let _db_thread = s.spawn(move || {
-            let tx_trans = conn_ref.transaction().unwrap();
+        let db_thread = s.spawn(move || -> Result<()> {
+            let tx_trans = conn_ref.transaction()?;
             {
                 let mut stmt = tx_trans.prepare_cached(
                     "UPDATE files SET smart_splice_path = ?1, smart_splice_log = ?2, phase18_done = 1 WHERE id = ?3"
-                ).unwrap();
+                )?;
                 for res in rx_db {
-                    let _ = stmt.execute(params![res.path, res.log, res.id]);
+                    stmt.execute(params![res.path, res.log, res.id])?;
                 }
             }
-            tx_trans.commit().unwrap();
+            tx_trans.commit()?;
             let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Wyniki inteligentnej rekonstrukcji zapisane w bazie.".to_string()));
+            Ok(())
         });
 
         process_stream(&ufs_base, &script_base, &target_base, &tasks, &stats, tx_db, &tx_ui, start_time, opr_log.clone());
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 18 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
+        }
     });
+    wynik_zapisu?;
 
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
         let _ = tx_ui.send(PhaseEvent::Log("🛑 Inteligentna rekonstrukcja przerwana przez użytkownika.".to_string()));
