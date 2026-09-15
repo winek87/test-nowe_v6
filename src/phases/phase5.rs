@@ -589,12 +589,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let script_base = PathBuf::from(&config.script_path);
 
     // --- ETAP 3: PRZETWARZANIE STRUMIENIOWE (MPSC) ---
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd SQLite
+    // w wątku bazy był wcześniej `.unwrap()`, czyli paniką w wątku pisarza
+    // wewnątrz `thread::scope`. Ten sam wzorzec co `phase17_repair::run`/
+    // `phase1::run`/`phase3::run` — `db_thread` zwraca `Result<()>`, panika
+    // jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel(200);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut last_db_update = Instant::now();
             let mut db_inserted = 0;
 
@@ -605,15 +610,15 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 };
 
                 if chunk_len > 0 {
-                    let tx_trans = conn_ref.transaction().unwrap();
+                    let tx_trans = conn_ref.transaction()?;
                     {
                         let mut stmt = match &msg {
                             ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(
                                 "UPDATE files SET uid_ufs = COALESCE(?1, uid_ufs), gid_ufs = COALESCE(?2, gid_ufs), mode_ufs = COALESCE(?3, mode_ufs), mtime_ufs = COALESCE(?4, mtime_ufs), is_symlink_ufs = COALESCE(?5, is_symlink_ufs), io_error_ufs = COALESCE(?6, io_error_ufs) WHERE id = ?7"
-                            ).unwrap(),
+                            )?,
                             ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(
                                 "UPDATE files SET uid_script = COALESCE(?1, uid_script), gid_script = COALESCE(?2, gid_script), mode_script = COALESCE(?3, mode_script), mtime_script = COALESCE(?4, mtime_script), is_symlink_script = COALESCE(?5, is_symlink_script), io_error_script = COALESCE(?6, io_error_script) WHERE id = ?7"
-                            ).unwrap(),
+                            )?,
                         };
                         
                         let chunk = match &msg {
@@ -639,11 +644,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                                     // podjęto próby". Patrz N2 w todo.faza05.md.
                                     res.stats.as_ref().and_then(|s| s.mtime_ns),
                                     res.stats.as_ref().map(|s| s.is_symlink), res.io_error, res.id
-                                ]).unwrap();
+                                ])?;
                             }
                         }
                     }
-                    tx_trans.commit().unwrap();
+                    tx_trans.commit()?;
                 }
 
                 db_inserted += chunk_len;
@@ -655,6 +660,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 }
             }
             let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Metadane bezpiecznie zapisane w SQLite.".to_string() });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -720,7 +726,22 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
             drop(tx_db);
         }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 5 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
+        }
     });
+    wynik_zapisu?;
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
