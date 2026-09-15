@@ -476,6 +476,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
     let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 18: Inteligentna Rekonstrukcja (Smart Splice).".to_string()));
 
+    // REGRESJA (measure twice — druga weryfikacja Gemini, N3): ta faza
+    // FIZYCZNIE zapisuje złożone pliki pod `config.target_path`
+    // (`_smart_splice_repaired`, patrz `target_base` niżej), dokładnie tak
+    // samo jak Faza 9 — ale, w przeciwieństwie do Fazy 9, nigdy nie wołała
+    // `sciezki_bezpieczne`. Sprawdzane PRZED jakimkolwiek zapisem, tak samo
+    // jak w Fazie 9/17.
+    let ufs_path = Path::new(&config.ufs_path);
+    let script_path = Path::new(&config.script_path);
+    let target_path_walidacja = Path::new(&config.target_path);
+    if let Err(powod) = super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path) {
+        let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY: {}", powod)));
+        return Ok(());
+    }
+
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
@@ -1018,6 +1032,42 @@ mod tests {
 
         let spliced = splice_png(&side_a, &side_b).expect("Złożenie prawdziwego PNG powinno się powieść");
         assert!(verify_image_bytes(&spliced), "Złożony prawdziwy PNG powinien się poprawnie zdekodować");
+    }
+
+    /// REGRESJA (measure twice — druga weryfikacja Gemini, N3): Faza 18
+    /// nigdy nie wołała `sciezki_bezpieczne` (w odróżnieniu od Fazy 9) —
+    /// `target_path` ustawiony przypadkiem na `ufs_path` pozwalałby złożyć i
+    /// zapisać wynikowy plik wprost do materiału dowodowego. Dowodzi, że
+    /// `run()` odmawia PRZED utworzeniem katalogu roboczego, nie tylko że
+    /// `sciezki_bezpieczne` samo w sobie zwraca `Err`.
+    #[test]
+    fn test_run_odmawia_gdy_target_path_jest_wewnatrz_korpusu() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let logi = tempdir().unwrap();
+        std::fs::write(ufs.path().join("wspolny.jpg"), b"cokolwiek").unwrap();
+        std::fs::write(script.path().join("wspolny.jpg"), b"cokolwiek innego").unwrap();
+
+        let mut config = Ustawienia {
+            ufs_path: ufs.path().to_string_lossy().to_string(),
+            script_path: script.path().to_string_lossy().to_string(),
+            target_path: ufs.path().to_string_lossy().to_string(), // == ufs_path - błędna konfiguracja
+            log_path: logi.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script, media_decoded_ufs, media_decoded_script)
+             VALUES ('wspolny.jpg', 1, 1, 0, 0)",
+            [],
+        ).unwrap();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui).expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
+
+        assert!(!ufs.path().join("_smart_splice_repaired").exists(), "katalog roboczy Fazy 18 NIE MOŻE powstać wewnątrz korpusu źródłowego");
     }
 
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
