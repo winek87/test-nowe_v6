@@ -275,6 +275,51 @@ fn decide_winner(file: &MergeCandidate) -> (&'static str, &'static str) {
 // SYSTEM KOPIOWANIA I REKONSTRUKCJI (I/O)
 // ============================================================================
 
+/// Sprawdza, że katalog docelowy (`target_path`, gdzie faza fizycznie
+/// zapisuje Złotą Kopię) jest ROZŁĄCZNY z obydwoma katalogami źródłowymi
+/// materiału dowodowego — ani nie jest tym samym katalogiem, ani nie jest
+/// przodkiem/potomkiem żadnego z nich. Bez tej kontroli błędna konfiguracja
+/// operatora (np. `target_path` przypadkiem ustawiony na `ufs_path`)
+/// prowadziłaby do fizycznego nadpisania oryginalnego materiału dowodowego
+/// przez `copy_file_and_meta`.
+///
+/// Kanonikalizuje ścieżki tam, gdzie się da (rozwiązuje symlinki/`..`), z
+/// fallbackiem na ścieżkę surową, gdy katalog jeszcze fizycznie nie istnieje
+/// (typowy przypadek dla `target_path` przy pierwszym uruchomieniu — nie
+/// można kanonikalizować czegoś, co jeszcze nie istnieje na dysku).
+fn sciezki_bezpieczne(target_path: &Path, ufs_path: &Path, script_path: &Path) -> std::result::Result<(), String> {
+    fn kanon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    let target = kanon(target_path);
+    let ufs = kanon(ufs_path);
+    let script = kanon(script_path);
+
+    for (nazwa, zrodlo) in [("UFS", &ufs), ("Skrypt", &script)] {
+        if target == *zrodlo {
+            return Err(format!(
+                "Ścieżka docelowa ({}) jest TAKA SAMA jak źródło {} ({}) — zapis nadpisałby materiał dowodowy.",
+                target_path.display(), nazwa, zrodlo.display()
+            ));
+        }
+        if target.starts_with(zrodlo) {
+            return Err(format!(
+                "Ścieżka docelowa ({}) leży WEWNĄTRZ źródła {} ({}) — zapis zaśmieciłby/nadpisałby materiał dowodowy.",
+                target_path.display(), nazwa, zrodlo.display()
+            ));
+        }
+        if zrodlo.starts_with(&target) {
+            return Err(format!(
+                "Źródło {} ({}) leży WEWNĄTRZ ścieżki docelowej ({}) — zapis nadpisałby materiał dowodowy.",
+                nazwa, zrodlo.display(), target_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Wylicza bezpieczną ścieżkę docelową, unikając nadpisania już istniejącego
 /// pliku o tej samej nazwie (może się zdarzyć, gdy dwa różne wpisy z bazy
 /// mapują się na tę samą ścieżkę względną z powodu wcześniejszych anomalii).
@@ -342,6 +387,21 @@ fn sciezka_naprawiona(zapisana: &str, baza_zrodlowa: &Path) -> PathBuf {
 /// niezależnie od sukcesu samego kopiowania — plik może zostać poprawnie
 /// skopiowany, ale np. `chown` zawiedzie bez uprawnień roota; to nie unieważnia
 /// samej kopii, stąd nie wpływa na wartość zwracaną `success`.
+/// Licznik dla [`sciezka_tymczasowa`] — zapewnia unikalność nazwy pliku
+/// tymczasowego, gdy wiele plików o tej samej nazwie bazowej jest
+/// kopiowanych "jednocześnie" na tym samym wątku w krótkim odstępie czasu
+/// (PID sam w sobie nie wystarcza, bo cała faza działa w jednym procesie).
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Ścieżka pliku tymczasowego w TYM SAMYM katalogu co `docelowa` — konieczne,
+/// żeby końcowy `fs::rename` był atomowy (rename między różnymi systemami
+/// plików/punktami montowania NIE jest atomowy i może się nie udać z EXDEV).
+fn sciezka_tymczasowa(docelowa: &Path) -> PathBuf {
+    let nazwa = docelowa.file_name().and_then(|n| n.to_str()).unwrap_or("plik");
+    let licznik = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    docelowa.with_file_name(format!(".{}.tmp-{}-{}", nazwa, std::process::id(), licznik))
+}
+
 fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Path, script_path: &Path, target_base: &Path, stats: &LiveStats) -> (bool, String, String) {
     let source_path = if winner == "splice" {
         // Plik już złożony i zweryfikowany przez Fazę 18 - leży pod własną,
@@ -398,19 +458,41 @@ fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Pa
             stats.symlinks_recreated.fetch_add(1, Ordering::Relaxed);
         } else { stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt); }
     } else {
-        if fs::copy(&source_path, &target_path_full).is_err() {
+        // Kopiowanie do pliku TYMCZASOWEGO w tym samym katalogu, a dopiero po
+        // potwierdzonym sukcesie (i weryfikacji rozmiaru, gdy dotyczy) —
+        // atomowy `fs::rename` na finalną nazwę. `fs::copy` prosto pod
+        // `target_path_full` tworzy/skraca plik wyjściowy PRZED skopiowaniem
+        // bajtów — przerwanie (crash/ENOSPC) w trakcie zostawiałoby wtedy
+        // uszkodzony plik TRWALE pod finalną nazwą (przy wznowieniu
+        // `get_safe_target_path` widziałby "kolizję" i dokleiłby nową,
+        // poprawną kopię pod INNĄ nazwą, zamiast nadpisać uszkodzony wynik).
+        let tmp_path = sciezka_tymczasowa(&target_path_full);
+
+        if fs::copy(&source_path, &tmp_path).is_err() {
+            let _ = fs::remove_file(&tmp_path);
             stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
         }
-        
+
         let used_repaired = (winner == "script" && file.repaired_path_script.is_some()) || (winner == "ufs" && file.repaired_path_ufs.is_some());
-        
+
         if !used_repaired {
-            if let Ok(meta) = fs::metadata(&target_path_full) {
-                if Some(meta.len() as i64) != expected_size && expected_size.is_some() {
+            match fs::metadata(&tmp_path) {
+                Ok(meta) if expected_size.is_none() || Some(meta.len() as i64) == expected_size => {}
+                Ok(_) => {
                     warn!(path = %file.rel_path, "Błąd weryfikacji po skopiowaniu - rozmiar nie zgadza się!");
+                    let _ = fs::remove_file(&tmp_path);
                     stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
                 }
-            } else { stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt); }
+                Err(_) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
+                }
+            }
+        }
+
+        if fs::rename(&tmp_path, &target_path_full).is_err() {
+            let _ = fs::remove_file(&tmp_path);
+            stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
         }
     }
 
@@ -640,6 +722,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let target_path = Path::new(&config.target_path);
 
     let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 9: SMART MERGE (Złota Kopia).".to_string()));
+
+    // Ta faza FIZYCZNIE ZAPISUJE finalny wynik na dysk (`copy_file_and_meta`,
+    // w tym `lchown`/`set_permissions`/`set_symlink_file_times`). Błędna
+    // konfiguracja operatora (target_path == ufs_path/script_path, albo
+    // jeden zagnieżdżony w drugim) fizycznie NADPISAŁABY materiał dowodowy —
+    // sprawdzamy PRZED jakimkolwiek zapisem, nie po fakcie.
+    if let Err(powod) = sciezki_bezpieczne(target_path, ufs_path, script_path) {
+        let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY: {}", powod)));
+        return Ok(());
+    }
 
     let start_time = Instant::now();
 
@@ -1267,6 +1359,90 @@ mod tests {
         let copied = std::fs::read(target_dir.path().join("plik.txt")).unwrap();
         assert_eq!(copied, b"zawartosc testowa");
         assert_eq!(stats.io_errors.load(Ordering::Relaxed), 0);
+
+        // REGRESJA: kopiowanie idzie teraz przez plik tymczasowy + rename -
+        // po sukcesie w katalogu docelowym nie może zostać ŻADEN plik `.tmp-*`.
+        let pozostale: Vec<_> = std::fs::read_dir(target_dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(pozostale.is_empty(), "plik tymczasowy nie został posprzątany: {:?}", pozostale);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): `fs::copy` prosto pod finalną nazwą zostawiał
+    // uszkodzony/niekompletny plik TRWALE pod tą nazwą przy błędzie w trakcie
+    // kopiowania (np. niezgodność rozmiaru wykryta po fakcie) - teraz idzie
+    // przez plik tymczasowy + atomowy `rename`, więc porażka nie może
+    // zostawić NICZEGO pod finalną nazwą.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_copy_bledny_rozmiar_nie_zostawia_zadnego_pliku_pod_finalna_nazwa() {
+        let ufs_dir = tempdir().unwrap();
+        let script_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        std::fs::write(ufs_dir.path().join("plik.txt"), b"tresc o innej dlugosci niz oczekiwana").unwrap();
+
+        // size_ufs celowo NIEZGODNY z rzeczywistą długością zapisanego pliku -
+        // wymusza porażkę weryfikacji rozmiaru w copy_file_and_meta.
+        let candidate = MergeCandidate { rel_path: "plik.txt".to_string(), size_ufs: Some(999_999), ..base_candidate() };
+        let stats = LiveStats::new(rayon::current_num_threads());
+
+        let (success, _, _) = copy_file_and_meta(&candidate, "ufs", ufs_dir.path(), script_dir.path(), target_dir.path(), &stats);
+
+        assert!(!success);
+        assert!(!target_dir.path().join("plik.txt").exists(), "błąd weryfikacji rozmiaru nie może zostawić pliku pod finalną nazwą");
+        let pozostale: Vec<_> = std::fs::read_dir(target_dir.path()).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(pozostale.is_empty(), "katalog docelowy musi zostać pusty (bez osieroconych plików .tmp-*), znaleziono: {:?}",
+            pozostale.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): sciezki_bezpieczne — brak walidacji
+    // target_path vs ufs_path/script_path pozwalał błędnej konfiguracji
+    // operatora fizycznie nadpisać materiał dowodowy.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sciezki_bezpieczne_akceptuje_rozlaczne_katalogi() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        assert!(sciezki_bezpieczne(target.path(), ufs.path(), script.path()).is_ok());
+    }
+
+    #[test]
+    fn test_sciezki_bezpieczne_odrzuca_identyczna_sciezke_z_ufs() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        assert!(sciezki_bezpieczne(ufs.path(), ufs.path(), script.path()).is_err());
+    }
+
+    #[test]
+    fn test_sciezki_bezpieczne_odrzuca_identyczna_sciezke_z_script() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        assert!(sciezki_bezpieczne(script.path(), ufs.path(), script.path()).is_err());
+    }
+
+    #[test]
+    fn test_sciezki_bezpieczne_odrzuca_target_wewnatrz_ufs() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let target = ufs.path().join("podkatalog_docelowy");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(sciezki_bezpieczne(&target, ufs.path(), script.path()).is_err());
+    }
+
+    #[test]
+    fn test_sciezki_bezpieczne_odrzuca_ufs_wewnatrz_target() {
+        let script = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let ufs = target.path().join("podkatalog_zrodlowy");
+        std::fs::create_dir_all(&ufs).unwrap();
+        assert!(sciezki_bezpieczne(target.path(), &ufs, script.path()).is_err());
     }
 
     #[test]
