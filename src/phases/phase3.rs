@@ -729,19 +729,25 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let script_path = PathBuf::from(&config.script_path);
 
     // --- ETAP 3: PRZETWARZANIE STRUMIENIOWE (MPSC) ---
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd SQLite
+    // w wątku bazy był wcześniej `.unwrap()`, czyli paniką w wątku pisarza
+    // wewnątrz `thread::scope` — jeden transjentny błąd I/O bazy ubijałby
+    // całą fazę bez żadnego komunikatu. Ten sam wzorzec co
+    // `phase17_repair::run`/`phase1::run` — `db_thread` zwraca `Result<()>`,
+    // panika jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel(200);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
         // Wątek Bazy Danych z zapisem transakcyjnym (Hybrydowym) dostosowanym pod ciężkie operacje (5000 / 500ms)
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut last_ui_update = Instant::now();
             let mut last_commit = Instant::now();
             let mut db_inserted = 0;
             let mut pending_records = 0;
 
-            let mut tx_trans = conn_ref.transaction().unwrap();
+            let mut tx_trans = conn_ref.transaction()?;
 
             loop {
                 let msg_result = rx_db.recv_timeout(Duration::from_millis(100));
@@ -759,17 +765,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                     if chunk_len > 0 {
                         {
                             let mut stmt = match &msg {
-                                ScanMsg::UfsChunk(_) => tx_trans.prepare_cached("UPDATE files SET hash_ufs = COALESCE(?1, hash_ufs), magic_ok_ufs = COALESCE(?2, magic_ok_ufs), io_error_ufs = COALESCE(?3, io_error_ufs) WHERE id = ?4").unwrap(),
-                                ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached("UPDATE files SET hash_script = COALESCE(?1, hash_script), magic_ok_script = COALESCE(?2, magic_ok_script), io_error_script = COALESCE(?3, io_error_script) WHERE id = ?4").unwrap(),
+                                ScanMsg::UfsChunk(_) => tx_trans.prepare_cached("UPDATE files SET hash_ufs = COALESCE(?1, hash_ufs), magic_ok_ufs = COALESCE(?2, magic_ok_ufs), io_error_ufs = COALESCE(?3, io_error_ufs) WHERE id = ?4")?,
+                                ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached("UPDATE files SET hash_script = COALESCE(?1, hash_script), magic_ok_script = COALESCE(?2, magic_ok_script), io_error_script = COALESCE(?3, io_error_script) WHERE id = ?4")?,
                             };
-                            
+
                             let chunk = match &msg {
                                 ScanMsg::UfsChunk(c) => c,
                                 ScanMsg::ScriptChunk(c) => c,
                             };
 
                             for res in chunk {
-                                stmt.execute(params![res.hash, res.magic_ok, res.io_error, res.id]).unwrap();
+                                stmt.execute(params![res.hash, res.magic_ok, res.io_error, res.id])?;
                             }
                         }
 
@@ -782,8 +788,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                 // LOGIKA HYBRYDOWA: Commit co 5 000 rekordów LUB co 500 ms (jeśli mamy cokolwiek do zapisu)
                 if pending_records > 0 && (pending_records >= 5_000 || now.duration_since(last_commit).as_millis() > 500) {
-                    tx_trans.commit().unwrap();
-                    tx_trans = conn_ref.transaction().unwrap();
+                    tx_trans.commit()?;
+                    tx_trans = conn_ref.transaction()?;
                     last_commit = now;
                     pending_records = 0;
                 }
@@ -805,10 +811,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
 
             if pending_records > 0 {
-                tx_trans.commit().unwrap();
+                tx_trans.commit()?;
             }
 
             let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Hashe bezpiecznie zapisane w SQLite.".to_string() });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -870,7 +877,22 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
             drop(tx_db);
         }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 3 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
+        }
     });
+    wynik_zapisu?;
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
