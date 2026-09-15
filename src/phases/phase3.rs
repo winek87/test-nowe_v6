@@ -489,16 +489,26 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 // slot dedykowanej puli Rayon tej strony jako zajęty na czas samego
                 // hashowania — patrz dokumentacja modułu `thread_activity` co do znaczenia
                 // (slot logiczny, NIE fizyczny rdzeń CPU).
-                let file_hash = match stats.thread_activity.track_current(|| hash_file(&full_path)) {
-                    Ok(h) => Some(h),
+                // REGRESJA (Gemini review — druga weryfikacja): ten sam wzorzec błędu co
+                // przy sondzie nagłówka (patrz komentarz "UWAGA KRYMINALISTYCZNA" wyżej w
+                // pliku) istniał TAKŻE tutaj, w głównej, częściej wykonywanej ścieżce
+                // hashowania — `io_error` było zapisywane na sztywno jako `Some(false)`
+                // (linia 544) niezależnie od tego, czy `hash_file()` faktycznie zawiodło
+                // prawdziwym błędem I/O. Kombinacja `hash=None, io_error=Some(false)` nigdy
+                // nie spełnia warunku `phase3_done` (`hash_ufs IS NOT NULL OR io_error_ufs = 1`),
+                // więc plik z bad sectorem trafionym w środku (nagłówek 128KB odczytał się
+                // poprawnie, dalsza część pliku już nie) wpadał w tę samą nieskończoną
+                // pętlę ponawiania.
+                let (file_hash, hash_io_error) = match stats.thread_activity.track_current(|| hash_file(&full_path)) {
+                    Ok(h) => (Some(h), false),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         // Anulowanie przez użytkownika (Ctrl+C) — NIE liczymy jako błąd dysku
-                        None
+                        (None, false)
                     }
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
                         log_buf.push(format!("[{}] Błąd I/O podczas właściwego hashowania: \"{}\"", side_label, task.rel_path));
-                        None
+                        (None, true)
                     }
                 };
 
@@ -537,11 +547,11 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                 }
 
-                results.push(ScanResult { 
-                    id: task.id, 
-                    hash: file_hash, 
-                    magic_ok, 
-                    io_error: Some(false) 
+                results.push(ScanResult {
+                    id: task.id,
+                    hash: file_hash,
+                    magic_ok,
+                    io_error: Some(hash_io_error)
                 });
             }
 
