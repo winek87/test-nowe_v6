@@ -692,9 +692,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         "INSERT OR REPLACE INTO phase16_analysis (file_id, yara_matched, rules_triggered) VALUES (?1, ?2, ?3)"
                     ).unwrap();
 
+                    // REGRESJA (measure twice — druga weryfikacja): dokumentacja
+                    // modułu (góra pliku) opisywała `yara_scanned_ufs`/`_script`
+                    // jako "ustawiane na 1 przy KAŻDYM zapisie wyniku, bezwarunkowo,
+                    // bez COALESCE" - ale to zapytanie nigdy faktycznie tej kolumny
+                    // nie ustawiało. Efekt identyczny z bugiem, który ta kolumna
+                    // miała naprawić: plik czysty (`yara_match_*=NULL`) nigdy nie
+                    // dostawał żadnego trwałego znacznika "przeskanowano", więc
+                    // ETAP 4 (CASE WHEN niżej) nigdy nie ustawiał `phase16_done=1`.
                     let mut stmt_update = match is_ufs {
-                        true => tx_db.prepare_cached("UPDATE files SET yara_match_ufs = COALESCE(?1, yara_match_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3").unwrap(),
-                        false => tx_db.prepare_cached("UPDATE files SET yara_match_script = COALESCE(?1, yara_match_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3").unwrap()
+                        true => tx_db.prepare_cached("UPDATE files SET yara_match_ufs = COALESCE(?1, yara_match_ufs), io_error_ufs = COALESCE(?2, io_error_ufs), yara_scanned_ufs = 1 WHERE id = ?3").unwrap(),
+                        false => tx_db.prepare_cached("UPDATE files SET yara_match_script = COALESCE(?1, yara_match_script), io_error_script = COALESCE(?2, io_error_script), yara_scanned_script = 1 WHERE id = ?3").unwrap()
                     };
 
                     for res in chunk {
@@ -784,10 +792,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let _ = tx_ui.send(PhaseEvent::Log("Trwa wiązanie macierzy sygnatur w bazie SQLite...".to_string()));
     conn.execute(
-        "UPDATE files SET phase16_done = CASE 
-            WHEN (found_in_ufs = 0 OR yara_match_ufs IS NOT NULL OR io_error_ufs = 1) 
-             AND (found_in_script = 0 OR yara_match_script IS NOT NULL OR io_error_script = 1) THEN 1 
-            ELSE 0 
+        "UPDATE files SET phase16_done = CASE
+            WHEN (found_in_ufs = 0 OR yara_match_ufs IS NOT NULL OR io_error_ufs = 1 OR yara_scanned_ufs = 1)
+             AND (found_in_script = 0 OR yara_match_script IS NOT NULL OR io_error_script = 1 OR yara_scanned_script = 1) THEN 1
+            ELSE 0
         END WHERE phase16_done = 0 OR phase16_done IS NULL", []
     )?;
 
@@ -1124,5 +1132,70 @@ mod tests {
         let rules = compile_test_rule();
         let result = scan_file_yara(Path::new("/nieistniejaca/sciezka/plik.exe"), "plik.exe", "UFS Explorer", &rules);
         assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // TYMCZASOWY TEST WERYFIKACYJNY (niezależny audyt) - USUNĄĆ PRZED COMMITEM
+    // Sprawdza empirycznie, czy pełny przebieg run() rzeczywiście zapisuje
+    // yara_scanned_ufs/script = 1 i czy phase16_done = 1 dla czystego pliku
+    // po JEDNYM przebiegu, oraz czy DRUGIE wywołanie run() na tej samej
+    // bazie ponownie nie skanuje już oznaczonego czystego pliku.
+    // ------------------------------------------------------------------
+    #[test]
+    fn audit_verify_clean_file_gets_scanned_flag_and_is_not_rescanned() {
+        use crate::settings::Ustawienia;
+
+        let dir = tempdir().unwrap();
+        let ufs_dir = dir.path().join("ufs");
+        let script_dir = dir.path().join("script");
+        std::fs::create_dir_all(&ufs_dir).unwrap();
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(ufs_dir.join("czysty.txt"), b"zupelnie niewinna zawartosc, bez zadnych sygnatur").unwrap();
+
+        let log_dir = dir.path().join("logi");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let db_path = dir.path().join("audit.sqlite");
+        let mut conn = crate::db::init_db(db_path.to_str().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('czysty.txt', 1, 0)",
+            [],
+        ).unwrap();
+
+        let mut cfg = Ustawienia::default();
+        cfg.ufs_path = ufs_dir.to_string_lossy().to_string();
+        cfg.script_path = script_dir.to_string_lossy().to_string();
+        cfg.log_path = log_dir.to_string_lossy().to_string();
+        cfg.io_mode = "SEQUENTIAL".to_string();
+        cfg.max_threads = 1;
+
+        let rules1 = compile_rule_files(&[]).unwrap();
+        let (tx1, rx1) = mpsc::channel();
+        std::thread::spawn(move || { while rx1.recv().is_ok() {} });
+        run(&mut conn, &cfg, tx1, rules1).unwrap();
+
+        let (scanned_ufs, phase16_done, yara_match_ufs): (Option<bool>, Option<bool>, Option<String>) = conn.query_row(
+            "SELECT yara_scanned_ufs, phase16_done, yara_match_ufs FROM files WHERE relative_path = 'czysty.txt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+
+        eprintln!("PO 1. PRZEBIEGU: yara_scanned_ufs={:?} phase16_done={:?} yara_match_ufs={:?}", scanned_ufs, phase16_done, yara_match_ufs);
+
+        // Uruchamiamy DRUGI raz na tej samej bazie - jeśli bug NIE jest naprawiony,
+        // plik czysty wpadnie ponownie do ufs_tasks (widoczne po zerowym total_db_rows
+        // przy naprawionej wersji, niezerowym przy niedziałającej).
+        let mut stmt = conn.prepare(
+            "SELECT id, relative_path, found_in_ufs, found_in_script, yara_match_ufs, yara_match_script, io_error_ufs, io_error_script, yara_scanned_ufs, yara_scanned_script
+             FROM files WHERE phase16_done = 0 OR phase16_done IS NULL"
+        ).unwrap();
+        let would_rescan_count = stmt.query_map([], |row| row.get::<_, i32>(0)).unwrap().filter_map(|r| r.ok()).count();
+        drop(stmt);
+
+        eprintln!("LICZBA WIERSZY KTÓRE ZOSTANĄ PONOWNIE ZAKOLEJKOWANE (phase16_done != 1): {}", would_rescan_count);
+
+        assert_eq!(scanned_ufs, Some(true), "yara_scanned_ufs powinno być ustawione na 1 po przebiegu skanowania pliku czystego");
+        assert_eq!(phase16_done, Some(true), "phase16_done powinno być 1 dla pliku czystego po zakończeniu skanowania jego jedynej strony");
+        assert_eq!(would_rescan_count, 0, "Plik czysty NIE powinien zostać ponownie zakolejkowany do skanowania w kolejnym przebiegu");
     }
 }
