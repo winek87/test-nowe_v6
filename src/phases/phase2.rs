@@ -416,19 +416,26 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let script_base = PathBuf::from(&config.script_path);
 
     // --- ETAP 3: PRZETWARZANIE STRUMIENIOWE (MPSC) ---
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd SQLite
+    // w wątku bazy był wcześniej `.unwrap()`, czyli paniką w wątku pisarza
+    // wewnątrz `thread::scope` — jeden transjentny błąd I/O bazy (dysk
+    // pełny, blokada pliku WAL) ubijałby całą fazę bez żadnego komunikatu.
+    // Ten sam wzorzec co `phase17_repair::run`/`phase1::run` — `db_thread`
+    // zwraca `Result<()>`, panika jest przechwytywana przez `.join()` i
+    // zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel(200);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
         // Wątek Bazy Danych z zapisem transakcyjnym (Hybrydowym)
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut last_ui_update = Instant::now();
             let mut last_commit = Instant::now();
             let mut db_inserted = 0;
             let mut pending_records = 0; // Licznik niezakomitowanych danych w obecnej transakcji
 
-            let mut tx_trans = conn_ref.transaction().unwrap();
+            let mut tx_trans = conn_ref.transaction()?;
 
             loop {
                 // recv_timeout pozwala nam uwolnić bazę, jeśli długo nie ma danych, i zmusić ją do commita
@@ -446,8 +453,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                     {
                         let mut stmt = match &msg {
-                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(SQL_ZAPIS_UFS).unwrap(),
-                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(SQL_ZAPIS_SCRIPT).unwrap(),
+                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(SQL_ZAPIS_UFS)?,
+                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(SQL_ZAPIS_SCRIPT)?,
                         };
 
                         let chunk = match &msg {
@@ -457,7 +464,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                         for res in chunk {
                             if res.stats.is_some() || res.io_error == Some(true) {
-                                stmt.execute(params![res.stats.as_ref().map(|s| s.size), res.io_error, res.id]).unwrap();
+                                stmt.execute(params![res.stats.as_ref().map(|s| s.size), res.io_error, res.id])?;
                             }
                         }
                     }
@@ -470,8 +477,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                 // LOGIKA HYBRYDOWA: Commit co 10 000 rekordów LUB co 500 ms (jeśli mamy cokolwiek do zapisu)
                 if pending_records > 0 && (pending_records >= 10_000 || now.duration_since(last_commit).as_millis() > 500) {
-                    tx_trans.commit().unwrap(); // Fizyczny zrzut na dysk
-                    tx_trans = conn_ref.transaction().unwrap(); // Natychmiastowe otwarcie nowej lufy
+                    tx_trans.commit()?; // Fizyczny zrzut na dysk
+                    tx_trans = conn_ref.transaction()?; // Natychmiastowe otwarcie nowej lufy
                     last_commit = now;
                     pending_records = 0;
                 }
@@ -494,14 +501,15 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
             // Zamknięcie programu: zrzut resztek (np. zostało 245 niezakomitowanych rekordów na koniec)
             if pending_records > 0 {
-                tx_trans.commit().unwrap();
+                tx_trans.commit()?;
             }
 
-            let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { 
-                idx: 2, 
-                current: db_inserted as u64, 
-                message: "Rozmiary w 100% zabezpieczone na dysku.".to_string() 
+            let _ = tx_ui_ref.send(PhaseEvent::UpdateBar {
+                idx: 2,
+                current: db_inserted as u64,
+                message: "Rozmiary w 100% zabezpieczone na dysku.".to_string()
             });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -559,7 +567,22 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
             drop(tx_db);
         }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 2 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
+        }
     });
+    wynik_zapisu?;
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH (Wyliczenie Larger Side) ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
