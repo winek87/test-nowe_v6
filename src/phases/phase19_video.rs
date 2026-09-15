@@ -615,33 +615,41 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let script_base = PathBuf::from(&config.script_path);
 
     // --- ETAP 3: PRZETWARZANIE ---
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): błąd SQLite w
+    // wątku bazy był wcześniej `.unwrap()` (transakcja/prepare/commit) albo,
+    // dla samego zapisu wyniku per plik, cicho POŁYKANY przez `let _ =
+    // stmt.execute(...)` — obie ścieżki są gorsze niż jawna propagacja: panika
+    // ubijała cały wątek pisarza wewnątrz `thread::scope`, a ciche `let _ =`
+    // gubiło zapis BEZ ŚLADU, nawet w logu. Ten sam wzorzec co
+    // `phase17_repair::run`/`phase1::run` — `db_thread` zwraca `Result<()>`,
+    // panika jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel::<ScanMsg>(200);
         let conn_ref = &mut *conn;
         let tx_ui_db = tx_ui.clone();
 
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut db_inserted = 0usize;
             let mut last_db_update = Instant::now();
 
-            let update_sql = |c: &mut Connection, chunk: &[SideVideoResult], is_ufs: bool| {
-                let tx = c.transaction().unwrap();
+            let update_sql = |c: &mut Connection, chunk: &[SideVideoResult], is_ufs: bool| -> Result<()> {
+                let tx = c.transaction()?;
                 {
                     let mut stmt = match is_ufs {
-                        true => tx.prepare_cached(SQL_ZAPIS_UFS).unwrap(),
-                        false => tx.prepare_cached(SQL_ZAPIS_SCRIPT).unwrap(),
+                        true => tx.prepare_cached(SQL_ZAPIS_UFS)?,
+                        false => tx.prepare_cached(SQL_ZAPIS_SCRIPT)?,
                     };
                     for r in chunk {
-                        let _ = stmt.execute(params![r.ok, r.reason, r.duration_ms, r.track_count, r.io_error, r.id, r.created_unix]);
+                        stmt.execute(params![r.ok, r.reason, r.duration_ms, r.track_count, r.io_error, r.id, r.created_unix])?;
                     }
                 }
-                tx.commit().unwrap();
+                tx.commit()
             };
 
             for msg in rx_db {
                 let n = match &msg {
-                    ScanMsg::UfsChunk(c) => { update_sql(conn_ref, c, true); c.len() }
-                    ScanMsg::ScriptChunk(c) => { update_sql(conn_ref, c, false); c.len() }
+                    ScanMsg::UfsChunk(c) => { update_sql(conn_ref, c, true)?; c.len() }
+                    ScanMsg::ScriptChunk(c) => { update_sql(conn_ref, c, false)?; c.len() }
                 };
                 db_inserted += n;
                 let now = Instant::now();
@@ -651,6 +659,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 }
             }
             let _ = tx_ui_db.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Pomyślnie zsynchronizowano z SQLite.".to_string() });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -690,11 +699,34 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let _ = tx_ui.send(PhaseEvent::Log("✔ Diagnostyka UFS zakończona.".to_string()));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db, is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, });
+                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, });
                 let _ = tx_ui.send(PhaseEvent::Log("✔ Diagnostyka Skrypt zakończona.".to_string()));
+            }
+            // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
+            // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
+            // przenoszony - kanał nie zamykał się, dopóki ta zmienna nie
+            // wyszła z zasięgu na końcu CAŁEGO domknięcia `thread::scope`,
+            // czyli PO `db_thread.join()` niżej - klasyczny deadlock. Jawny
+            // `drop` zamyka kanał deterministycznie, zanim `.join()` zacznie
+            // czekać.
+            drop(tx_db);
+        }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 19 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
             }
         }
     });
+    wynik_zapisu?;
 
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
         let _ = tx_ui.send(PhaseEvent::Log("🛑 Diagnostyka przerwana przez użytkownika.".to_string()));
