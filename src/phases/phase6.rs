@@ -203,7 +203,18 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
     let mut buffer = [0u8; 131_072]; 
 
     loop {
-        if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+        // REGRESJA (Gemini review — druga weryfikacja): wcześniej `break` przy
+        // anulowaniu w trakcie odczytu zwracał `Ok(AdvancedAnalysis{...})`
+        // policzone z NIEPEŁNEGO bufora podzielonego przez PEŁNY `file_len` —
+        // sztucznie zaniżony `zeros_pct`/`ffs_pct` bez żadnej flagi
+        // niekompletności. Taki błędny wynik trafiał do bazy przez COALESCE
+        // tak samo jak pełna analiza (kolumna przestaje być NULL), więc plik
+        // nigdy nie był ponownie analizowany przy wznowieniu. Teraz zwracamy
+        // `Err(Interrupted)` — wywołujący (`process_side_stream`) rozróżnia to
+        // od prawdziwego błędu I/O i NIE zapisuje żadnego wyniku do bazy.
+        if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Przerwano przez użytkownika"));
+        }
         let n = file.read(&mut buffer)?;
         if n == 0 { break; }
         let chunk = &buffer[..n];
@@ -319,6 +330,18 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     
                     (Some(a), Some(false))
                 },
+                // REGRESJA (Gemini review — druga weryfikacja): anulowanie
+                // (`ErrorKind::Interrupted`, zwracane teraz przez `analyze_file`
+                // przy CANCEL_SIGNAL) trafiało tu wcześniej do tej samej gałęzi
+                // co prawdziwy błąd I/O — plik dostawał `io_error_*=1` na
+                // stałe, czyli CASE WHEN w `run()` liczył go jako "rozliczony" i
+                // nigdy nie wracał do kolejki przy wznowieniu, mimo że w
+                // rzeczywistości nie został w ogóle przeanalizowany. Teraz
+                // anulowanie nie zapisuje NIC (`None, None`) — COALESCE w
+                // zapytaniu UPDATE zostawia `zeros_pct_*`/`io_error_*` bez
+                // zmian (nadal NULL przy pierwszym przebiegu), więc plik
+                // zostaje wybrany ponownie przy kolejnym uruchomieniu Fazy 6.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (None, None),
                 Err(e) => {
                     warn!(path = %task.rel_path, side = side_label, error = %e, "Błąd I/O podczas czytania zawartości pliku");
                     stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -847,6 +870,76 @@ mod tests {
         let result = analyze_file(&path, "test.dat").unwrap();
         assert!(result.ffs_pct > 99.0);
         assert_eq!(result.zeros_pct, 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review — druga weryfikacja): anulowanie (CANCEL_SIGNAL)
+    // w trakcie czytania zawartości pliku nie może być mylone z prawdziwym
+    // błędem I/O — inaczej plik dostaje trwałe `io_error_*=1` mimo że nigdy
+    // nie został faktycznie zbadany, i nie wraca do kolejki przy wznowieniu.
+    // Wzorzec identyczny z `phase7::tests::test_calculate_entropy_zwraca_interrupted_gdy_cancel_signal_ustawiony`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_analyze_file_zwraca_interrupted_gdy_cancel_signal_ustawiony() {
+        let content = vec![0u8; 500_000];
+        let (_guard, path) = temp_file_with_ext(&content, "dat");
+
+        CANCEL_SIGNAL.store(true, Ordering::Relaxed);
+        let wynik = analyze_file(&path, "test.dat");
+        CANCEL_SIGNAL.store(false, Ordering::Relaxed); // sprzątanie - stan globalny
+
+        match wynik {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Interrupted),
+            Ok(_) => panic!("oczekiwano Err(Interrupted) przy ustawionym CANCEL_SIGNAL"),
+        }
+    }
+
+    /// Dowodzi, że wywołujący (`process_side_stream`) faktycznie rozróżnia
+    /// `Interrupted` od prawdziwego błędu I/O na poziomie CAŁEGO strumienia:
+    /// gdy CANCEL_SIGNAL włącza się W TRAKCIE czytania dużego pliku, zadanie
+    /// nie trafia do bazy z `io_error=true` ani nie zwiększa licznika błędów —
+    /// zostaje po prostu pominięte (żeby wrócić do kolejki przy wznowieniu).
+    /// Odtwarza scenariusz Ctrl+C w środku odczytu (nie na granicy pliku),
+    /// stąd plik dostatecznie duży, by wątek zdążył ustawić flagę zanim
+    /// `analyze_file` skończy czytać.
+    #[test]
+    fn test_process_side_stream_przerwanie_w_trakcie_odczytu_nie_jest_bledem_io() {
+        let content = vec![0u8; 20_000_000]; // 20 MB - wielokrotność bufora 128 KB
+        let (_guard, path) = temp_file_with_ext(&content, "dat");
+        let base_path = path.parent().unwrap().to_path_buf();
+        let rel_path = path.file_name().unwrap().to_string_lossy().to_string();
+
+        CANCEL_SIGNAL.store(false, Ordering::Relaxed);
+        let przelacznik = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(5));
+            CANCEL_SIGNAL.store(true, Ordering::Relaxed);
+        });
+
+        let stats = LiveStats::new(1);
+        let (tx_db, rx_db) = mpsc::sync_channel(10);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let tasks = vec![Task { id: 1, rel_path, is_common: false }];
+
+        process_side_stream(StreamCtx {
+            base_path: &base_path, tasks: &tasks, side_label: "UFS Explorer", stats: &stats,
+            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log,
+        });
+
+        przelacznik.join().unwrap();
+        CANCEL_SIGNAL.store(false, Ordering::Relaxed); // sprzątanie - stan globalny
+
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "Anulowanie nie może zwiększać licznika błędów I/O");
+
+        // Zadanie mogło albo nie zostać w ogóle wysłane (przerwane na granicy
+        // pliku/paczki), albo zostać wysłane z (None, None) - obie sytuacje są
+        // poprawne, jedyne co jest ZABRONIONE to io_error=Some(true).
+        if let Ok(ScanMsg::UfsChunk(wyniki)) = rx_db.try_recv() {
+            for w in wyniki {
+                assert_ne!(w.io_error, Some(true), "Anulowanie NIE MOŻE zapisać trwałego io_error=true - plik nigdy by nie wrócił do kolejki");
+            }
+        }
     }
 
     #[test]
