@@ -115,6 +115,50 @@ fn parse_all_floats(s: &str) -> Vec<f64> {
         .collect()
 }
 
+/// Parsuje JEDNĄ współrzędną w formacie DMS (stopnie/minuty/sekundy) zwracanym
+/// przez domyślny silnik natywny `exiftool_rs::image_info` — np.
+/// `"48 deg 51' 24\" N"` — na wartość dziesiętną ze znakiem (ujemna dla
+/// S/W). `parse_all_floats` na takim tekście wyłuskuje TYLKO całkowite
+/// stopnie (minuty/sekundy mają doklejone `'`/`"`, więc nie parsują się jako
+/// `f64`), a litera hemisfery w ogóle nie parsuje się jako liczba — silnik
+/// natywny zwracał więc zawsze dodatnie, ucięte do stopni współrzędne.
+fn parse_dms_coordinate(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (deg_part, rest) = s.split_once("deg")?;
+    let degrees: f64 = deg_part.trim().parse().ok()?;
+
+    let (min_part, rest) = rest.split_once('\'')?;
+    let minutes: f64 = min_part.trim().parse().ok()?;
+
+    let (sec_part, hemi_part) = rest.split_once('"')?;
+    let seconds: f64 = sec_part.trim().parse().ok()?;
+
+    let sign = match hemi_part.trim().chars().next()?.to_ascii_uppercase() {
+        'N' | 'E' => 1.0,
+        'S' | 'W' => -1.0,
+        _ => return None,
+    };
+
+    Some(sign * (degrees + minutes / 60.0 + seconds / 3600.0))
+}
+
+/// Parsuje wartość GPS niezależnie od formatu zwróconego przez którykolwiek
+/// z dwóch silników (`exiftool_rs::image_info` natywny → DMS; fallback CLI
+/// `exiftool -n` → dziesiętny). Próbuje DMS jako pierwszy (bo to domyślna,
+/// GŁÓWNA ścieżka), z fallbackiem do starego zachowania dla formatu
+/// dziesiętnego — patrz [`parse_dms_coordinate`] dla uzasadnienia, czemu
+/// samo `parse_all_floats` nie wystarcza dla DMS.
+fn parse_gps_values(s: &str) -> Vec<f64> {
+    let segmenty: Vec<&str> = s.split(',').map(|seg| seg.trim()).filter(|seg| !seg.is_empty()).collect();
+    if !segmenty.is_empty() {
+        let dms: Vec<f64> = segmenty.iter().filter_map(|seg| parse_dms_coordinate(seg)).collect();
+        if dms.len() == segmenty.len() {
+            return dms;
+        }
+    }
+    parse_all_floats(s)
+}
+
 /// Ocenia sensowność pary współrzędnych GPS: poza zakresem geograficznym
 /// (szerokość poza ±90°, długość poza ±180°) LUB dokładnie `(0.0, 0.0)` —
 /// znane jako "Null Island", klasyczna wartość domyślna/uszkodzona GPS,
@@ -392,7 +436,16 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
         "Software"
     ];
 
-    if let Ok(info) = exiftool_rs::image_info(path_str) {
+    // REGRESJA (BŁĄD KRYTYCZNY): `exiftool_rs::image_info` wołane było tu
+    // bez żadnej ochrony przed paniką, niespójnie z `raw_image`/`heic_image`/
+    // `video_image`/`generic_image` (wszystkie owijają swój zewnętrzny
+    // dekoder w `catch_unwind`, bo panika na spreparowanym/uszkodzonym pliku
+    // ubijałaby cały wątek Rayon w środku skanowania). Reużywamy
+    // `generic_image::decode_guarded` (już zarejestrowany w globalnym panic
+    // hooku, patrz `logging.rs`) zamiast duplikować identyczną infrastrukturę
+    // `thread_local` w tym pliku — panika w środku zamienia się na `None`,
+    // traktowane identycznie jak zwykły `Err`: kod spada na fallback CLI.
+    if let Some(Ok(info)) = crate::generic_image::decode_guarded(|| exiftool_rs::image_info(path_str)) {
         for k in keys {
             if let Some(v) = info.get(k) {
                 let val_str = v.to_string().trim_matches('"').to_string();
@@ -535,7 +588,7 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
     let has_gps = meta.get("GPSLatitude").is_some() || meta.get("GPSPosition").is_some();
     let has_suspicious_gps = if has_gps {
         let raw = meta.get("GPSPosition").or(meta.get("GPSLatitude")).map(|s| s.as_str()).unwrap_or("");
-        let floats = parse_all_floats(raw);
+        let floats = parse_gps_values(raw);
         match (floats.first(), floats.get(1)) {
             (Some(&lat), Some(&lon)) => is_gps_suspicious(lat, lon),
             (Some(&lat), None) => !(-90.0..=90.0).contains(&lat),
@@ -1274,6 +1327,73 @@ mod tests {
     #[test]
     fn test_gps_normal_coordinates_not_suspicious() {
         assert!(!is_gps_suspicious(52.2297, 21.0122)); // Warszawa
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): parse_dms_coordinate / parse_gps_values —
+    // domyślny silnik natywny (exiftool_rs::image_info) zwraca GPS w
+    // formacie DMS, nie dziesiętnym. Stare parse_all_floats gubiło minuty/
+    // sekundy i znak hemisfery S/W (litera nie parsuje się jako liczba).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_dms_coordinate_north_east_is_positive() {
+        let lat = parse_dms_coordinate("48 deg 51' 24\" N").unwrap();
+        assert!((lat - 48.8567).abs() < 0.001, "otrzymano {}", lat);
+    }
+
+    #[test]
+    fn test_parse_dms_coordinate_south_west_is_negative() {
+        // Dokładnie scenariusz z zadania: -48.8567 / -2.3519
+        let lat = parse_dms_coordinate("48 deg 51' 24\" S").unwrap();
+        let lon = parse_dms_coordinate("2 deg 21' 7\" W").unwrap();
+        assert!((lat - (-48.8567)).abs() < 0.001, "otrzymano {}", lat);
+        assert!((lon - (-2.3519)).abs() < 0.001, "otrzymano {}", lon);
+    }
+
+    #[test]
+    fn test_parse_dms_coordinate_rejects_decimal_format() {
+        // Format dziesiętny (fallback CLI) nie jest DMS - musi dać None,
+        // żeby parse_gps_values poprawnie spadło na parse_all_floats.
+        assert_eq!(parse_dms_coordinate("52.2297"), None);
+    }
+
+    #[test]
+    fn test_parse_gps_values_dms_pair_matches_known_landmark() {
+        // Wieża Eiffla: 48.8584° N, 2.2945° E
+        let vals = parse_gps_values("48 deg 51' 30\" N, 2 deg 17' 40\" E");
+        assert_eq!(vals.len(), 2);
+        assert!((vals[0] - 48.8584).abs() < 0.001, "szerokość: {}", vals[0]);
+        assert!((vals[1] - 2.2945).abs() < 0.001, "długość: {}", vals[1]);
+    }
+
+    #[test]
+    fn test_parse_gps_values_south_west_hemisphere_gives_negative_pair() {
+        let vals = parse_gps_values("48 deg 51' 24\" S, 2 deg 21' 7\" W");
+        assert_eq!(vals.len(), 2);
+        assert!(vals[0] < 0.0, "szerokość S musi być ujemna: {}", vals[0]);
+        assert!(vals[1] < 0.0, "długość W musi być ujemna: {}", vals[1]);
+    }
+
+    #[test]
+    fn test_parse_gps_values_still_handles_decimal_format_from_cli_fallback() {
+        let vals = parse_gps_values("52.2297, 21.0122");
+        assert_eq!(vals, vec![52.2297, 21.0122]);
+    }
+
+    #[test]
+    fn test_evaluate_metadata_dms_south_west_is_suspicious_via_range_check() {
+        // Buenos Aires realnie leży na -34.60, -58.38 — silnik natywny w
+        // formacie DMS PRZED poprawką dawałby (34.0, 58.0) dodatnie, poza
+        // wszelkim podejrzeniem. Test dowodzi, że sam ZNAK jest teraz
+        // poprawnie wydobyty (choć akurat ta konkretna para współrzędnych
+        // mieści się w zakresie geograficznym niezależnie od znaku, więc
+        // sprawdzamy wprost wynik parse_gps_values użyty przez evaluate_metadata,
+        // nie samą flagę has_suspicious_gps).
+        let mut meta = HashMap::new();
+        meta.insert("GPSPosition".to_string(), "34 deg 36' 0\" S, 58 deg 22' 48\" W".to_string());
+        let vals = parse_gps_values(meta.get("GPSPosition").unwrap());
+        assert!(vals[0] < 0.0 && vals[1] < 0.0, "Buenos Aires musi dać obie współrzędne ujemne: {:?}", vals);
     }
 
     // ------------------------------------------------------------------
