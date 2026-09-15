@@ -584,6 +584,24 @@ pub fn select_active_module_ids() -> Option<Vec<&'static str>> {
 pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>, active_module_ids: Vec<&'static str>) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Faza 18 N3): ta
+    // faza FIZYCZNIE zapisuje naprawione pliki pod `config.target_path`
+    // (patrz `repair_base` niżej), dokładnie tak samo jak Faza 9 — ale, w
+    // przeciwieństwie do Fazy 9, nigdy nie wołała `sciezki_bezpieczne`.
+    // Błędna konfiguracja operatora (`target_path` przypadkiem ustawiony na
+    // `ufs_path`/`script_path`, albo jeden zagnieżdżony w drugim)
+    // pozwoliłaby Fazie 17, uruchomionej PRZED Fazą 9, zapisać naprawione
+    // pliki bezpośrednio do materiału dowodowego, zanim walidacja Fazy 9
+    // miałaby w ogóle szansę to wychwycić. Sprawdzane PRZED jakimkolwiek
+    // zapisem, tak jak w Fazie 9.
+    let ufs_path = Path::new(&config.ufs_path);
+    let script_path = Path::new(&config.script_path);
+    let target_path_walidacja = Path::new(&config.target_path);
+    if let Err(powod) = super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path) {
+        let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY: {}", powod)));
+        return Ok(());
+    }
+
     // Wskazuje `mp4_doctor` gdzie zakładać przestrzenie robocze — identycznie
     // jak `menu::actions::run_mp4_doctor_with_ui` dla ręcznego wejścia „[25]
     // MP4 DOCTOR", więc oba wejścia (ręczne i automatyczny moduł
@@ -1170,6 +1188,35 @@ mod tests {
         };
         u.raporty_faz.clear();
         u
+    }
+
+    /// REGRESJA (measure twice — druga weryfikacja Gemini, Faza 18 N3): Faza
+    /// 17 nigdy nie wołała `sciezki_bezpieczne` (w odróżnieniu od Fazy 9) —
+    /// `target_path` ustawiony przypadkiem na `ufs_path` pozwalałby zapisać
+    /// naprawione pliki wprost do materiału dowodowego. Dowodzi, że `run()`
+    /// odmawia PRZED utworzeniem katalogu roboczego napraw, nie tylko że
+    /// `sciezki_bezpieczne` samo w sobie zwraca `Err` (to już pokrywają testy
+    /// w `phase9.rs`).
+    #[test]
+    fn test_run_odmawia_gdy_target_path_jest_wewnatrz_korpusu() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let logi = tempdir().unwrap();
+        std::fs::write(ufs.path().join("brudny.txt"), b"tekst\x00z zerem").unwrap();
+
+        // target_path == ufs_path - dokładnie scenariusz błędnej konfiguracji operatora.
+        let config = konfiguracja_testowa(ufs.path(), script.path(), ufs.path(), logi.path());
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script, utf8_ok_ufs)
+             VALUES ('brudny.txt', 1, 0, 0)",
+            [],
+        ).unwrap();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui, all_module_ids()).expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
+
+        assert!(!ufs.path().join(KATALOG_NAPRAW).exists(), "katalog roboczy napraw NIE MOŻE powstać wewnątrz korpusu źródłowego");
     }
 
     #[test]
