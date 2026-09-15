@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
@@ -130,6 +130,26 @@ fn classify_unique_match_score(score: u32) -> &'static str {
 /// `twin_file_path` wskazującym właśnie na niego. Ta funkcja gwarantuje, że
 /// KAŻDY `id` z `unique_scr_ids` dostaje dokładnie jeden wpis: albo z
 /// najlepszym znalezionym dopasowaniem (`scr_best`), albo jawne "NONE".
+/// Decyduje, czy wolno zapisać symetryczne wpisy dla strony Skrypt (patrz
+/// [`buduj_symetryczne_wpisy_skryptu`]) po zakończeniu korelacji unikatów w
+/// `run()`. Wydzielone jako czysta funkcja, żeby dało się przetestować bez
+/// budowania wątków/Rayon.
+///
+/// NAPRAWIONY BUG (measure twice — druga weryfikacja Gemini, Punkt 5b):
+/// wywołanie było wcześniej BEZWARUNKOWE. `scr_best` jest budowany
+/// WYŁĄCZNIE z wyników korelacji unikatów UFS×Skrypt — jeśli ta korelacja
+/// nie odbyła się wcale (`correlation_cancelled`, Ctrl+C w pętli
+/// `common_rows` PRZED wejściem w Etap korelacji unikatów) albo odbyła się
+/// tylko CZĘŚCIOWO (`unique_ufs_przerwane`, Ctrl+C W TRAKCIE równoległego
+/// porównania "każdy z każdym"), `scr_best` jest odpowiednio pusty albo
+/// niekompletny — zapisanie wtedy "NONE" dla KAŻDEGO pliku unikalnego
+/// Skryptu byłoby fałszywym, trwałym wynikiem (bramkowanym przez
+/// `phase14_done = 1`), mimo że jego prawdziwy bliźniak mógł być właśnie
+/// wśród nieprzetworzonych/przerwanych porównań strony UFS.
+fn wolno_zapisac_symetryczne_wpisy_skryptu(correlation_cancelled: bool, unique_ufs_przerwane: bool) -> bool {
+    !correlation_cancelled && !unique_ufs_przerwane
+}
+
 fn buduj_symetryczne_wpisy_skryptu(
     unique_scr_ids: &[i32],
     scr_best: &HashMap<i32, (u32, String, i64, bool)>,
@@ -745,24 +765,39 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let last_ui_update = Arc::new(AtomicU64::new(0)); 
 
-    // Równoległa pętla "każdy z każdym" dla plików unikalnych - NAPRAWA:
-    // sprawdza CANCEL_SIGNAL zarówno przed rozpoczęciem drogiego wewnętrznego
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Punkt 5a): element,
+    // którego porównanie O(m) zostało przerwane przez CANCEL_SIGNAL (przed
+    // startem LUB w trakcie wewnętrznej pętli), musi zniknąć z wyniku, a NIE
+    // dostać `best_score = 0` nie do odróżnienia od "naprawdę porównano z
+    // wszystkimi kandydatami, brak dopasowania". Wcześniej takie elementy
+    // dostawały trwały, fałszywy wpis "NONE" + `phase14_done = 1` i nigdy
+    // więcej nie wracały do korelacji, mimo że nigdy nie zostały w pełni
+    // sprawdzone (a prawdziwy bliźniak mógł istnieć dalej w `unique_scr`).
+    // `unique_ufs_przerwane` śledzi, czy CHOĆ JEDEN element tej puli padł
+    // ofiarą anulowania — potrzebne niżej, żeby `buduj_symetryczne_wpisy_skryptu`
+    // też wiedziało, że `scr_best` mogło zostać zbudowane z niekompletnych
+    // danych (patrz Punkt 5b).
+    let unique_ufs_przerwane = AtomicBool::new(false);
+
+    // Równoległa pętla "każdy z każdym" dla plików unikalnych - sprawdza
+    // CANCEL_SIGNAL zarówno przed rozpoczęciem drogiego wewnętrznego
     // porównania O(m) dla danego elementu, jak i wewnątrz niego (przerywa
     // wcześniej rozpoczęte porównanie, jeśli anulowanie nadejdzie w trakcie).
     let cross_results: Vec<_> = if correlation_cancelled {
         Vec::new()
     } else {
-        unique_ufs.par_iter().map(|(u_id, u_path, u_hash)| {
+        unique_ufs.par_iter().filter_map(|(u_id, u_path, u_hash)| {
             let ext_ufs = Path::new(&u_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
             let mut best_score = 0;
             let mut best_match_id: Option<i32> = None;
             let mut best_match_path = None;
             let mut delta = 0;
             let mut ext_mismatch = false;
+            let mut przerwano = CANCEL_SIGNAL.load(Ordering::Relaxed);
 
-            if !CANCEL_SIGNAL.load(Ordering::Relaxed) {
+            if !przerwano {
                 for (s_id, s_path, s_hash) in &unique_scr {
-                    if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                    if CANCEL_SIGNAL.load(Ordering::Relaxed) { przerwano = true; break; }
                     if let Ok(score) = ssdeep::compare(u_hash, s_hash)
                         && score > best_score {
                             best_score = score;
@@ -784,10 +819,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
 
             let current = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            
+
             let now_ms = start_time.elapsed().as_millis() as u64;
             let last_ms = last_ui_update.load(Ordering::Relaxed);
-            
+
             if now_ms - last_ms > 80
                 && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                     let m = live_mismatches.load(Ordering::Relaxed);
@@ -799,9 +834,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                     });
                 }
 
-            (*u_id, u_path.clone(), best_score, best_match_id, best_match_path, delta, ext_mismatch, ext_ufs)
+            if przerwano {
+                unique_ufs_przerwane.store(true, Ordering::Relaxed);
+                return None;
+            }
+            Some((*u_id, u_path.clone(), best_score, best_match_id, best_match_path, delta, ext_mismatch, ext_ufs))
         }).collect()
     };
+    let unique_ufs_przerwane = unique_ufs_przerwane.load(Ordering::Relaxed);
 
     // NAPRAWIONY BUG (rozjazd stron / nieskończona re-analiza): tylko strona
     // UFS otrzymywała wpis `phase14_done=1` z tej pętli — strona Skrypt
@@ -856,8 +896,25 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // próg szumu) albo z jawnym "NONE", żeby dostał `phase14_done=1` i nie
     // był bez końca re-analizowany. Wydzielone do czystej funkcji — patrz
     // testy `buduj_symetryczne_wpisy_skryptu`.
-    let unique_scr_ids: Vec<i32> = unique_scr.iter().map(|(id, _, _)| *id).collect();
-    db_updates.extend(buduj_symetryczne_wpisy_skryptu(&unique_scr_ids, &scr_best));
+    //
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Punkt 5b): to
+    // wywołanie było wcześniej BEZWARUNKOWE. Gdy `correlation_cancelled`
+    // (Ctrl+C podczas pętli `common_rows`, PRZED wejściem w korelację
+    // unikatów) `scr_best` jest pusty, a funkcja - zgodnie ze swoją
+    // udokumentowaną, poprawną logiką - zapisywała wtedy "NONE" dla
+    // KAŻDEGO pliku unikalnego Skryptu, mimo że korelacja unikatów w ogóle
+    // się nie zaczęła. Analogicznie, gdy `unique_ufs_przerwane` (Ctrl+C W
+    // TRAKCIE równoległej korelacji, patrz wyżej) `scr_best` mógł zostać
+    // zbudowany z NIEKOMPLETNYCH danych — brakuje w nim wpisów od strony
+    // UFS, których porównanie zostało przerwane, więc plik Skryptu, którego
+    // prawdziwy bliźniak akurat był wśród NICH, dostałby fałszywe "NONE".
+    // W obu przypadkach poprawna odpowiedź to NIE zapisywać nic — pliki
+    // unikalne Skryptu zostają nieoznaczone (`phase14_done` bez zmian) i
+    // wracają do kolejki przy następnym, pełnym uruchomieniu fazy.
+    if wolno_zapisac_symetryczne_wpisy_skryptu(correlation_cancelled, unique_ufs_przerwane) {
+        let unique_scr_ids: Vec<i32> = unique_scr.iter().map(|(id, _, _)| *id).collect();
+        db_updates.extend(buduj_symetryczne_wpisy_skryptu(&unique_scr_ids, &scr_best));
+    }
 
     // NAPRAWIONY BUG: pliki jednostronne bez policzonego hasha (błąd I/O,
     // za małe dla ssdeep) — patrz `unhashable_unique` przy budowie zadań.
@@ -1146,6 +1203,37 @@ mod tests {
     #[test]
     fn test_symetryczne_wpisy_pusta_lista_daje_pusty_wynik() {
         assert!(buduj_symetryczne_wpisy_skryptu(&[], &HashMap::new()).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, Punkt 5):
+    // wolno_zapisac_symetryczne_wpisy_skryptu — bramka chroniąca przed
+    // fałszywym "NONE" po anulowaniu w trakcie korelacji Etapu 4.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_wolno_zapisac_symetryczne_wpisy_gdy_korelacja_pelna_i_nieprzerwana() {
+        assert!(wolno_zapisac_symetryczne_wpisy_skryptu(false, false));
+    }
+
+    #[test]
+    fn test_zabrania_zapisu_gdy_common_rows_zostalo_anulowane() {
+        // Punkt 5b: korelacja unikatów w ogóle się nie zaczęła (Ctrl+C w
+        // pętli common_rows) - scr_best jest pusty, zapis dałby fałszywe
+        // "NONE" dla KAŻDEGO pliku unikalnego Skryptu.
+        assert!(!wolno_zapisac_symetryczne_wpisy_skryptu(true, false));
+    }
+
+    #[test]
+    fn test_zabrania_zapisu_gdy_korelacja_unikatow_zostala_przerwana_w_trakcie() {
+        // Punkt 5a: część elementów unique_ufs nigdy nie dostała pełnego
+        // porównania - scr_best jest niekompletny, nie tylko pusty.
+        assert!(!wolno_zapisac_symetryczne_wpisy_skryptu(false, true));
+    }
+
+    #[test]
+    fn test_zabrania_zapisu_gdy_oba_etapy_zostaly_dotkniete_anulowaniem() {
+        assert!(!wolno_zapisac_symetryczne_wpisy_skryptu(true, true));
     }
 
     // ------------------------------------------------------------------
