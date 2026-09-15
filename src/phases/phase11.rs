@@ -341,123 +341,150 @@ impl AnomalyCategory {
 /// Magic Bytes nagłówka — pod kompresją nie ma wewnętrznej listy plików
 /// odczytywalnej bez pełnej dekompresji, więc głębsza walidacja struktury nie
 /// jest tu wykonywana.
+/// Rozpakowana z `analyze_archive` logika ZIP/pochodnych — wydzielona, żeby
+/// dało się ją osłonić `catch_unwind` w miejscu wywołania (patrz N1 z
+/// `todo.faza11.md`). Nie zwraca `Result` — jedyny błąd tej gałęzi
+/// (`File::open`) jest obsługiwany wcześniej, w `analyze_archive`.
+fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bool) -> ArchiveAnalysis {
+    let mut archive = match ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return ArchiveAnalysis {
+            is_valid: false, reason: Some("Brak EOCD / Ucięta Struktura".into()),
+            internal_files_count: 0, uncompressed_size: 0,
+            has_encrypted_entries: false, has_suspicious_compression: false,
+        },
+    };
+
+    if archive.is_empty() {
+        return ArchiveAnalysis {
+            is_valid: false, reason: Some("Wydmuszka (0 plików wewnątrz)".into()),
+            internal_files_count: 0, uncompressed_size: 0,
+            has_encrypted_entries: false, has_suspicious_compression: false,
+        };
+    }
+
+    if archive.len() > MASS_FILES_THRESHOLD {
+        return ArchiveAnalysis {
+            is_valid: false, reason: Some(format!("Bomba plikowa (>{} wpisów)", MASS_FILES_THRESHOLD)),
+            internal_files_count: archive.len(), uncompressed_size: 0,
+            has_encrypted_entries: false, has_suspicious_compression: false,
+        };
+    }
+
+    let mut uncompressed_total: u64 = 0;
+    let mut has_word = false; let mut has_xl = false;
+    let mut has_manifest = false; let mut has_meta = false;
+    let mut has_encrypted = false;
+
+    // UWAGA BEZPIECZEŃSTWA (naprawiony bug zip-bomby): poprzednio suma
+    // `uncompressed_total` (i detekcja szyfrowania/DNA formatu DOCX/XLSX/
+    // APK/EPUB) liczyła TYLKO pierwsze 2000 wpisów, mimo że limit liczby
+    // wpisów dopuszczał archiwa do `MASS_FILES_THRESHOLD` (50 000) - wpis
+    // o dużym nieskompresowanym rozmiarze umieszczony na indeksie >=2000
+    // przechodził KOMPLETNIE niezauważony. `archive.by_index()` czyta
+    // wyłącznie metadane nagłówka lokalnego (nie dekompresuje danych), więc
+    // iteracja po WSZYSTKICH wpisach jest tania nawet dla maksymalnej
+    // dopuszczalnej liczby wpisów (`archive.len()` jest już ograniczone do
+    // <= `MASS_FILES_THRESHOLD` przez sprawdzenie kilka linii wyżej).
+    for i in 0..archive.len() {
+        if let Ok(inner_file) = archive.by_index(i) {
+            uncompressed_total = uncompressed_total.saturating_add(inner_file.size());
+            if inner_file.encrypted() { has_encrypted = true; }
+
+            if let Some(name) = inner_file.enclosed_name() {
+                let name_str = name.to_string_lossy().to_lowercase();
+                if name_str.starts_with("word/") { has_word = true; }
+                if name_str.starts_with("xl/") { has_xl = true; }
+                if name_str.contains("androidmanifest.xml") || name_str.contains("classes.dex") { has_manifest = true; }
+                if name_str.contains("meta-inf/") || name_str.contains("mimetype") { has_meta = true; }
+            }
+        }
+    }
+
+    let mut is_fake = false;
+    if ext == "docx" && !has_word { is_fake = true; }
+    if ext == "xlsx" && !has_xl { is_fake = true; }
+    if ext == "apk" && !has_manifest { is_fake = true; }
+    if ext == "epub" && !has_meta { is_fake = true; }
+
+    if is_fake {
+        return ArchiveAnalysis {
+            is_valid: false, reason: Some(format!("Fałszywe rozszerzenie (Brak DNA .{})", ext)),
+            internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
+            has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
+        };
+    }
+
+    let verdict = classify_compression_ratio(file_size, uncompressed_total);
+    if verdict == CompressionVerdict::Bomb {
+        return ArchiveAnalysis {
+            is_valid: false, reason: Some("Zip Bomb (Anomalia Kompresji)".into()),
+            internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
+            has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
+        };
+    }
+    let has_suspicious_compression = verdict == CompressionVerdict::Suspicious;
+
+    // METODA (opcjonalna): próbkowa weryfikacja CRC32 pierwszych 3 wpisów.
+    // Realna dekompresja - crate `zip` weryfikuje CRC32 automatycznie przy
+    // pełnym odczycie strumienia i zwraca błąd przy niezgodności.
+    //
+    // UWAGA (naprawiony błąd pożyczenia E0502): `archive.len()` jest
+    // wyliczane RAZ, PRZED pętlą, do zmiennej `total_entries`. Wywołanie
+    // `archive.len()` wewnątrz `if let Ok(mut inner_file) = archive.by_index(i)`
+    // koliduje z mutowalnym pożyczeniem `archive` trzymanym przez
+    // `inner_file` przez cały czas trwania tego bloku - `archive.len()`
+    // wymaga pożyczenia niemutowalnego, którego kompilator nie pozwoli
+    // wziąć, dopóki `inner_file` (pożyczenie mutowalne) nie wyjdzie z zasięgu.
+    let total_entries = archive.len();
+    if deep_scan {
+        let sample_count = std::cmp::min(total_entries, 3);
+        for i in 0..sample_count {
+            if let Ok(mut inner_file) = archive.by_index(i) {
+                let mut sink = Vec::new();
+                if inner_file.read_to_end(&mut sink).is_err() {
+                    return ArchiveAnalysis {
+                        is_valid: false, reason: Some("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)".into()),
+                        internal_files_count: total_entries, uncompressed_size: uncompressed_total,
+                        has_encrypted_entries: has_encrypted, has_suspicious_compression,
+                    };
+                }
+            }
+        }
+    }
+
+    ArchiveAnalysis {
+        is_valid: true, reason: None,
+        internal_files_count: total_entries, uncompressed_size: uncompressed_total,
+        has_encrypted_entries: has_encrypted, has_suspicious_compression,
+    }
+}
+
 fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result::Result<ArchiveAnalysis, std::io::Error> {
     let mut file = File::open(path)?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     if ZIP_DERIVATIVES.contains(&ext.as_str()) {
-        let mut archive = match ZipArchive::new(&mut file) {
-            Ok(a) => a,
-            Err(_) => return Ok(ArchiveAnalysis {
-                is_valid: false, reason: Some("Brak EOCD / Ucięta Struktura".into()),
-                internal_files_count: 0, uncompressed_size: 0,
-                has_encrypted_entries: false, has_suspicious_compression: false,
-            }),
-        };
-
-        if archive.is_empty() {
-            return Ok(ArchiveAnalysis {
-                is_valid: false, reason: Some("Wydmuszka (0 plików wewnątrz)".into()),
-                internal_files_count: 0, uncompressed_size: 0,
-                has_encrypted_entries: false, has_suspicious_compression: false,
-            });
-        }
-
-        if archive.len() > MASS_FILES_THRESHOLD {
-            return Ok(ArchiveAnalysis {
-                is_valid: false, reason: Some(format!("Bomba plikowa (>{} wpisów)", MASS_FILES_THRESHOLD)),
-                internal_files_count: archive.len(), uncompressed_size: 0,
-                has_encrypted_entries: false, has_suspicious_compression: false,
-            });
-        }
-
-        let mut uncompressed_total: u64 = 0;
-        let mut has_word = false; let mut has_xl = false; 
-        let mut has_manifest = false; let mut has_meta = false;
-        let mut has_encrypted = false;
-
-        // UWAGA BEZPIECZEŃSTWA (naprawiony bug zip-bomby): poprzednio suma
-        // `uncompressed_total` (i detekcja szyfrowania/DNA formatu DOCX/XLSX/
-        // APK/EPUB) liczyła TYLKO pierwsze 2000 wpisów, mimo że limit liczby
-        // wpisów dopuszczał archiwa do `MASS_FILES_THRESHOLD` (50 000) - wpis
-        // o dużym nieskompresowanym rozmiarze umieszczony na indeksie >=2000
-        // przechodził KOMPLETNIE niezauważony. `archive.by_index()` czyta
-        // wyłącznie metadane nagłówka lokalnego (nie dekompresuje danych), więc
-        // iteracja po WSZYSTKICH wpisach jest tania nawet dla maksymalnej
-        // dopuszczalnej liczby wpisów (`archive.len()` jest już ograniczone do
-        // <= `MASS_FILES_THRESHOLD` przez sprawdzenie kilka linii wyżej).
-        for i in 0..archive.len() {
-            if let Ok(inner_file) = archive.by_index(i) {
-                uncompressed_total = uncompressed_total.saturating_add(inner_file.size());
-                if inner_file.encrypted() { has_encrypted = true; }
-                
-                if let Some(name) = inner_file.enclosed_name() {
-                    let name_str = name.to_string_lossy().to_lowercase();
-                    if name_str.starts_with("word/") { has_word = true; }
-                    if name_str.starts_with("xl/") { has_xl = true; }
-                    if name_str.contains("androidmanifest.xml") || name_str.contains("classes.dex") { has_manifest = true; }
-                    if name_str.contains("meta-inf/") || name_str.contains("mimetype") { has_meta = true; }
-                }
-            }
-        }
-
-        let mut is_fake = false;
-        if ext == "docx" && !has_word { is_fake = true; }
-        if ext == "xlsx" && !has_xl { is_fake = true; }
-        if ext == "apk" && !has_manifest { is_fake = true; }
-        if ext == "epub" && !has_meta { is_fake = true; }
-
-        if is_fake {
-            return Ok(ArchiveAnalysis {
-                is_valid: false, reason: Some(format!("Fałszywe rozszerzenie (Brak DNA .{})", ext)),
-                internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
-                has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
-            });
-        }
-
-        let verdict = classify_compression_ratio(file_size, uncompressed_total);
-        if verdict == CompressionVerdict::Bomb {
-            return Ok(ArchiveAnalysis {
-                is_valid: false, reason: Some("Zip Bomb (Anomalia Kompresji)".into()),
-                internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
-                has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
-            });
-        }
-        let has_suspicious_compression = verdict == CompressionVerdict::Suspicious;
-
-        // METODA (opcjonalna): próbkowa weryfikacja CRC32 pierwszych 3 wpisów.
-        // Realna dekompresja - crate `zip` weryfikuje CRC32 automatycznie przy
-        // pełnym odczycie strumienia i zwraca błąd przy niezgodności.
-        //
-        // UWAGA (naprawiony błąd pożyczenia E0502): `archive.len()` jest
-        // wyliczane RAZ, PRZED pętlą, do zmiennej `total_entries`. Wywołanie
-        // `archive.len()` wewnątrz `if let Ok(mut inner_file) = archive.by_index(i)`
-        // koliduje z mutowalnym pożyczeniem `archive` trzymanym przez
-        // `inner_file` przez cały czas trwania tego bloku - `archive.len()`
-        // wymaga pożyczenia niemutowalnego, którego kompilator nie pozwoli
-        // wziąć, dopóki `inner_file` (pożyczenie mutowalne) nie wyjdzie z zasięgu.
-        let total_entries = archive.len();
-        if deep_scan {
-            let sample_count = std::cmp::min(total_entries, 3);
-            for i in 0..sample_count {
-                if let Ok(mut inner_file) = archive.by_index(i) {
-                    let mut sink = Vec::new();
-                    if inner_file.read_to_end(&mut sink).is_err() {
-                        return Ok(ArchiveAnalysis {
-                            is_valid: false, reason: Some("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)".into()),
-                            internal_files_count: total_entries, uncompressed_size: uncompressed_total,
-                            has_encrypted_entries: has_encrypted, has_suspicious_compression,
-                        });
-                    }
-                }
-            }
-        }
-
-        return Ok(ArchiveAnalysis {
-            is_valid: true, reason: None,
-            internal_files_count: total_entries, uncompressed_size: uncompressed_total,
-            has_encrypted_entries: has_encrypted, has_suspicious_compression,
-        });
+        // REGRESJA (measure twice — druga weryfikacja Gemini, N1): crate `zip`
+        // ma udokumentowaną historię panik na zniekształconych archiwach
+        // (przepełnienia arytmetyczne, ucięte nagłówki XZ, nieprawidłowe pola
+        // extra) - dokładnie ten rodzaj wejścia, jakim jest korpus do audytu.
+        // Bez osłony panika w JEDNYM uszkodzonym pliku ubijała CAŁY proces
+        // (brak `catch_unwind`/`panic = "abort"`), nie tylko Fazę 11 - operator
+        // tracił sesję TUI i po restarcie natychmiast wpadał w tę samą awarię
+        // przy tym samym pliku (nieskończona pętla bez ręcznej interwencji).
+        // Ten sam wzorzec ochronny co `raw_image.rs`/`heic_image.rs`/
+        // `video_image.rs`/`generic_image::decode_guarded`/`phase16.rs` (YARA) —
+        // panika jest traktowana jak zwykła porażka parsowania.
+        let ext_ref = ext.clone();
+        let wynik = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            analyze_zip_entries(&mut file, &ext_ref, file_size, deep_scan)
+        }));
+        return Ok(wynik.unwrap_or_else(|_| ArchiveAnalysis {
+            is_valid: false, reason: Some("Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)".into()),
+            internal_files_count: 0, uncompressed_size: 0,
+            has_encrypted_entries: false, has_suspicious_compression: false,
+        }));
     }
 
     // 2. Walidacja PEŁNEJ STRUKTURY zwykłego `.tar` (moduł `tar_archive`)
@@ -1510,6 +1537,52 @@ mod tests {
         let a = analyze_archive(&path, size, false).unwrap();
         assert!(!a.is_valid);
         assert!(a.reason.unwrap().contains("Wydmuszka"));
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, N1): panika
+    // wewnątrz parsowania ZIP nie może ubić wątku Rayon / całego procesu.
+    // ------------------------------------------------------------------
+
+    /// Dowodzi kształtu ochrony zastosowanego w `analyze_archive` (`catch_unwind`
+    /// + `unwrap_or_else` na `ArchiveAnalysis` sygnalizującą porażkę), na
+    /// syntetycznej panice — uczciwie udokumentowane ograniczenie: crate `zip`
+    /// (wersja użyta w tym projekcie) nie ma znanego, stabilnego pliku
+    /// wejściowego wywołującego panikę deterministycznie (wszystkie
+    /// udokumentowane w jego CHANGELOGu panikujące przypadki są już
+    /// naprawione w tej wersji) — w przeciwieństwie do `rawloader`, gdzie
+    /// panika jest EMPIRYCZNIE zaobserwowana na realnym pliku DNG (patrz
+    /// `raw_image.rs`). Ten sam uczciwy wzorzec testu mechanizmu co
+    /// `phase13::test_analyze_image_generic_branch_is_panic_guarded`.
+    #[test]
+    fn test_panika_w_silniku_zip_jest_bezpiecznie_przechwycona() {
+        let wynik: std::thread::Result<ArchiveAnalysis> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> ArchiveAnalysis {
+                panic!("celowa panika testowa - symuluje awarię silnika ZIP na zniekształconym archiwum");
+            }));
+
+        let a = wynik.unwrap_or_else(|_| ArchiveAnalysis {
+            is_valid: false, reason: Some("Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)".into()),
+            internal_files_count: 0, uncompressed_size: 0,
+            has_encrypted_entries: false, has_suspicious_compression: false,
+        });
+
+        assert!(!a.is_valid, "Panika musi zostać zamieniona na porażkę parsowania, nie propagować się dalej");
+        assert!(a.reason.unwrap().contains("spanikował"));
+    }
+
+    /// Dowodzi, że `analyze_archive` (prawdziwa, produkcyjna funkcja - nie
+    /// izolowany mechanizm) faktycznie przechodzi przez `analyze_zip_entries`
+    /// owinięte w `catch_unwind` na normalnej, nie-panikującej ścieżce - czyli
+    /// że refaktoryzacja wydzielająca `analyze_zip_entries` nie zmieniła
+    /// zachowania dla zdrowych i uszkodzonych (ale nie panikujących) archiwów.
+    #[test]
+    fn test_analyze_archive_dziala_normalnie_przez_warstwe_catch_unwind() {
+        let (_g, path) = build_zip(&[("plik.txt", b"tresc")], "zip");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let a = analyze_archive(&path, size, false).unwrap();
+        assert!(a.is_valid);
+        assert_eq!(a.internal_files_count, 1);
     }
 
     #[test]
