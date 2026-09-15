@@ -258,6 +258,34 @@ fn build_source_block(stats: &LiveStats, start_time: Instant) -> String {
 /// dokumentacji modułu) i próbuje kolejne AKTYWNE moduły z `active_modules`
 /// w kolejności priorytetu, aż jeden zwróci sukces. Rozgłasza postęp co
 /// ~20 plików LUB co 250ms (hybrydowy próg — wzorzec z Fazy 5-7/10-16).
+/// Śledzi ile zadań zostało już rozliczonych dla każdego pliku (`id`), żeby
+/// `phase17_done` dało się ustawić dopiero PO kompletnym rozliczeniu
+/// WSZYSTKICH zadań wygenerowanych dla danego pliku w tym przebiegu — patrz
+/// dokumentacja przy budowie `oczekiwane_na_id` w `run()`. Wydzielone jako
+/// osobna, czysta struktura, żeby dało się ją przetestować bez budowania
+/// całego środowiska wątków/kanałów/SQLite wokół `db_thread`.
+struct SledzenieUkonczenia {
+    oczekiwane: HashMap<i32, u8>,
+    otrzymane: HashMap<i32, u8>,
+}
+
+impl SledzenieUkonczenia {
+    fn new(oczekiwane: HashMap<i32, u8>) -> Self {
+        Self { oczekiwane, otrzymane: HashMap::new() }
+    }
+
+    /// Rejestruje kolejny rozliczony wynik dla `id`. Zwraca `true`, gdy PO
+    /// tym doliczeniu WSZYSTKIE zadania wygenerowane dla tego pliku zostały
+    /// rozliczone (a więc wolno ustawić `phase17_done=1`) — `false`, jeśli
+    /// wciąż brakuje co najmniej jednego (np. drugiej strony pliku).
+    fn zarejestruj_wynik(&mut self, id: i32) -> bool {
+        let licznik = self.otrzymane.entry(id).or_insert(0);
+        *licznik += 1;
+        let oczekiwane = self.oczekiwane.get(&id).copied().unwrap_or(1);
+        *licznik >= oczekiwane
+    }
+}
+
 pub struct RepairCtx<'a> {
     pub ufs_base: &'a Path,
     pub script_base: &'a Path,
@@ -307,7 +335,29 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
 
             let mut result_opt: Option<(&'static str, PathBuf, String)> = None;
             for module in active_modules {
-                if !module.applies_to(&ctx) { continue; }
+                // REGRESJA (Gemini review — druga weryfikacja): `catch_unwind`
+                // niżej chronił `repair()`/`verify()`, ale NIE `applies_to()` —
+                // luka w deklarowanej gwarancji "panika w module nie ubija
+                // wątku". Dziś wszystkie implementacje `applies_to` to
+                // trywialne porównania (ryzyko praktyczne niskie), ale nic nie
+                // broni przyszłemu modułowi dodania bardziej złożonej logiki
+                // tutaj. Panika jest traktowana jak `applies_to()==false` —
+                // orkiestrator przechodzi do kolejnego modułu, tak jak przy
+                // zwykłym niedopasowaniu.
+                let pasuje = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.applies_to(&ctx)));
+                match pasuje {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => {
+                        if let Ok(mut f) = opr_log.lock() {
+                            let _ = writeln!(
+                                f, "[✖] [{}] {} | PANIKA W MODULE NAPRAWCZYM (applies_to) - pominięto, próbuję kolejnego",
+                                module.id(), task.rel_path
+                            );
+                        }
+                        continue;
+                    }
+                }
 
                 let Some(katalog) = katalog_wyjsciowy.as_deref() else { break };
 
@@ -697,6 +747,30 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let stats = LiveStats::new(rayon::current_num_threads());
 
+    // REGRESJA (Gemini review — druga weryfikacja): plik z anomaliami po OBU
+    // stronach dostaje DWA niezależne `RepairTask` (ten sam `id`, `side`
+    // różny). Ctrl+C w niewłaściwym momencie mógł wcześniej trwale zgubić
+    // zadanie dla JEDNEJ strony: `phase17_done` było ustawiane per `id` zaraz
+    // po przetworzeniu KTÓREGOKOLWIEK zadania dla niego, więc jeśli strona
+    // `script` zdążyła się przetworzyć i zacommitować, a `ufs` jeszcze nie w
+    // momencie przerwania, cały rekord wypadał z `WHERE phase17_done = 0` na
+    // zawsze — strona `ufs` nigdy nie dostawała kolejnej szansy.
+    //
+    // Naprawa: `phase17_done=1` jest teraz ustawiane DOPIERO gdy WSZYSTKIE
+    // zadania wygenerowane dla danego `id` w tym przebiegu (1 lub 2, policzone
+    // tu z `repair_tasks` PRZED uruchomieniem wątków) faktycznie dotarły do
+    // wątku zapisu. Zapis `repaired_path_*`/`repair_log_*` dla pojedynczego,
+    // już ukończonego zadania NIE jest wstrzymywany — tylko sama flaga
+    // ukończenia całego rekordu. Przy przerwaniu w połowie, kolejne
+    // uruchomienie Fazy 17 wygeneruje na nowo OBA zadania dla tego `id`
+    // (diagnostyka źródłowa z Faz 6/11/12/14/19 się nie zmienia) — strona już
+    // naprawiona zostanie po prostu naprawiona ponownie (idempotentne,
+    // nadpisze tym samym wynikiem), ale żadna strona nie zostanie pominięta.
+    let mut oczekiwane_na_id: HashMap<i32, u8> = HashMap::new();
+    for task in &repair_tasks {
+        *oczekiwane_na_id.entry(task.id).or_insert(0) += 1;
+    }
+
     // Wynik wątku zapisu do bazy jest PRZENOSZONY na zewnątrz zakresu wątków i
     // zgłaszany przez `?` niżej. Wcześniej każdy błąd SQLite w tym wątku był
     // `.unwrap()`, czyli paniką w wątku w środku `thread::scope` — wbrew
@@ -710,12 +784,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let db_thread = s.spawn(move || -> Result<()> {
             let tx_trans = conn_ref.transaction()?;
             {
-                // Zapis naprawy USTAWIA RÓWNIEŻ `phase17_done` — jedno zapytanie
-                // zamiast dwóch dla najczęstszego przypadku.
-                let mut stmt_u = tx_trans.prepare_cached("UPDATE files SET repaired_path_ufs = ?1, repair_log_ufs = ?2, phase17_done = 1 WHERE id = ?3")?;
-                let mut stmt_s = tx_trans.prepare_cached("UPDATE files SET repaired_path_script = ?1, repair_log_script = ?2, phase17_done = 1 WHERE id = ?3")?;
-                // Plik przetworzony bez naprawy — sama flaga ukończenia.
+                // `phase17_done` NIE jest już ustawiane w tych samych zapytaniach —
+                // patrz `otrzymane_na_id` niżej i dokumentacja przy `oczekiwane_na_id`.
+                let mut stmt_u = tx_trans.prepare_cached("UPDATE files SET repaired_path_ufs = ?1, repair_log_ufs = ?2 WHERE id = ?3")?;
+                let mut stmt_s = tx_trans.prepare_cached("UPDATE files SET repaired_path_script = ?1, repair_log_script = ?2 WHERE id = ?3")?;
                 let mut stmt_done = tx_trans.prepare_cached("UPDATE files SET phase17_done = 1 WHERE id = ?1")?;
+
+                let mut sledzenie = SledzenieUkonczenia::new(oczekiwane_na_id);
 
                 for ScanMsg::Chunk(chunk) in rx_db {
                     for res in chunk {
@@ -724,7 +799,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                                 let stmt = if res.side == "ufs" { &mut stmt_u } else { &mut stmt_s };
                                 stmt.execute(params![sciezka, log, res.id])?;
                             }
-                            _ => { stmt_done.execute(params![res.id])?; }
+                            _ => {}
+                        }
+
+                        if sledzenie.zarejestruj_wynik(res.id) {
+                            stmt_done.execute(params![res.id])?;
                         }
                     }
                 }
@@ -935,6 +1014,128 @@ mod tests {
         // I panel boczny musi się zbudować, a nie wywalić fazę.
         let blok = build_source_block(&stats, Instant::now());
         assert!(blok.contains("splice: 3"), "dostałem: {}", blok);
+    }
+
+    // ------------------------------------------------------------------
+    // SledzenieUkonczenia — `phase17_done` dopiero po WSZYSTKICH zadaniach
+    // wygenerowanych dla danego `id` (regresja: Ctrl+C w złym momencie
+    // gubiło trwale stronę, która nie zdążyła się przetworzyć).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sledzenie_ukonczenia_jedna_oczekiwana_strona_konczy_od_razu() {
+        let mut oczekiwane = HashMap::new();
+        oczekiwane.insert(1, 1u8);
+        let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
+
+        assert!(sledzenie.zarejestruj_wynik(1), "Plik z jedną oczekiwaną stroną musi być ukończony po pierwszym wyniku");
+    }
+
+    #[test]
+    fn test_sledzenie_ukonczenia_dwie_oczekiwane_strony_czeka_na_obie() {
+        let mut oczekiwane = HashMap::new();
+        oczekiwane.insert(1, 2u8);
+        let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
+
+        assert!(!sledzenie.zarejestruj_wynik(1), "Po pierwszej z dwóch stron plik NIE MOŻE być oznaczony jako ukończony");
+        assert!(sledzenie.zarejestruj_wynik(1), "Po drugiej z dwóch stron plik musi być ukończony");
+    }
+
+    #[test]
+    fn test_sledzenie_ukonczenia_rozne_id_sa_niezalezne() {
+        let mut oczekiwane = HashMap::new();
+        oczekiwane.insert(1, 2u8);
+        oczekiwane.insert(2, 1u8);
+        let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
+
+        assert!(!sledzenie.zarejestruj_wynik(1));
+        assert!(sledzenie.zarejestruj_wynik(2), "id=2 ma tylko jedną oczekiwaną stronę - musi się ukończyć niezależnie od stanu id=1");
+        assert!(sledzenie.zarejestruj_wynik(1), "id=1 dostaje teraz swój drugi wynik i dopiero teraz się kończy");
+    }
+
+    /// Brak wpisu w `oczekiwane` (id spoza tego przebiegu) nie może zawiesić
+    /// śledzenia — domyślne 1 oczekiwane zadanie jest bezpiecznym fallbackiem.
+    #[test]
+    fn test_sledzenie_ukonczenia_id_bez_wpisu_zaklada_jedna_oczekiwana_strone() {
+        let mut sledzenie = SledzenieUkonczenia::new(HashMap::new());
+        assert!(sledzenie.zarejestruj_wynik(999));
+    }
+
+    // ------------------------------------------------------------------
+    // `applies_to()` panikujący nie może ubić wątku Rayon — regresja
+    // znaleziona w drugiej (niezależnej) weryfikacji Gemini.
+    // ------------------------------------------------------------------
+
+    use crate::phases::repair_modules::WynikWeryfikacji;
+
+    struct PanikujacyWApplitesTo;
+    impl RepairModule for PanikujacyWApplitesTo {
+        fn id(&self) -> &'static str { "test_panikujacy" }
+        fn display_name(&self) -> &'static str { "Testowy moduł panikujący (applies_to)" }
+        fn applies_to(&self, _ctx: &RepairContext) -> bool {
+            panic!("celowa panika testowa w applies_to");
+        }
+        fn repair(&self, _source: &Path, _ctx: &RepairContext, _twin: Option<&Path>, _katalog_wyjsciowy: &Path) -> Option<(PathBuf, String)> {
+            None
+        }
+        fn verify(&self, _repaired: &Path, _ctx: &RepairContext) -> WynikWeryfikacji {
+            Err("nie powinno być wołane".to_string())
+        }
+    }
+
+    /// Drugi moduł, ZA panikującym w kolejności — dowodzi, że orkiestrator
+    /// faktycznie PRZECHODZI do kolejnego modułu po panice, a nie tylko "nie
+    /// wywraca się" (co dałoby się osiągnąć też przez ciche zatrzymanie).
+    struct ZawszeNaprawiaModul;
+    impl RepairModule for ZawszeNaprawiaModul {
+        fn id(&self) -> &'static str { "test_zawsze_naprawia" }
+        fn display_name(&self) -> &'static str { "Testowy moduł, który zawsze naprawia" }
+        fn applies_to(&self, _ctx: &RepairContext) -> bool { true }
+        fn repair(&self, source: &Path, _ctx: &RepairContext, _twin: Option<&Path>, katalog_wyjsciowy: &Path) -> Option<(PathBuf, String)> {
+            let nazwa = source.file_name()?;
+            let cel = katalog_wyjsciowy.join(nazwa);
+            std::fs::write(&cel, b"naprawiono").ok()?;
+            Some((cel, "naprawiono przez testowy moduł".to_string()))
+        }
+        fn verify(&self, _repaired: &Path, _ctx: &RepairContext) -> WynikWeryfikacji {
+            Ok("test OK")
+        }
+    }
+
+    #[test]
+    fn test_process_repair_stream_przezywa_panike_w_applies_to_i_probuje_kolejny_modul() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let repair = tempdir().unwrap();
+        std::fs::write(ufs.path().join("a.bin"), b"cokolwiek").unwrap();
+
+        let panikujacy = PanikujacyWApplitesTo;
+        let naprawiajacy = ZawszeNaprawiaModul;
+        let active_modules: Vec<&dyn RepairModule> = vec![&panikujacy, &naprawiajacy];
+
+        let task = RepairTask {
+            id: 1, rel_path: "a.bin".to_string(), side: "ufs", ext: "bin".to_string(),
+            media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None,
+            match_type: None, twin_path: None, video_ok: None, structure_ok: None,
+        };
+        let tasks = vec![task];
+
+        let stats = LiveStats::new(1);
+        let (tx_db, rx_db) = mpsc::sync_channel(10);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+
+        process_repair_stream(RepairCtx {
+            ufs_base: ufs.path(), script_base: script.path(), repair_base: repair.path(),
+            active_modules: &active_modules, tasks: &tasks, stats: &stats,
+            tx_db, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log: opr_log.clone(),
+        });
+
+        let ScanMsg::Chunk(wyniki) = rx_db.recv().expect("wątek naprawy musiał wysłać wynik, nie spanikować");
+        assert_eq!(wyniki.len(), 1);
+        assert!(wyniki[0].repaired_path.is_some(), "Moduł panikujący w applies_to nie może zablokować kolejnego, sprawnego modułu");
+        assert_eq!(stats.liczniki().get("test_zawsze_naprawia").copied(), Some(1));
+        assert_eq!(stats.liczniki().get("test_panikujacy"), None, "Panikujący moduł nie mógł zostać policzony jako ten, który naprawił plik");
     }
 
     #[test]
