@@ -210,6 +210,37 @@ impl AnomalyCategory {
 /// skompresowanych lub zaszyfrowanych).
 ///
 /// Zwraca `Ok(0.0)` dla pliku pustego (brak danych = brak entropii, nie błąd).
+/// Kategorie anomalii entropii — wydzielone z [`klasyfikuj_entropie`], żeby
+/// progi klasyfikacji dało się przetestować niezależnie od reszty
+/// `process_side_stream` (liczniki `stats`, log operacyjny, I/O).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KategoriaEntropii {
+    Szum,
+    Zaszyfrowany,
+    ZepsutaKompresja,
+    Wydmuszka,
+}
+
+/// Klasyfikuje wynik entropii pliku. Dokumentacja modułu deklaruje zakres
+/// "wydmuszki" jako domknięty przedział `0.0–1.0`, ale kod do niedawna
+/// implementował otwarty `(0.0, 1.0)` — plik z entropią DOKŁADNIE `0.0`
+/// (jeden powtarzający się bajt na całej długości, najbardziej klasyczny
+/// pusty blok) nie pasował do ŻADNEJ kategorii i przechodził całkowicie
+/// niesklasyfikowany. Naprawione: `ent >= 0.0`.
+fn klasyfikuj_entropie(ent: f64, is_compressed: bool) -> Option<KategoriaEntropii> {
+    if ent > 7.995 {
+        Some(KategoriaEntropii::Szum)
+    } else if ent > 7.5 && !is_compressed {
+        Some(KategoriaEntropii::Zaszyfrowany)
+    } else if ent < 6.0 && is_compressed {
+        Some(KategoriaEntropii::ZepsutaKompresja)
+    } else if ent >= 0.0 && ent < 1.0 {
+        Some(KategoriaEntropii::Wydmuszka)
+    } else {
+        None
+    }
+}
+
 /// Sprawdza `CANCEL_SIGNAL` między odczytami bufora (128 KB) i zwraca
 /// `Err(ErrorKind::Interrupted)` przy anulowaniu — wywołujący
 /// ([`process_side_stream`]) już poprawnie odróżnia to od prawdziwego błędu I/O.
@@ -347,26 +378,32 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     let mut anomalies = Vec::new();
                     let is_compressed = matches!(ext.as_str(), "zip" | "rar" | "7z" | "jpg" | "jpeg" | "png" | "mp4" | "mkv" | "pdf" | "apk" | "gz" | "docx" | "xlsx");
 
-                    if ent > 7.995 {
-                        anomalies.push(format!("Biały Szum / Śmieci (H={:.3})", ent));
-                        if task.is_common { stats.noise_common.fetch_add(1, Ordering::Relaxed); } 
-                        else { stats.noise_unique.fetch_add(1, Ordering::Relaxed); }
-                        *local_noise_ext.entry(ext.clone()).or_insert(0) += 1;
-                    } else if ent > 7.5 && !is_compressed {
-                        anomalies.push(format!("Zaszyfrowany / Nadpisany (H={:.3})", ent));
-                        if task.is_common { stats.crypto_common.fetch_add(1, Ordering::Relaxed); } 
-                        else { stats.crypto_unique.fetch_add(1, Ordering::Relaxed); }
-                        *local_crypto_ext.entry(ext.clone()).or_insert(0) += 1;
-                    } else if ent < 6.0 && is_compressed {
-                        anomalies.push(format!("Zepsuta Kompresja (H={:.3})", ent));
-                        if task.is_common { stats.broken_common.fetch_add(1, Ordering::Relaxed); } 
-                        else { stats.broken_unique.fetch_add(1, Ordering::Relaxed); }
-                        *local_broken_ext.entry(ext.clone()).or_insert(0) += 1;
-                    } else if ent > 0.0 && ent < 1.0 {
-                        anomalies.push(format!("Wydmuszka / Pusty blok (H={:.3})", ent));
-                        if task.is_common { stats.low_common.fetch_add(1, Ordering::Relaxed); } 
-                        else { stats.low_unique.fetch_add(1, Ordering::Relaxed); }
-                        *local_low_ext.entry(ext.clone()).or_insert(0) += 1;
+                    match klasyfikuj_entropie(ent, is_compressed) {
+                        Some(KategoriaEntropii::Szum) => {
+                            anomalies.push(format!("Biały Szum / Śmieci (H={:.3})", ent));
+                            if task.is_common { stats.noise_common.fetch_add(1, Ordering::Relaxed); }
+                            else { stats.noise_unique.fetch_add(1, Ordering::Relaxed); }
+                            *local_noise_ext.entry(ext.clone()).or_insert(0) += 1;
+                        }
+                        Some(KategoriaEntropii::Zaszyfrowany) => {
+                            anomalies.push(format!("Zaszyfrowany / Nadpisany (H={:.3})", ent));
+                            if task.is_common { stats.crypto_common.fetch_add(1, Ordering::Relaxed); }
+                            else { stats.crypto_unique.fetch_add(1, Ordering::Relaxed); }
+                            *local_crypto_ext.entry(ext.clone()).or_insert(0) += 1;
+                        }
+                        Some(KategoriaEntropii::ZepsutaKompresja) => {
+                            anomalies.push(format!("Zepsuta Kompresja (H={:.3})", ent));
+                            if task.is_common { stats.broken_common.fetch_add(1, Ordering::Relaxed); }
+                            else { stats.broken_unique.fetch_add(1, Ordering::Relaxed); }
+                            *local_broken_ext.entry(ext.clone()).or_insert(0) += 1;
+                        }
+                        Some(KategoriaEntropii::Wydmuszka) => {
+                            anomalies.push(format!("Wydmuszka / Pusty blok (H={:.3})", ent));
+                            if task.is_common { stats.low_common.fetch_add(1, Ordering::Relaxed); }
+                            else { stats.low_unique.fetch_add(1, Ordering::Relaxed); }
+                            *local_low_ext.entry(ext.clone()).or_insert(0) += 1;
+                        }
+                        None => {}
                     }
 
                     if !anomalies.is_empty()
@@ -379,15 +416,24 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     (Some(ent), Some(false))
                 },
                 Err(e) => {
-                    if e.kind() != std::io::ErrorKind::Interrupted {
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        // Anulowanie skanu przez operatora (CANCEL_SIGNAL sprawdzany
+                        // co 128 KB w calculate_entropy), NIE błąd I/O - plik nigdy
+                        // nie został faktycznie zbadany. `io_error=Some(true)` tutaj
+                        // trwale i fałszywie oznaczałoby go jako uszkodzony (warunek
+                        // ponownego zakolejkowania sprawdza `err_ufs/script != Some(true)`),
+                        // blokując weryfikację na zawsze zamiast wznowić przy kolejnym
+                        // uruchomieniu.
+                        (None, None)
+                    } else {
                         warn!(path = %task.rel_path, side = side_label, error = %e, "Błąd I/O podczas czytania pliku");
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut f) = opr_log.lock() {
                             let kategoria = if task.is_common { "Wspólne" } else { "Unikalne" };
                             let _ = writeln!(f, "[{:<15}] [{:<8}] [Błąd I/O: {}] Format: .{:<5} | Ścieżka: \"{}\"", side_label, kategoria, e, ext, full_path.display());
                         }
+                        (None, Some(true))
                     }
-                    (None, Some(true))
                 }
             };
 
@@ -949,6 +995,56 @@ mod tests {
         let f = make_temp_file(b"");
         let h = calculate_entropy(f.path()).unwrap();
         assert_eq!(h, 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): H=0.0 musi trafić do kategorii "Wydmuszka",
+    // nie zniknąć bez klasyfikacji (były otwarty przedział `ent > 0.0`).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_klasyfikuj_entropie_zero_jest_wydmuszka_nie_brakiem_kategorii() {
+        assert_eq!(klasyfikuj_entropie(0.0, false), Some(KategoriaEntropii::Wydmuszka));
+    }
+
+    #[test]
+    fn test_klasyfikuj_entropie_zero_dla_pliku_skompresowanego_jest_zepsuta_kompresja() {
+        // `is_compressed=true` i `ent<6.0` wygrywa PRZED gałęzią wydmuszki
+        // (kolejność if/else) - zamierzone, zip wypełniony zerami to realnie
+        // zepsuta kompresja, nie zwykła wydmuszka.
+        assert_eq!(klasyfikuj_entropie(0.0, true), Some(KategoriaEntropii::ZepsutaKompresja));
+    }
+
+    #[test]
+    fn test_klasyfikuj_entropie_granice_pozostalych_kategorii_niezmienione() {
+        assert_eq!(klasyfikuj_entropie(8.0, false), Some(KategoriaEntropii::Szum));
+        assert_eq!(klasyfikuj_entropie(7.8, false), Some(KategoriaEntropii::Zaszyfrowany));
+        assert_eq!(klasyfikuj_entropie(0.5, false), Some(KategoriaEntropii::Wydmuszka));
+        assert_eq!(klasyfikuj_entropie(4.0, false), None, "entropia środkowego zakresu bez kompresji nie jest anomalią");
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): anulowanie skanu (CANCEL_SIGNAL) w trakcie
+    // liczenia entropii nie może być mylone z prawdziwym błędem I/O -
+    // inaczej plik dostaje trwałe `io_error=true` mimo że nigdy nie został
+    // faktycznie zbadany, i nie wraca do kolejki przy wznowieniu.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_calculate_entropy_zwraca_interrupted_gdy_cancel_signal_ustawiony() {
+        // Plik dostatecznie duży, żeby CANCEL_SIGNAL zdążył zostać sprawdzony
+        // w pętli odczytu (co 128 KB) przed wyczerpaniem pliku.
+        let content = vec![0u8; 500_000];
+        let f = make_temp_file(&content);
+
+        CANCEL_SIGNAL.store(true, Ordering::Relaxed);
+        let wynik = calculate_entropy(f.path());
+        CANCEL_SIGNAL.store(false, Ordering::Relaxed); // sprzątanie - stan globalny
+
+        match wynik {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Interrupted),
+            Ok(_) => panic!("oczekiwano Err(Interrupted) przy ustawionym CANCEL_SIGNAL"),
+        }
     }
 
     #[test]
