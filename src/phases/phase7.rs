@@ -800,20 +800,34 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             map.entry(ext.clone()).or_default().push(rel_path.clone());
         };
 
+        // REGRESJA (Gemini review — druga weryfikacja): ten generator Dziennika
+        // Końcowego duplikował CAŁĄ logikę progów `process_side_stream` inline,
+        // zamiast wywoływać wspólną `klasyfikuj_entropie` — poprawka progu
+        // H=0.0 (>=0.0 zamiast >0.0) trafiła wcześniej TYLKO do klasyfikacji
+        // na żywo, nie do tej drugiej kopii. Plik z H=0.0 był więc poprawnie
+        // liczony w panelu TUI, ale znikał bez klasyfikacji z persystentnego,
+        // archiwizowanego pliku `dziennik_koncowy_faza7.txt`. Wywołanie
+        // wspólnej funkcji eliminuje drugie źródło prawdy.
         if in_ufs
-            && let Some(e) = e_ufs { 
-                if e > 7.995 { add_to_cat(&mut cat_noise, true); } 
-                else if e > 7.5 && !is_compressed { add_to_cat(&mut cat_crypto, true); } 
-                else if e < 6.0 && is_compressed { add_to_cat(&mut cat_broken, true); } 
-                else if e > 0.0 && e < 1.0 { add_to_cat(&mut cat_low, true); }
+            && let Some(e) = e_ufs {
+                match klasyfikuj_entropie(e, is_compressed) {
+                    Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, true),
+                    Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, true),
+                    Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, true),
+                    Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, true),
+                    None => {}
+                }
             }
 
         if in_scr
-            && let Some(e) = e_scr { 
-                if e > 7.995 { add_to_cat(&mut cat_noise, false); } 
-                else if e > 7.5 && !is_compressed { add_to_cat(&mut cat_crypto, false); } 
-                else if e < 6.0 && is_compressed { add_to_cat(&mut cat_broken, false); } 
-                else if e > 0.0 && e < 1.0 { add_to_cat(&mut cat_low, false); }
+            && let Some(e) = e_scr {
+                match klasyfikuj_entropie(e, is_compressed) {
+                    Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, false),
+                    Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, false),
+                    Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, false),
+                    Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, false),
+                    None => {}
+                }
             }
     }
     drop(stmt);
