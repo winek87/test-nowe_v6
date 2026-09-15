@@ -568,36 +568,42 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (CTPH)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
         let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
 
-        std::thread::scope(|s| {
+        // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd
+        // SQLite w wątku bazy był wcześniej `.unwrap()`, czyli paniką w
+        // wątku pisarza wewnątrz `thread::scope`. Ten sam wzorzec co
+        // `phase17_repair::run`/`phase1::run`/`phase3::run` — `db_thread`
+        // zwraca `Result<()>`, panika jest przechwytywana przez `.join()` i
+        // zamieniana na błąd domenowy.
+        let wynik_zapisu: Result<()> = std::thread::scope(|s| {
             let (tx_db, rx_db) = mpsc::sync_channel(200);
 
-            let _db_thread = s.spawn(|| {
+            let db_thread = s.spawn(|| -> Result<()> {
                 let mut db_inserted = 0;
                 let mut last_db_update = Instant::now();
 
-                let update_sql = |c: &mut Connection, chunk: &[SideFuzzyResult], is_ufs: bool| {
-                    let tx_trans = c.transaction().unwrap();
+                let update_sql = |c: &mut Connection, chunk: &[SideFuzzyResult], is_ufs: bool| -> Result<()> {
+                    let tx_trans = c.transaction()?;
                     {
                         let mut stmt = match is_ufs {
-                            true => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_ufs = COALESCE(?1, fuzzy_hash_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3").unwrap(),
-                            false => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_script = COALESCE(?1, fuzzy_hash_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3").unwrap()
+                            true => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_ufs = COALESCE(?1, fuzzy_hash_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3")?,
+                            false => tx_trans.prepare_cached("UPDATE files SET fuzzy_hash_script = COALESCE(?1, fuzzy_hash_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3")?
                         };
-                        
+
                         for res in chunk {
                             if res.hash.is_some() || res.io_error == Some(true) {
-                                stmt.execute(params![res.hash, res.io_error, res.id]).unwrap();
+                                stmt.execute(params![res.hash, res.io_error, res.id])?;
                             }
                         }
                     }
-                    tx_trans.commit().unwrap();
+                    tx_trans.commit()
                 };
 
                 for msg in rx_db {
                     let c_len = match &msg {
-                        ScanMsg::UfsChunk(chunk) => { update_sql(conn, chunk, true); chunk.len() },
-                        ScanMsg::ScriptChunk(chunk) => { update_sql(conn, chunk, false); chunk.len() },
+                        ScanMsg::UfsChunk(chunk) => { update_sql(conn, chunk, true)?; chunk.len() },
+                        ScanMsg::ScriptChunk(chunk) => { update_sql(conn, chunk, false)?; chunk.len() },
                     };
-                    
+
                     db_inserted += c_len;
                     let now = Instant::now();
                     if now.duration_since(last_db_update).as_millis() > 60 {
@@ -606,6 +612,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                     }
                 }
                 let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Hashe CTPH w 100% zsynchronizowane z SQLite.".to_string() });
+                Ok(())
             });
 
             if config.io_mode == "CONCURRENT" {
@@ -651,16 +658,43 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 });
                 drop(tx_db); 
             } else {
-                if !ufs_tasks.is_empty() { 
-                    process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 0, }); 
-                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku UFS zakończone.".to_string())); 
+                if !ufs_tasks.is_empty() {
+                    process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 0, });
+                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku UFS zakończone.".to_string()));
                 }
-                if !script_tasks.is_empty() { 
-                    process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db, is_ufs: false, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 1, }); 
-                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku Skryptu zakończone.".to_string())); 
+                if !script_tasks.is_empty() {
+                    process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, fallback_max_bytes, tx_ui: &tx_ui, bar_idx: 1, });
+                    let _ = tx_ui.send(PhaseEvent::Log("✔ Hashowanie CTPH dysku Skryptu zakończone.".to_string()));
+                }
+                // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
+                // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
+                // przenoszony (poprzednio: `tx_db` bez `.clone()` w drugim
+                // wywołaniu) - kanał nie zamykał się, dopóki ta zmienna nie
+                // wyszła z zasięgu na końcu CAŁEGO domknięcia `thread::scope`.
+                // Wcześniej to nie miało znaczenia (brak jawnego `.join()`),
+                // ale teraz `db_thread.join()` niżej blokowałby się W
+                // NIESKOŃCZONOŚĆ, czekając na zamknięcie kanału, który sam
+                // trzyma otwarty - klasyczny deadlock. Jawny `drop` zamyka
+                // kanał deterministycznie, zanim `.join()` zacznie czekać.
+                drop(tx_db);
+            }
+
+            match db_thread.join() {
+                Ok(wynik) => wynik,
+                // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama
+                // panika jest już odnotowana przez globalny hook w
+                // `logging.rs`, więc tu zamieniamy ją na błąd domenowy, żeby
+                // nie rozprzestrzeniała się dalej i żeby wywołujący nie
+                // uznał przebiegu za udany.
+                Err(_) => {
+                    let _ = tx_ui.send(PhaseEvent::Log(
+                        "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 14 mógł nie zostać w pełni zapisany.".to_string()
+                    ));
+                    Err(rusqlite::Error::UnwindingPanic)
                 }
             }
         });
+        wynik_zapisu?;
     }
 
     // --- ETAP 4: BŁYSKAWICZNA KORELACJA W PAMIĘCI RAM Z DELTĄ ---
