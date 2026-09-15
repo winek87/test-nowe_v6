@@ -274,7 +274,21 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             // - MKV/WebM/MKA → kontener EBML/Matroska (`mkv_container`),
             // - TS/M2TS/MTS  → ciągły strumień pakietów 188 B (`ts_stream`),
             //   gdzie liczniki ciągłości ujawniają DOKŁADNIE ile pakietów zginęło.
-            let side_result = if crate::ts_stream::is_ts_extension(&task.rel_path) {
+            // REGRESJA (measure twice — druga weryfikacja Gemini, N2): żadna
+            // z czterech ścieżek analizy kontenera nie miała tu własnej
+            // osłony `catch_unwind` — MP4 jest chronione jedno wywołanie
+            // głębiej (`video_image::read_video_bytes`), MKV ma jawną,
+            // sfalsyfikowalną decyzję o nieużywaniu (`mkv_container.rs`
+            // nagłówek modułu), a TS/FLV/`mp4_engines::boxes` są ręcznie
+            // pisanymi parserami bez takiej deklaracji - bezpieczne DZIŚ
+            // (ręczny przegląd: konsekwentne strażowanie długości bufora,
+            // `checked_add`), ale bez żadnej sieci bezpieczeństwa, gdyby
+            // przyszła zmiana złamała tę dyscyplinę. Ten sam wzorzec
+            // "belt and suspenders" co YARA w Fazie 16 i
+            // `applies_to`/`repair`/`verify` w Fazie 17: panika w KTÓRYMKOLWIEK
+            // analizatorze nie może ubić wątku Rayon / całej sesji TUI dla
+            // jednego spreparowanego pliku w korpusie.
+            let side_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> SideVideoResult { if crate::ts_stream::is_ts_extension(&task.rel_path) {
                 match stats.thread_activity.track_current(|| crate::ts_stream::analyze_ts_file(&full_path)) {
                     Some(a) if a.is_healthy() => {
                         stats.ok.fetch_add(1, Ordering::Relaxed);
@@ -462,7 +476,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         }
                     }
                 }
-            };
+            }})).unwrap_or_else(|_| {
+                warn!(path = %task.rel_path, side = side_label, "PANIKA podczas analizy kontenera wideo - potraktowano jak uszkodzenie");
+                bump_damage_counter(stats, VideoDamage::Other, task.is_common);
+                SideVideoResult {
+                    id: task.id, ok: Some(false),
+                    reason: Some("Analiza kontenera spanikowała (parser/dekoder natrafił na nieoczekiwaną strukturę) - traktowane jak uszkodzenie, nie błąd I/O".to_string()),
+                    duration_ms: None, track_count: None, io_error: Some(false), created_unix: None,
+                }
+            });
             results.push(side_result);
 
             let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
@@ -745,6 +767,38 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, N2, defense in
+    // depth): panika w KTÓRYMKOLWIEK analizatorze kontenera nie może ubić
+    // wątku Rayon. Uczciwie udokumentowane ograniczenie: żaden z parserów
+    // TS/FLV/mp4_engines::boxes nie ma dziś znanego, stabilnego pliku
+    // wejściowego wywołującego panikę deterministycznie (ręczny przegląd
+    // kodu nie znalazł ścieżki panikującej) — ten sam uczciwy wzorzec testu
+    // MECHANIZMU co `phase13::test_analyze_image_generic_branch_is_panic_guarded`
+    // i `phase11::test_panika_w_silniku_zip_jest_bezpiecznie_przechwycona`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_panika_w_analizie_kontenera_jest_bezpiecznie_przechwycona() {
+        let stats = LiveStats::new(1);
+        let wynik: std::thread::Result<SideVideoResult> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> SideVideoResult {
+                panic!("celowa panika testowa - symuluje awarię parsera kontenera wideo");
+            }));
+
+        let s = wynik.unwrap_or_else(|_| {
+            bump_damage_counter(&stats, VideoDamage::Other, false);
+            SideVideoResult {
+                id: 1, ok: Some(false),
+                reason: Some("Analiza kontenera spanikowała (parser/dekoder natrafił na nieoczekiwaną strukturę) - traktowane jak uszkodzenie, nie błąd I/O".to_string()),
+                duration_ms: None, track_count: None, io_error: Some(false), created_unix: None,
+            }
+        });
+
+        assert_eq!(s.ok, Some(false), "Panika musi zostać zamieniona na porażkę analizy, nie propagować się dalej");
+        assert_eq!(s.io_error, Some(false), "Panika NIE jest błędem I/O - plik istnieje i jest czytelny, tylko parser go nie udźwignął");
+    }
 
     #[test]
     fn test_compute_half_threads() {
