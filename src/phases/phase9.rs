@@ -283,51 +283,77 @@ fn decide_winner(file: &MergeCandidate) -> (&'static str, &'static str) {
 /// prowadziłaby do fizycznego nadpisania oryginalnego materiału dowodowego
 /// przez `copy_file_and_meta`.
 ///
-/// Kanonikalizuje ścieżki tam, gdzie się da (rozwiązuje symlinki/`..`), z
-/// fallbackiem na ścieżkę surową, gdy katalog jeszcze fizycznie nie istnieje
-/// (typowy przypadek dla `target_path` przy pierwszym uruchomieniu — nie
-/// można kanonikalizować czegoś, co jeszcze nie istnieje na dysku).
-fn sciezki_bezpieczne(target_path: &Path, ufs_path: &Path, script_path: &Path) -> std::result::Result<(), String> {
-    // REGRESJA (Gemini review — druga weryfikacja): zwykły
-    // `canonicalize().unwrap_or(surowa_sciezka)` zawodzi cicho dla
-    // `target_path`, który typowo JESZCZE NIE ISTNIEJE przy pierwszym
-    // uruchomieniu — funkcja porównywałaby wtedy surowy, potencjalnie
-    // WZGLĘDNY string operatora ze skanonikalizowanymi, BEZWZGLĘDNYMI
-    // ścieżkami źródłowymi. Taka ścieżka nigdy nie spełni `==`/`starts_with`
-    // nawet jeśli faktycznie leży wewnątrz źródła (np. przez symlink) —
-    // walidacja przechodziłaby bezpiecznie WYGLĄDAJĄCO, nic nie sprawdzając.
-    // Naprawa: kanonikalizuj najbliższego ISTNIEJĄCEGO przodka i dołącz do
-    // wyniku resztę składników ścieżki — daje efektywnie bezwzględną,
-    // rozwiązaną ścieżkę nawet dla jeszcze nieutworzonego katalogu liścia.
-    fn kanon(p: &Path) -> PathBuf {
-        if let Ok(real) = std::fs::canonicalize(p) {
-            return real;
-        }
-        let mut ogon: Vec<std::ffi::OsString> = Vec::new();
-        let mut biezacy = p;
-        loop {
-            match std::fs::canonicalize(biezacy) {
-                Ok(real) => {
-                    let mut wynik = real;
-                    for skladnik in ogon.iter().rev() {
-                        wynik.push(skladnik);
-                    }
-                    return wynik;
+/// Kanonikalizuje ścieżkę tam, gdzie się da (rozwiązuje symlinki/`..`), z
+/// fallbackiem na najbliższego ISTNIEJĄCEGO przodka + doklejenie reszty
+/// składników, gdy sama ścieżka jeszcze fizycznie nie istnieje na dysku
+/// (typowy przypadek dla `target_path` przy pierwszym uruchomieniu). Wydzielona
+/// jako samodzielna funkcja modułu (nie zagnieżdżona w `sciezki_bezpieczne`),
+/// żeby dało się ją przetestować bezpośrednio, bez mutowania globalnego CWD
+/// procesu testowego.
+///
+/// REGRESJA (Gemini review — druga weryfikacja): zwykły
+/// `canonicalize().unwrap_or(surowa_sciezka)` zawodzi cicho dla
+/// `target_path`, który typowo JESZCZE NIE ISTNIEJE przy pierwszym
+/// uruchomieniu — funkcja porównywałaby wtedy surowy, potencjalnie
+/// WZGLĘDNY string operatora ze skanonikalizowanymi, BEZWZGLĘDNYMI
+/// ścieżkami źródłowymi. Taka ścieżka nigdy nie spełni `==`/`starts_with`
+/// nawet jeśli faktycznie leży wewnątrz źródła (np. przez symlink) —
+/// walidacja przechodziłaby bezpiecznie WYGLĄDAJĄCO, nic nie sprawdzając.
+fn kanon(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    let mut ogon: Vec<std::ffi::OsString> = Vec::new();
+    let mut biezacy = p;
+    loop {
+        match std::fs::canonicalize(biezacy) {
+            Ok(real) => {
+                let mut wynik = real;
+                for skladnik in ogon.iter().rev() {
+                    wynik.push(skladnik);
                 }
-                Err(_) => match (biezacy.file_name(), biezacy.parent()) {
-                    (Some(nazwa), Some(rodzic)) if !rodzic.as_os_str().is_empty() => {
-                        ogon.push(nazwa.to_os_string());
-                        biezacy = rodzic;
-                    }
-                    // Żaden przodek nie istnieje (korzeń albo ścieżka względna
-                    // bez wspólnego istniejącego prefiksu) — ostatnia deska
-                    // ratunku, zwracamy ścieżkę jak jest.
-                    _ => return p.to_path_buf(),
-                },
+                return wynik;
             }
+            Err(_) => match biezacy.file_name() {
+                Some(nazwa) => {
+                    ogon.push(nazwa.to_os_string());
+                    biezacy = match biezacy.parent() {
+                        Some(rodzic) if !rodzic.as_os_str().is_empty() => rodzic,
+                        // REGRESJA (measure twice — druga weryfikacja
+                        // Gemini, N1): rodzic PUSTY nie znaczy "koniec
+                        // drogi" — znaczy "ostatni składnik ścieżki
+                        // WZGLĘDNEJ" (np. samo "wyniki", albo "sub" po
+                        // odcięciu z "sub/wyniki"). Poprzednio pętla
+                        // poddawała się tutaj i zwracała SUROWĄ,
+                        // nieznormalizowaną ścieżkę względem CWD — dwie
+                        // ścieżki względne bez wspólnego istniejącego
+                        // przodka na dysku (typowy pierwszy przebieg,
+                        // `target_path` jeszcze nieistniejący) nigdy nie
+                        // miały jak wykazać wspólnego prefiksu, nawet
+                        // jeśli faktycznie wskazywały w to samo miejsce.
+                        // Bieżący katalog roboczy ZAWSZE istnieje, więc
+                        // `canonicalize(".")` w kolejnej iteracji na
+                        // pewno się powiedzie.
+                        _ => Path::new("."),
+                    };
+                }
+                // Korzeń ("/") nie istnieje — nic więcej nie da się
+                // zrobić (nie powinno się zdarzyć w praktyce).
+                None => return p.to_path_buf(),
+            },
         }
     }
+}
 
+/// Sprawdza, że katalog docelowy (`target_path`, gdzie faza fizycznie
+/// zapisuje Złotą Kopię) jest ROZŁĄCZNY z obydwoma katalogami źródłowymi
+/// materiału dowodowego — ani nie jest tym samym katalogiem, ani nie jest
+/// przodkiem/potomkiem żadnego z nich. Bez tej kontroli błędna konfiguracja
+/// operatora (np. `target_path` przypadkiem ustawiony na `ufs_path`)
+/// prowadziłaby do fizycznego nadpisania oryginalnego materiału dowodowego
+/// przez `copy_file_and_meta`. Kanonikalizacja przez [`kanon`] — patrz jej
+/// dokumentacja.
+pub(crate) fn sciezki_bezpieczne(target_path: &Path, ufs_path: &Path, script_path: &Path) -> std::result::Result<(), String> {
     let target = kanon(target_path);
     let ufs = kanon(ufs_path);
     let script = kanon(script_path);
@@ -1479,6 +1505,57 @@ mod tests {
         let ufs = target.path().join("podkatalog_zrodlowy");
         std::fs::create_dir_all(&ufs).unwrap();
         assert!(sciezki_bezpieczne(target.path(), &ufs, script.path()).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // kanon() — REGRESJA (measure twice — druga weryfikacja Gemini, N1):
+    // ścieżka WZGLĘDNA bez ŻADNEGO istniejącego przodka na dysku (typowy
+    // pierwszy przebieg — nic pod `target_path` jeszcze nie istnieje)
+    // wcześniej powodowała, że pętla ancestor-walk poddawała się i zwracała
+    // SUROWĄ, nieznormalizowaną ścieżkę zamiast rozwiązać ją względem CWD.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_kanon_wzgledna_jednoskladnikowa_bez_istniejacego_przodka_rozwiazuje_wzgledem_cwd() {
+        let nazwa = "___test_kanon_jednoskladnikowa_nieistniejaca___";
+        let wynik = kanon(Path::new(nazwa));
+        let oczekiwane = std::env::current_dir().unwrap().join(nazwa);
+        assert_eq!(wynik, oczekiwane, "ścieżka względna bez istniejącego przodka musi zostać rozwiązana względem CWD, nie zwrócona surowo");
+        assert!(wynik.is_absolute(), "wynik kanon() musi być zawsze bezwzględny, żeby porównania starts_with miały sens");
+    }
+
+    #[test]
+    fn test_kanon_wzgledna_wieloskladnikowa_bez_istniejacego_przodka_rozwiazuje_wzgledem_cwd() {
+        let wynik = kanon(Path::new("___test_kanon_a___/___test_kanon_b___/___test_kanon_c___"));
+        let oczekiwane = std::env::current_dir().unwrap()
+            .join("___test_kanon_a___").join("___test_kanon_b___").join("___test_kanon_c___");
+        assert_eq!(wynik, oczekiwane);
+    }
+
+    #[test]
+    fn test_kanon_katalog_istniejacy_zwraca_kanoniczna_sciezke() {
+        let dir = tempdir().unwrap();
+        assert_eq!(kanon(dir.path()), std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn test_kanon_lisc_nieistniejacy_pod_istniejacym_rodzicem() {
+        let dir = tempdir().unwrap();
+        let cel = dir.path().join("jeszcze_nieutworzony_lisc");
+        let oczekiwane = std::fs::canonicalize(dir.path()).unwrap().join("jeszcze_nieutworzony_lisc");
+        assert_eq!(kanon(&cel), oczekiwane);
+    }
+
+    /// Dowodzi, że dwie ścieżki WZGLĘDNE bez wspólnego istniejącego przodka,
+    /// ale faktycznie wskazujące w to samo miejsce (przez CWD), są teraz
+    /// poprawnie rozpoznawane jako identyczne — dokładnie scenariusz z N1
+    /// (`sciezki_bezpieczne` z operatorem, który wpisał ścieżki względne).
+    #[test]
+    fn test_kanon_dwie_wzgledne_sciezki_do_tego_samego_miejsca_sa_rowne() {
+        assert_eq!(
+            kanon(Path::new("___test_kanon_wspolny___")),
+            kanon(Path::new("./___test_kanon_wspolny___")),
+        );
     }
 
     /// REGRESJA (Gemini review — druga weryfikacja): `target_path` JESZCZE
