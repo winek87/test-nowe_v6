@@ -638,12 +638,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let script_path = PathBuf::from(&config.script_path);
 
     // --- ETAP 3: PRZETWARZANIE STRUMIENIOWE (MPSC) ---
-    std::thread::scope(|s| {
+    // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd SQLite
+    // w wątku bazy był wcześniej `.unwrap()`, czyli paniką w wątku pisarza
+    // wewnątrz `thread::scope`. Ten sam wzorzec co `phase17_repair::run`/
+    // `phase1::run`/`phase3::run` — `db_thread` zwraca `Result<()>`, panika
+    // jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
+    let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel(200);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut last_db_update = Instant::now();
             let mut db_inserted = 0;
 
@@ -654,18 +659,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 };
 
                 if chunk_len > 0 {
-                    let tx_trans = conn_ref.transaction().unwrap();
+                    let tx_trans = conn_ref.transaction()?;
                     {
                         // OPTYMALIZACJA: prepare_cached
                         let mut stmt = match &msg {
                             ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(
                                 "UPDATE files SET entropy_ufs = COALESCE(?1, entropy_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3"
-                            ).unwrap(),
+                            )?,
                             ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(
                                 "UPDATE files SET entropy_script = COALESCE(?1, entropy_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3"
-                            ).unwrap(),
+                            )?,
                         };
-                        
+
                         let chunk = match &msg {
                             ScanMsg::UfsChunk(c) => c,
                             ScanMsg::ScriptChunk(c) => c,
@@ -673,11 +678,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                         for res in chunk {
                             if res.entropy.is_some() || res.io_error == Some(true) {
-                                stmt.execute(params![res.entropy, res.io_error, res.id]).unwrap();
+                                stmt.execute(params![res.entropy, res.io_error, res.id])?;
                             }
                         }
                     }
-                    tx_trans.commit().unwrap();
+                    tx_trans.commit()?;
                 }
 
                 db_inserted += chunk_len;
@@ -689,6 +694,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 }
             }
             let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Entropie w 100% zsynchronizowane z SQLite.".to_string() });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -752,7 +758,22 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
             drop(tx_db);
         }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 7 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
+            }
+        }
     });
+    wynik_zapisu?;
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
