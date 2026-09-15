@@ -79,12 +79,14 @@ pub fn init(log_dir: &str, log_level: &str, max_threads: usize, io_mode: &str) -
     // jego bezpiecznie obsłużona panika i tak zniszczyłaby ekran TUI:
     //   - `raw_image`   → rawloader (DNG) - tu panika ZAOBSERWOWANA w praktyce,
     //   - `heic_image`  → libheif (HEIC/HEIF/AVIF),
-    //   - `video_image` → crate mp4 (MP4/MOV/M4V).
+    //   - `video_image` → crate mp4 (MP4/MOV/M4V),
+    //   - `generic_image` → crate image (jpg/jpeg/png/webp/bmp/tif/tiff/gif, Faza 13).
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let expected = crate::raw_image::is_expected_panic_in_progress()
             || crate::heic_image::is_expected_panic_in_progress()
-            || crate::video_image::is_expected_panic_in_progress();
+            || crate::video_image::is_expected_panic_in_progress()
+            || crate::generic_image::is_expected_panic_in_progress();
         if expected {
             // Oczekiwana, bezpiecznie obsługiwana panika (np. rawloader na
             // uszkodzonym DNG) - logujemy jako ostrzeżenie, ale NIE ruszamy

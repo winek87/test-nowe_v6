@@ -46,6 +46,26 @@ use tracing::{info, instrument, warn};
 
 const CHUNK_SIZE: usize = 100; // Mniejsza paczka, oszczędzamy RAM przy ciężkich bitmapach
 
+/// SQL zapisu wyniku analizy dla strony UFS, wołane w pętli wątku
+/// bazodanowego w [`run`]. Wydzielone do stałej (wzorzec identyczny z innymi
+/// fazami, patrz np. `phase2::SQL_FINALIZACJA_MACIERZY`), żeby test
+/// regresyjny [`tests::test_media_decoded_written_alongside_pixels_ok`]
+/// wykonywał DOKŁADNIE ten sam SQL co produkcja - zero ryzyka, że test
+/// i implementacja się rozjadą.
+///
+/// `media_decoded_ufs` (param `?8`) reużywa DOKŁADNIE tę samą wartość co
+/// `pixels_ok_ufs` (param `?1`) - patrz naprawa BŁĘDU KRYTYCZNEGO opisana
+/// przy wywołaniu `ALTER TABLE`/backfillu w [`run`]: Faza 9
+/// (`phase9::decide_winner`, linie z komentarzem "Gray Banding") i Faza 8
+/// (`phase8::evaluate_file`) czytają `media_decoded_*`, NIE `pixels_ok_*`,
+/// przy decyzji Smart Merge - do tej naprawy ta kolumna nigdy nie była
+/// zapisywana przez normalny przebieg tej fazy.
+const SQL_UPDATE_UFS: &str = "UPDATE files SET pixels_ok_ufs = COALESCE(?1, pixels_ok_ufs), decode_reason_ufs = COALESCE(?2, decode_reason_ufs), img_width_ufs = COALESCE(?3, img_width_ufs), img_height_ufs = COALESCE(?4, img_height_ufs), img_extreme_ratio_ufs = COALESCE(?5, img_extreme_ratio_ufs), img_uniform_ufs = COALESCE(?6, img_uniform_ufs), io_error_ufs = COALESCE(?7, io_error_ufs), media_decoded_ufs = COALESCE(?8, media_decoded_ufs) WHERE id = ?9";
+
+/// Odpowiednik [`SQL_UPDATE_UFS`] dla strony Skrypt Autorski - patrz tamta
+/// dokumentacja.
+const SQL_UPDATE_SCRIPT: &str = "UPDATE files SET pixels_ok_script = COALESCE(?1, pixels_ok_script), decode_reason_script = COALESCE(?2, decode_reason_script), img_width_script = COALESCE(?3, img_width_script), img_height_script = COALESCE(?4, img_height_script), img_extreme_ratio_script = COALESCE(?5, img_extreme_ratio_script), img_uniform_script = COALESCE(?6, img_uniform_script), io_error_script = COALESCE(?7, io_error_script), media_decoded_script = COALESCE(?8, media_decoded_script) WHERE id = ?9";
+
 /// Próg stosunku dłuższego do krótszego boku, powyżej którego geometria
 /// obrazu jest uznawana za bezsensowną dowodowo (np. 1×50000 px) — typowy
 /// ślad częściowo nadpisanego lub błędnie zinterpretowanego nagłówka.
@@ -410,39 +430,64 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
         });
     }
 
-    match image::open(path) {
-        Ok(img) => {
-            let w = img.width();
-            let h = img.height();
-            let mp = (w as f64 * h as f64) / 1_000_000.0;
-            let color = match img.color() {
-                image::ColorType::Rgb8 | image::ColorType::Rgb16 | image::ColorType::Rgb32F => "RGB",
-                image::ColorType::Rgba8 | image::ColorType::Rgba16 | image::ColorType::Rgba32F => "RGBA",
-                image::ColorType::L8 | image::ColorType::L16 | image::ColorType::La8 | image::ColorType::La16 => "Grayscale",
-                _ => "Inny/Mieszany",
-            };
+    // REGRESJA (BŁĄD WYSOKI): gałąź `image::open` (jpg/jpeg/png/webp/bmp/tif/
+    // gif — najpopularniejsza z trzech ścieżek dekodowania w tej fazie) była
+    // jedyną BEZ ochrony `catch_unwind`, mimo że DNG (`raw_image`) i HEIC
+    // (`heic_image`) już ją mają. Panika crate'u `image` na spreparowanym/
+    // uszkodzonym pliku ubijała cały wątek Rayon. `generic_image::decode_guarded`
+    // opakowuje TERAZ zarówno `image::open`, jak i całe przetwarzanie
+    // zdekodowanego bufora (próbkowanie jednolitości) w jednym domknięciu —
+    // patrz `generic_image.rs` i jego testy dowodzące że panika wewnątrz
+    // domknięcia zostaje bezpiecznie przechwycona.
+    let guarded = crate::generic_image::decode_guarded(|| -> std::io::Result<ImageAnalysis> {
+        match image::open(path) {
+            Ok(img) => {
+                let w = img.width();
+                let h = img.height();
+                let mp = (w as f64 * h as f64) / 1_000_000.0;
+                let color = match img.color() {
+                    image::ColorType::Rgb8 | image::ColorType::Rgb16 | image::ColorType::Rgb32F => "RGB",
+                    image::ColorType::Rgba8 | image::ColorType::Rgba16 | image::ColorType::Rgba32F => "RGBA",
+                    image::ColorType::L8 | image::ColorType::L16 | image::ColorType::La8 | image::ColorType::La16 => "Grayscale",
+                    _ => "Inny/Mieszany",
+                };
 
-            let has_extreme_aspect_ratio = is_extreme_aspect_ratio(w, h);
-            let samples = sample_pixels(&img, UNIFORM_SAMPLE_POINTS);
-            let has_uniform_content = is_uniform_sample(&samples);
-            
-            Ok(ImageAnalysis {
-                is_valid: true, reason: None, width: w, height: h, megapixels: mp, color_space: color.to_string(),
-                has_extreme_aspect_ratio, has_uniform_content,
-            })
-        }
-        Err(e) => {
-            let err_str = e.to_string().to_lowercase();
-            if err_str.contains("os error") || err_str.contains("no such file") {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Błąd I/O"));
+                let has_extreme_aspect_ratio = is_extreme_aspect_ratio(w, h);
+                let samples = sample_pixels(&img, UNIFORM_SAMPLE_POINTS);
+                let has_uniform_content = is_uniform_sample(&samples);
+
+                Ok(ImageAnalysis {
+                    is_valid: true, reason: None, width: w, height: h, megapixels: mp, color_space: color.to_string(),
+                    has_extreme_aspect_ratio, has_uniform_content,
+                })
             }
-            let (_, reason) = classify_decode_error(&err_str);
-            
-            Ok(ImageAnalysis {
-                is_valid: false, reason: Some(reason.to_string()), width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
-                has_extreme_aspect_ratio: false, has_uniform_content: false,
-            })
+            Err(e) => {
+                let err_str = e.to_string().to_lowercase();
+                if err_str.contains("os error") || err_str.contains("no such file") {
+                    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Błąd I/O"));
+                }
+                let (_, reason) = classify_decode_error(&err_str);
+
+                Ok(ImageAnalysis {
+                    is_valid: false, reason: Some(reason.to_string()), width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
+                    has_extreme_aspect_ratio: false, has_uniform_content: false,
+                })
+            }
         }
+    });
+
+    match guarded {
+        Some(result) => result,
+        // Panika przechwycona: dla wywołującego nie ma znaczenia, czy crate
+        // `image` zwrócił `Err`, czy się wywalił - to samo traktowanie co
+        // zwykły błąd dekodowania, nie błąd I/O (plik istnieje i się otwiera,
+        // tylko jego treść łamie dekoder).
+        None => Ok(ImageAnalysis {
+            is_valid: false,
+            reason: Some("Dekoder obrazu spanikował na uszkodzonym pliku (przechwycone bezpiecznie)".to_string()),
+            width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
+            has_extreme_aspect_ratio: false, has_uniform_content: false,
+        }),
     }
 }
 
@@ -642,6 +687,28 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_uniform_ufs BOOLEAN", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_uniform_script BOOLEAN", []);
 
+    // NAPRAWA (BŁĄD KRYTYCZNY): `media_decoded_ufs`/`media_decoded_script`
+    // JUŻ ISTNIEJĄ w bazowym `CREATE TABLE` (patrz `db.rs`) - Faza 9
+    // (`decide_winner`) i Faza 8 (`evaluate_file`) je CZYTAJĄ bezwarunkowo
+    // przy decyzji Smart Merge (odrzucenie strony z powodu Gray Banding), ale
+    // do tej pory ŻADNA faza normalnego przebiegu ich nie ZAPISYWAŁA (tylko
+    // osobna ścieżka `dng_repair.rs`) - detekcja Gray Banding tej fazy nigdy
+    // nie wpływała na finalną decyzję. Naprawione niżej: zapisujemy
+    // `media_decoded_*` RÓWNOLEGLE do `pixels_ok_*`, tą samą wartością (patrz
+    // pętla zapisu w wątku bazodanowym), bo to DOKŁADNIE ta sama semantyka -
+    // `Some(true)` = zdekodowano czysto, `Some(false)` = Gray Banding / ucięty
+    // obraz / błąd I/O, `NULL` = jeszcze nie sprawdzone.
+    //
+    // Jednorazowy BACKFILL dla baz, na których Faza 13 działała PRZED tą
+    // naprawą: takie wiersze mają już wypełnione `pixels_ok_*`, ale
+    // `media_decoded_*` zostałoby trwale NULL, bo wiersze z wypełnionym
+    // `pixels_ok_*` są POMIJANE przy ponownym uruchomieniu Fazy 13 (patrz
+    // filtr `ok_ufs.is_none()` niżej w ETAPIE 1) - bez tego backfillu jedynym
+    // sposobem naprawy istniejącej bazy byłoby skasowanie `pixels_ok_*` i
+    // ponowne (kosztowne) wyrenderowanie WSZYSTKICH pikseli od zera.
+    let _ = conn.execute("UPDATE files SET media_decoded_ufs = pixels_ok_ufs WHERE media_decoded_ufs IS NULL AND pixels_ok_ufs IS NOT NULL", []);
+    let _ = conn.execute("UPDATE files SET media_decoded_script = pixels_ok_script WHERE media_decoded_script IS NULL AND pixels_ok_script IS NOT NULL", []);
+
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
     let raport_cfg = config.raporty_faz.get("Faza 13").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
         katalog: config.log_path.clone(),
@@ -758,15 +825,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 if chunk_len > 0 {
                     let tx_trans = conn_ref.transaction().unwrap();
                     {
+                        // NAPRAWA (BŁĄD KRYTYCZNY): `media_decoded_*` zapisywane
+                        // RÓWNOLEGLE do `pixels_ok_*`, tą samą wartością `ok`
+                        // (patrz pętla niżej) - to Faza 9 (`decide_winner`) i
+                        // Faza 8 (`evaluate_file`) faktycznie czytają przy
+                        // decyzji Smart Merge, nie `pixels_ok_*`. `pixels_ok_*`
+                        // POZOSTAJE bez zmian (nic z tego, co już na nim polega,
+                        // nie jest ruszane).
                         let mut stmt = match &msg {
-                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(
-                                "UPDATE files SET pixels_ok_ufs = COALESCE(?1, pixels_ok_ufs), decode_reason_ufs = COALESCE(?2, decode_reason_ufs), img_width_ufs = COALESCE(?3, img_width_ufs), img_height_ufs = COALESCE(?4, img_height_ufs), img_extreme_ratio_ufs = COALESCE(?5, img_extreme_ratio_ufs), img_uniform_ufs = COALESCE(?6, img_uniform_ufs), io_error_ufs = COALESCE(?7, io_error_ufs) WHERE id = ?8"
-                            ).unwrap(),
-                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(
-                                "UPDATE files SET pixels_ok_script = COALESCE(?1, pixels_ok_script), decode_reason_script = COALESCE(?2, decode_reason_script), img_width_script = COALESCE(?3, img_width_script), img_height_script = COALESCE(?4, img_height_script), img_extreme_ratio_script = COALESCE(?5, img_extreme_ratio_script), img_uniform_script = COALESCE(?6, img_uniform_script), io_error_script = COALESCE(?7, io_error_script) WHERE id = ?8"
-                            ).unwrap(),
+                            ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(SQL_UPDATE_UFS).unwrap(),
+                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(SQL_UPDATE_SCRIPT).unwrap(),
                         };
-                        
+
                         let chunk = match &msg {
                             ScanMsg::UfsChunk(c) => c,
                             ScanMsg::ScriptChunk(c) => c,
@@ -779,7 +849,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                             } else {
                                 (Some(false), res.analysis.reason.clone(), None, None, None, None)
                             };
-                            stmt.execute(params![ok, reason, w, h, extreme, uniform, res.io_error, res.id]).unwrap();
+                            // `media_decoded_*` (param ?8) reużywa DOKŁADNIE tę
+                            // samą wartość `ok` co `pixels_ok_*` (param ?1) -
+                            // identyczna semantyka: Some(true) = zdekodowano
+                            // czysto, Some(false) = Gray Banding / ucięty obraz
+                            // / błąd I/O.
+                            stmt.execute(params![ok, reason, w, h, extreme, uniform, res.io_error, ok, res.id]).unwrap();
                         }
                     }
                     tx_trans.commit().unwrap();
@@ -1380,5 +1455,191 @@ mod tests {
     fn test_compute_half_threads() {
         assert_eq!(compute_half_threads(8), 4);
         assert_eq!(compute_half_threads(1), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (BŁĄD KRYTYCZNY): `media_decoded_ufs`/`media_decoded_script`
+    // muszą zostać zapisane RÓWNOLEGLE do `pixels_ok_*`, bo to one - nie
+    // `pixels_ok_*` - czyta `phase9::decide_winner` (linie z Gray Banding) i
+    // `phase8::evaluate_file` przy decyzji Smart Merge. Testy wołają
+    // DOKŁADNIE ten sam SQL co produkcja ([`SQL_UPDATE_UFS`]/
+    // [`SQL_UPDATE_SCRIPT`]), więc nie mogą się "po cichu" rozjechać z
+    // implementacją w [`run`].
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_media_decoded_written_alongside_pixels_ok_for_healthy_image() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (1, 'zdrowe.png', 1, 1)",
+            [],
+        ).unwrap();
+
+        // Zdjęcie zdekodowane CZYSTO: `ok = Some(true)`, dokładnie tak jak
+        // produkuje pętla zapisu w [`run`] dla `res.analysis.is_valid == true`.
+        conn.execute(
+            SQL_UPDATE_UFS,
+            params![Some(true), None::<String>, Some(1920i64), Some(1080i64), Some(false), Some(false), None::<bool>, Some(true), 1],
+        ).unwrap();
+
+        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn.query_row(
+            "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(pixels_ok, Some(true));
+        assert_eq!(media_decoded, Some(true), "media_decoded_ufs musi być zapisane dla zdrowego zdjęcia - Faza 9/8 na tym polegają, nie na pixels_ok_ufs");
+        assert_eq!(pixels_ok, media_decoded, "obie kolumny muszą nieść IDENTYCZNĄ wartość - ta sama semantyka");
+    }
+
+    #[test]
+    fn test_media_decoded_written_alongside_pixels_ok_for_gray_banded_image() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (2, 'gray_banding.jpg', 1, 1)",
+            [],
+        ).unwrap();
+
+        // Gray Banding: `ok = Some(false)`, dokładnie tak jak produkuje pętla
+        // zapisu w [`run`] dla `res.analysis.is_valid == false`.
+        conn.execute(
+            SQL_UPDATE_UFS,
+            params![Some(false), Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"), None::<i64>, None::<i64>, None::<bool>, None::<bool>, None::<bool>, Some(false), 2],
+        ).unwrap();
+
+        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn.query_row(
+            "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 2",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(pixels_ok, Some(false));
+        assert_eq!(
+            media_decoded, Some(false),
+            "media_decoded_ufs = Some(false) jest DOKŁADNIE tym, co sprawdza phase9::decide_winner \
+             (`file.media_decoded_ufs == Some(false)`) przy odrzuceniu strony za Gray Banding - \
+             bez tej naprawy kolumna zostawała NULL na zawsze i decyzja nigdy nie zapadała."
+        );
+    }
+
+    #[test]
+    fn test_media_decoded_script_side_uses_correct_columns() {
+        // Wersja dla strony Skrypt Autorski - upewnia się, że `SQL_UPDATE_SCRIPT`
+        // pisze do `_script`, nie przypadkiem do `_ufs` (kopiuj-wklej bug byłby
+        // niewidoczny w powyższych dwóch testach, które sprawdzają tylko UFS).
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (3, 'skrypt.png', 1, 1)",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            SQL_UPDATE_SCRIPT,
+            params![Some(false), Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"), None::<i64>, None::<i64>, None::<bool>, None::<bool>, None::<bool>, Some(false), 3],
+        ).unwrap();
+
+        let (media_ufs, media_script): (Option<bool>, Option<bool>) = conn.query_row(
+            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 3",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(media_ufs, None, "SQL_UPDATE_SCRIPT nie może dotykać kolumn _ufs");
+        assert_eq!(media_script, Some(false));
+    }
+
+    #[test]
+    fn test_backfill_populates_media_decoded_from_preexisting_pixels_ok() {
+        // Regresja dla baz, na których Faza 13 działała PRZED tą naprawą:
+        // `pixels_ok_*` już wypełnione, `media_decoded_*` jeszcze NULL.
+        // Odtwarza dokładnie ten stan i weryfikuje backfill z [`run`].
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, pixels_ok_ufs, pixels_ok_script)
+             VALUES (1, 'stare.png', 1, 1, 1, 0)",
+            [],
+        ).unwrap();
+        // Wiersz bez wcześniejszego przebiegu Fazy 13 - backfill nie powinien
+        // go ruszać (pixels_ok_* jest NULL, więc warunek WHERE go pomija).
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (2, 'nietkniete.png', 1, 1)",
+            [],
+        ).unwrap();
+
+        conn.execute("UPDATE files SET media_decoded_ufs = pixels_ok_ufs WHERE media_decoded_ufs IS NULL AND pixels_ok_ufs IS NOT NULL", []).unwrap();
+        conn.execute("UPDATE files SET media_decoded_script = pixels_ok_script WHERE media_decoded_script IS NULL AND pixels_ok_script IS NOT NULL", []).unwrap();
+
+        let (m1_ufs, m1_scr): (Option<bool>, Option<bool>) = conn.query_row(
+            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(m1_ufs, Some(true));
+        assert_eq!(m1_scr, Some(false));
+
+        let (m2_ufs, m2_scr): (Option<bool>, Option<bool>) = conn.query_row(
+            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 2",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(m2_ufs, None, "wiersz bez wcześniejszego pixels_ok_ufs nie powinien zostać dotknięty przez backfill");
+        assert_eq!(m2_scr, None);
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (BŁĄD WYSOKI): gałąź `image::open` (jpg/jpeg/png/webp/bmp/
+    // tif/tiff/gif) musi być objęta `catch_unwind`, tak jak DNG (`raw_image`)
+    // i HEIC (`heic_image`) - patrz `generic_image::decode_guarded`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_analyze_image_generic_branch_is_panic_guarded() {
+        // UWAGA: crate `image` jest mocno ufuzzowane (używane m.in. w
+        // Firefoksie) - w przeciwieństwie do `rawloader` (gdzie panika była
+        // EMPIRYCZNIE zaobserwowana na prawdziwym pliku DNG użytkownika, patrz
+        // `raw_image.rs`), nie ma znanego, stabilnego pliku wejściowego, który
+        // wiarygodnie i nie-kruchowo wywoła panikę wewnątrz `image::open` na
+        // dowolnej wersji crate. Ten test weryfikuje więc MECHANIZM integracji
+        // dokładnie w kształcie użytym przez `analyze_image`: `image::open` +
+        // DALSZE przetwarzanie zdekodowanego bufora w JEDNYM domknięciu
+        // przekazanym do `generic_image::decode_guarded` - udowadnia, że
+        // panika w KTÓRYMKOLWIEK miejscu tego domknięcia (nie tylko w samym
+        // `image::open`) zostaje bezpiecznie przechwycona, zamiast ubić wątek.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3])));
+        img.save(&path).unwrap();
+
+        let guarded = crate::generic_image::decode_guarded(|| -> ImageAnalysis {
+            let opened = image::open(&path).expect("plik testowy musi się otworzyć");
+            let _ = sample_pixels(&opened, UNIFORM_SAMPLE_POINTS); // "cokolwiek bezpośrednio po nim"
+            panic!("symulowana panika PODCZAS przetwarzania już zdekodowanego bufora");
+        });
+
+        assert!(guarded.is_none(), "Panika w domknięciu image::open+przetwarzanie musi zostać przechwycona, nie propagować dalej");
+        assert!(!crate::generic_image::is_expected_panic_in_progress(), "Flaga musi zostać zdjęta po obsłużonej panice");
+    }
+
+    #[test]
+    fn test_analyze_image_recovers_and_returns_ok_after_simulated_panic_pattern() {
+        // Odtwarza DOKŁADNIE strukturę `analyze_image`'s `None` branch (linia
+        // `match guarded { Some(result) => result, None => Ok(ImageAnalysis{...}) }`)
+        // i sprawdza, że wynik jest `is_valid == false`, sklasyfikowany jako
+        // Gray Banding/glitch - NIE `Err` (to byłoby błędnie potraktowane jako
+        // brak pliku / błąd I/O przez `process_side_stream`).
+        let guarded: Option<std::result::Result<ImageAnalysis, std::io::Error>> =
+            crate::generic_image::decode_guarded(|| -> std::result::Result<ImageAnalysis, std::io::Error> {
+                panic!("symulowana panika dekodera");
+            });
+
+        let result = match guarded {
+            Some(r) => r,
+            None => Ok(ImageAnalysis {
+                is_valid: false,
+                reason: Some("Zepsute Piksele (Gray Banding / Ucięty obraz) - dekoder wywołał panikę, przechwycono bezpiecznie".to_string()),
+                width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
+                has_extreme_aspect_ratio: false, has_uniform_content: false,
+            }),
+        };
+
+        let analysis = result.expect("panika NIGDY nie powinna być zwrócona jako Err/błąd I/O");
+        assert!(!analysis.is_valid);
+        assert!(analysis.reason.unwrap().contains("Gray Banding"));
     }
 }

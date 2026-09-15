@@ -110,10 +110,24 @@ fn with_expected_panic_guard<T>(f: impl FnOnce() -> T) -> std::thread::Result<T>
 /// Rozpoznaje rozszerzenia obsługiwane przez ten moduł. MKV/WebM CELOWO
 /// pominięte — to inna rodzina kontenerów (Matroska, nie ISOBMFF), crate
 /// `mp4` ich nie obsługuje.
+/// Lista MUSI pokrywać się z `ROZSZERZENIA_MP4` w `repair_modules::mp4` —
+/// inaczej Faza 19 nie analizuje pliku wcale (`video_ok` zostaje trwale
+/// `NULL`), a moduły naprawcze MP4 tracą swój główny sygnał uszkodzenia
+/// dla całej podgrupy formatów. `.3gp`/`.3g2`/`.f4v` to ten sam kontener
+/// ISOBMFF pod innym rozszerzeniem nazwy.
 pub fn is_video_extension(path_str: &str) -> bool {
     let lower = path_str.to_lowercase();
     lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".m4v")
+        || lower.ends_with(".3gp") || lower.ends_with(".3g2") || lower.ends_with(".f4v")
 }
+
+/// Górny limit rozmiaru pliku wczytywanego w całości do pamięci przed
+/// diagnozą. Ten sam próg i to samo uzasadnienie co
+/// `mp4_engines::boxes::LIMIT_DIAGNOZY_W_RAM`: Faza 19 przetwarza pliki
+/// równolegle (Rayon), więc szczyt zużycia RAM to wielokrotność tej
+/// wartości — bez granicy pojedynczy plik wideo 4K/8K rzędu kilkunastu GB
+/// gwarantuje OOM.
+const LIMIT_DIAGNOZY_W_RAM: u64 = 256 * 1024 * 1024; // 256 MB
 
 /// Odczytuje strukturę kontenera z bufora w pamięci. `Ok` = kontener spójny,
 /// `Err(VideoDamage)` = sklasyfikowane uszkodzenie.
@@ -134,7 +148,15 @@ pub fn read_video_bytes(bytes: &[u8]) -> std::result::Result<VideoInfo, VideoDam
 }
 
 /// Wariant [`read_video_bytes`] operujący na pliku na dysku.
+/// Odmawia wczytania plików większych niż [`LIMIT_DIAGNOZY_W_RAM`] — zwraca
+/// `VideoDamage::Other`, ten sam wariant, którym `phase19_video` już
+/// oznacza porażki odczytu I/O, więc zachowanie orkiestratora się nie
+/// zmienia.
 pub fn read_video_file(path: &Path) -> std::result::Result<VideoInfo, VideoDamage> {
+    let rozmiar = std::fs::metadata(path).map_err(|_| VideoDamage::Other)?.len();
+    if rozmiar > LIMIT_DIAGNOZY_W_RAM {
+        return Err(VideoDamage::Other);
+    }
     let bytes = std::fs::read(path).map_err(|_| VideoDamage::Other)?;
     read_video_bytes(&bytes)
 }
@@ -256,6 +278,22 @@ mod tests {
         assert!(read_video_file(Path::new("/nie/ma/takiego.mp4")).is_err());
     }
 
+    /// REGRESJA: plik większy niż `LIMIT_DIAGNOZY_W_RAM` musi zostać
+    /// odrzucony PRZED próbą wczytania go w całości do pamięci — inaczej
+    /// równoległe przetwarzanie kilkunastogigabajtowych plików 4K/8K przez
+    /// Rayon gwarantuje OOM. Plik rzadki (sparse) - `set_len` nie alokuje
+    /// fizycznie tych bajtów na dysku, więc test jest szybki i tani.
+    #[test]
+    fn test_read_video_file_odrzuca_plik_wiekszy_niz_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("ogromny.mp4");
+        let plik = std::fs::File::create(&sciezka).unwrap();
+        plik.set_len(LIMIT_DIAGNOZY_W_RAM + 1).unwrap();
+        drop(plik);
+
+        assert_eq!(read_video_file(&sciezka), Err(VideoDamage::Other));
+    }
+
     // ------------------------------------------------------------------
     // is_video_extension
     // ------------------------------------------------------------------
@@ -266,6 +304,16 @@ mod tests {
         assert!(is_video_extension("FILM.MP4"));
         assert!(is_video_extension("film.mov"));
         assert!(is_video_extension("film.m4v"));
+    }
+
+    /// REGRESJA: te trzy rozszerzenia to ten sam kontener ISOBMFF, a
+    /// `repair_modules::mp4::ROZSZERZENIA_MP4` już je obejmowała - bez tego
+    /// Faza 19 nigdy nie ustawiała `video_ok` dla `.3gp`/`.3g2`/`.f4v`.
+    #[test]
+    fn test_is_video_extension_obejmuje_3gp_3g2_f4v() {
+        assert!(is_video_extension("clip.3gp"));
+        assert!(is_video_extension("CLIP.3G2"));
+        assert!(is_video_extension("clip.f4v"));
     }
 
     #[test]

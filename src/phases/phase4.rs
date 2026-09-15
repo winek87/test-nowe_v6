@@ -499,6 +499,42 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 }
 
 // ============================================================================
+// ZAPYTANIA SQL FINALIZACJI (wydzielone, żeby dały się testować bez
+// duplikowania treści — patrz analogiczne wydzielenie w Fazie 2)
+// ============================================================================
+
+/// Domknięcie macierzy hashy dla domeny Fazy 4 (resztki/unikaty).
+///
+/// Warunek `size_match IS NULL OR size_match = 0` jest tu KONIECZNY, nie
+/// kosmetyczny: bez niego zapytanie łapało też wiersze z `size_match = 1` —
+/// pliki, którymi zajęła się już Faza 3 (zgodne rozmiarowo). Te pliki mają
+/// swój OSOBNY stan ukończenia (`phase3_done`) i własne liczniki w raporcie
+/// Fazy 3; nadpisanie im tu `phase4_done = 1` powodowało PODWÓJNE liczenie
+/// tego samego pliku w statystykach obu faz naraz.
+const SQL_FINALIZACJA_HASHY: &str = "UPDATE files SET
+            hash_match = CASE
+                WHEN io_error_ufs = 1 OR io_error_script = 1 THEN NULL
+                WHEN hash_ufs IS NULL OR hash_script IS NULL THEN NULL
+                WHEN hash_ufs = hash_script THEN 1
+                ELSE 0
+            END,
+            phase4_done = CASE
+                WHEN (found_in_ufs = 0 OR hash_ufs IS NOT NULL OR io_error_ufs = 1)
+                 AND (found_in_script = 0 OR hash_script IS NOT NULL OR io_error_script = 1) THEN 1
+                ELSE 0
+            END
+         WHERE (phase4_done = 0 OR phase4_done IS NULL)
+           AND (size_match IS NULL OR size_match = 0)";
+
+/// Zapytanie raportu końcowego Fazy 4 — ten sam warunek `size_match` co w
+/// [`SQL_FINALIZACJA_HASHY`] powyżej, z tego samego powodu: raport ma liczyć
+/// wyłącznie pliki ze swojej domeny (resztki/unikaty), inaczej wliczyłby też
+/// pliki zgodne rozmiarowo, którymi zajmuje się i raportuje już Faza 3.
+const SQL_RAPORT_HASHY: &str = "SELECT relative_path, hash_match, magic_ok_ufs, magic_ok_script, found_in_ufs, found_in_script
+         FROM files
+         WHERE phase4_done = 1 AND (size_match IS NULL OR size_match = 0)";
+
+// ============================================================================
 // GŁÓWNA FUNKCJA KORDYNUJĄCA (Entrypoint Fazy 4)
 // ============================================================================
 
@@ -747,21 +783,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let _ = tx_ui.send(PhaseEvent::Log("Trwa korelacja resztek i budowa macierzy w SQLite...".to_string()));
     
-    conn.execute(
-        "UPDATE files SET 
-            hash_match = CASE 
-                WHEN io_error_ufs = 1 OR io_error_script = 1 THEN NULL
-                WHEN hash_ufs IS NULL OR hash_script IS NULL THEN NULL 
-                WHEN hash_ufs = hash_script THEN 1 
-                ELSE 0 
-            END, 
-            phase4_done = CASE 
-                WHEN (found_in_ufs = 0 OR hash_ufs IS NOT NULL OR io_error_ufs = 1) 
-                 AND (found_in_script = 0 OR hash_script IS NOT NULL OR io_error_script = 1) THEN 1 
-                ELSE 0 
-            END
-         WHERE phase4_done = 0 OR phase4_done IS NULL", []
-    )?;
+    conn.execute(SQL_FINALIZACJA_HASHY, [])?;
 
     // --- ETAP 5: GENEROWANIE RAPORTU KRYMINALISTYCZNEGO ---
     let mut spoofing_matrix_ufs: HashMap<String, Vec<String>> = HashMap::new();
@@ -769,7 +791,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut match_count = 0;
     let mut mismatch_count = 0;
 
-    let mut stmt = conn.prepare("SELECT relative_path, hash_match, magic_ok_ufs, magic_ok_script, found_in_ufs, found_in_script FROM files WHERE phase4_done = 1")?;
+    let mut stmt = conn.prepare(SQL_RAPORT_HASHY)?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?, 
@@ -1137,5 +1159,83 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats_ufs, start_time);
         assert!(block.contains("Poprawne sygnatury: 100"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regresja: pliki z domeny Fazy 3 (size_match = 1) NIE MOGĄ być liczone
+    // podwójnie przez finalizację/raport Fazy 4
+    // ------------------------------------------------------------------
+
+    fn wstaw_plik(
+        conn: &Connection,
+        id: i32,
+        rel: &str,
+        size_match: Option<i64>,
+        hash_ufs: Option<&str>,
+        hash_script: Option<&str>,
+        found_in_script: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_ufs, hash_script, io_error_ufs, io_error_script, phase4_done)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0, 0, 0)",
+            params![id, rel, found_in_script, size_match, hash_ufs, hash_script],
+        ).unwrap();
+    }
+
+    /// Plik ZGODNY rozmiarowo (`size_match = 1`) to domena Fazy 3, nie Fazy 4
+    /// — mimo że oba jego hashe są już policzone (przez Fazę 3, do TYCH
+    /// SAMYCH kolumn `hash_ufs`/`hash_script`), finalizacja Fazy 4 NIE MOŻE
+    /// go domknąć jako `phase4_done = 1`. Przed poprawką (brak filtra
+    /// `size_match` w `WHERE`) łapała go, dając podwójne liczenie tego
+    /// samego pliku w statystykach obu faz naraz.
+    #[test]
+    fn test_finalizacja_pomija_pliki_z_domeny_fazy_trzeciej() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        wstaw_plik(&conn, 1, "zgodny.jpg", Some(1), Some("abc"), Some("abc"), true);
+        wstaw_plik(&conn, 2, "unikat.jpg", None, Some("def"), None, false);
+
+        conn.execute(SQL_FINALIZACJA_HASHY, []).unwrap();
+
+        let phase4_zgodny: bool = conn.query_row(
+            "SELECT phase4_done FROM files WHERE id = 1", [], |r| r.get(0)
+        ).unwrap();
+        assert!(!phase4_zgodny, "plik z size_match=1 należy do Fazy 3 - Faza 4 nie może go domknąć");
+
+        let phase4_unikat: bool = conn.query_row(
+            "SELECT phase4_done FROM files WHERE id = 2", [], |r| r.get(0)
+        ).unwrap();
+        assert!(phase4_unikat, "plik unikalny (poza domeną Fazy 3) to właściwa domena Fazy 4 - musi zostać domknięty");
+    }
+
+    /// Raport końcowy Fazy 4 musi liczyć wyłącznie swoją domenę: gdyby
+    /// wliczał też wiersze `size_match = 1`, dałoby to podwójne liczenie
+    /// tego samego pliku w statystykach obu faz (Faza 3 też go raportuje).
+    /// Test symuluje nawet "zepsuty" stan sprzed poprawki (`phase4_done = 1`
+    /// na wierszu z `size_match = 1`) i pokazuje, że SAM raport i tak
+    /// odfiltrowuje taki wiersz po `size_match`.
+    #[test]
+    fn test_raport_pomija_pliki_z_domeny_fazy_trzeciej() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_match, phase4_done)
+             VALUES (1, 'zgodny.jpg', 1, 1, 1, 1, 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_match, phase4_done)
+             VALUES (2, 'unikat.jpg', 1, 0, NULL, NULL, 1)",
+            [],
+        ).unwrap();
+
+        let mut stmt = conn.prepare(SQL_RAPORT_HASHY).unwrap();
+        let sciezki: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            sciezki, vec!["unikat.jpg".to_string()],
+            "raport Fazy 4 nie może zawierać pliku z domeny Fazy 3, nawet jeśli ma phase4_done=1"
+        );
     }
 }

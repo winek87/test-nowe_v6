@@ -5,6 +5,7 @@
 
 mod raw_image;
 mod heic_image;
+mod generic_image;
 mod video_image;
 mod ts_stream;
 mod mkv_container;

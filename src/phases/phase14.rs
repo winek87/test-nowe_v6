@@ -93,17 +93,55 @@ fn classify_common_match_score(score: u32) -> &'static str {
     else { "HIGH" }
 }
 
+/// Próg odcięcia szumu CTPH dla korelacji plików UNIKALNYCH. ssdeep
+/// notorycznie zwraca niskie, przypadkowe dopasowania (kilka-kilkanaście
+/// procent) między zupełnie niepowiązanymi plikami binarnymi — to znany
+/// artefakt rolling-hash CTPH, nie sygnał realnego pokrewieństwa.
+/// `match_type == "PARTIAL"` jest bramką do FIZYCZNEGO zszycia bajtów
+/// (patrz `repair_modules::splice`), więc próg musi leżeć wyraźnie powyżej
+/// typowego poziomu szumu, nie tuż nad zerem — błąd klasyfikacji tutaj
+/// oznacza sklejenie dwóch niepowiązanych dowodów w jeden plik.
+const UNIQUE_MATCH_NOISE_FLOOR: u32 = 25;
+
 /// Klasyfikuje wynik korelacji krzyżowej DWÓCH RÓŻNYCH plików unikalnych
 /// (różne ścieżki, potencjalnie różne nazwy, znalezione tylko po jednej
-/// stronie). Tu `0%` to zwykły BRAK dopasowania (`"NONE"`), NIE anomalia —
-/// zdecydowana większość przypadkowych par plików unikalnych będzie miała
-/// zerowe podobieństwo, to oczekiwane, nie podejrzane (w przeciwieństwie do
+/// stronie). Tu wynik poniżej [`UNIQUE_MATCH_NOISE_FLOOR`] to zwykły BRAK
+/// dopasowania (`"NONE"`), NIE anomalia — zdecydowana większość
+/// przypadkowych par plików unikalnych będzie miała zerowe lub szumowe
+/// podobieństwo, to oczekiwane, nie podejrzane (w przeciwieństwie do
 /// [`classify_common_match_score`], gdzie ta sama ścieżka uzasadnia wyższe
 /// oczekiwania).
 fn classify_unique_match_score(score: u32) -> &'static str {
     if score >= 90 { "TWIN" }
-    else if score > 0 { "PARTIAL" }
+    else if score >= UNIQUE_MATCH_NOISE_FLOOR { "PARTIAL" }
     else { "NONE" }
+}
+
+/// Buduje wpisy `db_updates` dla KAŻDEGO pliku unikalnego strony Skrypt —
+/// symetrycznie do wyników korelacji UFS-owej. Czysta funkcja (bez I/O),
+/// więc testowalna bez bazy/dysku.
+///
+/// NAPRAWIONY BUG: wcześniej strona Skrypt (`unique_scr`) służyła w
+/// korelacji krzyżowej WYŁĄCZNIE jako bierny zbiór porównawczy — żaden plik
+/// unikalny dla Skryptu nigdy nie dostawał własnego wpisu `phase14_done=1`,
+/// więc był bez końca ponownie kolejkowany do korelacji przy każdym
+/// uruchomieniu fazy, a moduł zszywania w Fazie 17 nigdy nie widział go
+/// jako kandydata — mimo że po stronie UFS mógł istnieć bliźniak z
+/// `twin_file_path` wskazującym właśnie na niego. Ta funkcja gwarantuje, że
+/// KAŻDY `id` z `unique_scr_ids` dostaje dokładnie jeden wpis: albo z
+/// najlepszym znalezionym dopasowaniem (`scr_best`), albo jawne "NONE".
+fn buduj_symetryczne_wpisy_skryptu(
+    unique_scr_ids: &[i32],
+    scr_best: &HashMap<i32, (u32, String, i64, bool)>,
+) -> Vec<(i32, String, f64, Option<String>, i64, bool)> {
+    unique_scr_ids.iter().map(|s_id| {
+        if let Some((score, ufs_path, delta_dla_skryptu, ext_mismatch)) = scr_best.get(s_id) {
+            let m_type = classify_unique_match_score(*score).to_string();
+            (*s_id, m_type, *score as f64, Some(ufs_path.clone()), *delta_dla_skryptu, *ext_mismatch)
+        } else {
+            (*s_id, "NONE".to_string(), 0.0, None, 0, false)
+        }
+    }).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +657,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut common_rows = Vec::new();
     let mut unique_ufs = Vec::new();
     let mut unique_scr = Vec::new();
+    // NAPRAWIONY BUG (rozjazd stron / nieskończona re-analiza): pliki
+    // jednostronne, dla których hashowanie CTPH się nie powiodło (io_error,
+    // za małe dla ssdeep) wcześniej nie trafiały ANI do `unique_ufs`/
+    // `unique_scr` (bo `h_u`/`h_s` to `None`), ANI do `common_rows` (bo są
+    // jednostronne) — więc nigdy nie dostawały `phase14_done=1` i były
+    // ponownie kolejkowane w KAŻDYM kolejnym uruchomieniu fazy, w
+    // nieskończoność. Zbierane tu osobno, dostają wprost wpis "NONE".
+    let mut unhashable_unique: Vec<i32> = Vec::new();
 
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?))
@@ -629,6 +675,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         if in_u && in_s { common_rows.push(HashRow { id, rel_path: rel, hash_u: h_u, hash_s: h_s }); }
         else if in_u && h_u.is_some() { unique_ufs.push((id, rel, h_u.unwrap())); }
         else if in_s && let Some(h) = h_s { unique_scr.push((id, rel, h)); }
+        else { unhashable_unique.push(id); }
     }
     drop(stmt);
 
@@ -708,16 +755,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         unique_ufs.par_iter().map(|(u_id, u_path, u_hash)| {
             let ext_ufs = Path::new(&u_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
             let mut best_score = 0;
+            let mut best_match_id: Option<i32> = None;
             let mut best_match_path = None;
             let mut delta = 0;
             let mut ext_mismatch = false;
 
             if !CANCEL_SIGNAL.load(Ordering::Relaxed) {
-                for (_, s_path, s_hash) in &unique_scr {
+                for (s_id, s_path, s_hash) in &unique_scr {
                     if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
                     if let Ok(score) = ssdeep::compare(u_hash, s_hash)
                         && score > best_score {
                             best_score = score;
+                            best_match_id = Some(*s_id);
                             best_match_path = Some(s_path.clone());
                             if score == 100 { break; }
                         }
@@ -750,14 +799,33 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                     });
                 }
 
-            (*u_id, u_path.clone(), best_score, best_match_path, delta, ext_mismatch, ext_ufs)
+            (*u_id, u_path.clone(), best_score, best_match_id, best_match_path, delta, ext_mismatch, ext_ufs)
         }).collect()
     };
 
-    for (u_id, u_path, score, best_path, delta, ext_mismatch, ext_ufs) in cross_results {
+    // NAPRAWIONY BUG (rozjazd stron / nieskończona re-analiza): tylko strona
+    // UFS otrzymywała wpis `phase14_done=1` z tej pętli — strona Skrypt
+    // (`unique_scr`) służyła wyłącznie jako bierny zbiór porównawczy, więc
+    // pliki unikalne dla Skryptu były bez końca ponownie kolejkowane do
+    // korelacji przy każdym uruchomieniu fazy, a moduł zszywania w Fazie 17
+    // nigdy ich nie widział jako kandydatów mimo istniejącego bliźniaka po
+    // stronie UFS. `scr_best` zbiera NAJLEPSZE dopasowanie per plik Skryptu
+    // (jeden plik Skryptu może być najlepszym kandydatem dla wielu plików
+    // UFS — bierzemy zwycięzcę po najwyższym wyniku), żeby druga pętla mogła
+    // zapisać dla niego symetryczny wpis zamiast zostawić go bez wpisu.
+    let mut scr_best: HashMap<i32, (u32, String, i64, bool)> = HashMap::new();
+
+    for (u_id, u_path, score, best_id, best_path, delta, ext_mismatch, ext_ufs) in cross_results {
         if score > 0 { live_total_delta.fetch_add(delta.abs(), Ordering::Relaxed); }
 
         let m_type = classify_unique_match_score(score as u32).to_string();
+        let ma_zaliczone_dopasowanie = m_type != "NONE";
+        // Poniżej progu szumu (patrz `UNIQUE_MATCH_NOISE_FLOOR`) nie
+        // zapisujemy ani ścieżki, ani delty — to jest klasyfikowane jak
+        // BRAK dopasowania, więc nie ma po co zostawiać śladu sugerującego
+        // realny związek między plikami.
+        let zapisywana_sciezka = if ma_zaliczone_dopasowanie { best_path.clone() } else { None };
+
         match m_type.as_str() {
             "TWIN" => {
                 live_twins.fetch_add(1, Ordering::Relaxed);
@@ -766,13 +834,35 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let p = best_path.clone().unwrap_or_default();
                 let d_str = format_delta(delta);
                 let bad_ext_flag = if ext_mismatch { " [ZŁY TYP!]" } else { "" };
-                let _ = writeln!(log_twins.lock().unwrap(), "[{:<4}] [{:>3}%] [Δ: {:>10}]{} UFS: \"{}\" <---> Skrypt: \"{}\"", 
+                let _ = writeln!(log_twins.lock().unwrap(), "[{:<4}] [{:>3}%] [Δ: {:>10}]{} UFS: \"{}\" <---> Skrypt: \"{}\"",
                     ext_ufs, score, d_str, bad_ext_flag, u_path, p);
             }
             "PARTIAL" => { live_partial.fetch_add(1, Ordering::Relaxed); }
             _ => {}
         }
-        db_updates.push((u_id, m_type, score as f64, best_path, delta, ext_mismatch));
+        db_updates.push((u_id, m_type, score as f64, zapisywana_sciezka, delta, ext_mismatch));
+
+        if ma_zaliczone_dopasowanie
+            && let Some(sid) = best_id {
+                let wpis_lustrzany = (score as u32, u_path.clone(), -delta, ext_mismatch);
+                scr_best.entry(sid)
+                    .and_modify(|istniejacy| if wpis_lustrzany.0 > istniejacy.0 { *istniejacy = wpis_lustrzany.clone(); })
+                    .or_insert(wpis_lustrzany);
+            }
+    }
+
+    // Symetryczny wpis dla KAŻDEGO pliku unikalnego strony Skrypt — z
+    // najlepszym znalezionym dopasowaniem (jeśli jakiekolwiek przekroczyło
+    // próg szumu) albo z jawnym "NONE", żeby dostał `phase14_done=1` i nie
+    // był bez końca re-analizowany. Wydzielone do czystej funkcji — patrz
+    // testy `buduj_symetryczne_wpisy_skryptu`.
+    let unique_scr_ids: Vec<i32> = unique_scr.iter().map(|(id, _, _)| *id).collect();
+    db_updates.extend(buduj_symetryczne_wpisy_skryptu(&unique_scr_ids, &scr_best));
+
+    // NAPRAWIONY BUG: pliki jednostronne bez policzonego hasha (błąd I/O,
+    // za małe dla ssdeep) — patrz `unhashable_unique` przy budowie zadań.
+    for id in &unhashable_unique {
+        db_updates.push((*id, "NONE".to_string(), 0.0, None, 0, false));
     }
 
     if correlation_cancelled {
@@ -978,9 +1068,19 @@ mod tests {
         assert_eq!(classify_unique_match_score(0), "NONE");
     }
 
+    /// REGRESJA (Gemini review): wynik poniżej progu szumu CTPH nie może
+    /// kwalifikować się jako "PARTIAL" — to typowy przypadkowy szum ssdeep
+    /// między zupełnie niepowiązanymi plikami, a "PARTIAL" jest bramką do
+    /// fizycznego zszycia bajtów w Fazie 17.
     #[test]
-    fn test_classify_unique_below_90_is_partial() {
-        assert_eq!(classify_unique_match_score(1), "PARTIAL");
+    fn test_classify_unique_below_noise_floor_is_none_not_partial() {
+        assert_eq!(classify_unique_match_score(1), "NONE");
+        assert_eq!(classify_unique_match_score(UNIQUE_MATCH_NOISE_FLOOR - 1), "NONE");
+    }
+
+    #[test]
+    fn test_classify_unique_from_noise_floor_below_90_is_partial() {
+        assert_eq!(classify_unique_match_score(UNIQUE_MATCH_NOISE_FLOOR), "PARTIAL");
         assert_eq!(classify_unique_match_score(89), "PARTIAL");
     }
 
@@ -988,6 +1088,64 @@ mod tests {
     fn test_classify_unique_90_and_above_is_twin() {
         assert_eq!(classify_unique_match_score(90), "TWIN");
         assert_eq!(classify_unique_match_score(100), "TWIN");
+    }
+
+    // ------------------------------------------------------------------
+    // buduj_symetryczne_wpisy_skryptu
+    // ------------------------------------------------------------------
+
+    /// REGRESJA (Gemini review): sedno naprawy — wcześniej strona Skrypt nie
+    /// dostawała ŻADNEGO wpisu (ani "NONE", ani dopasowania), więc pliki
+    /// unikalne dla Skryptu były bez końca ponownie kolejkowane do
+    /// korelacji. Teraz KAŻDY id z `unique_scr_ids` dostaje dokładnie jeden
+    /// wpis, niezależnie od tego, czy coś dla niego znaleziono.
+    #[test]
+    fn test_symetryczne_wpisy_kazdy_plik_skryptu_dostaje_dokladnie_jeden_wpis() {
+        let scr_ids = vec![1, 2, 3];
+        let mut scr_best = HashMap::new();
+        scr_best.insert(2, (30u32, "ufs/x.bin".to_string(), 0i64, false));
+
+        let wpisy = buduj_symetryczne_wpisy_skryptu(&scr_ids, &scr_best);
+
+        assert_eq!(wpisy.len(), 3, "każdy plik unikalny Skryptu musi dostać dokładnie jeden wpis");
+        assert!(wpisy.iter().any(|(id, ..)| *id == 1));
+        assert!(wpisy.iter().any(|(id, ..)| *id == 2));
+        assert!(wpisy.iter().any(|(id, ..)| *id == 3));
+    }
+
+    #[test]
+    fn test_symetryczne_wpisy_plik_bez_dopasowania_dostaje_none() {
+        let scr_ids = vec![42];
+        let scr_best = HashMap::new();
+
+        let wpisy = buduj_symetryczne_wpisy_skryptu(&scr_ids, &scr_best);
+
+        assert_eq!(wpisy, vec![(42, "NONE".to_string(), 0.0, None, 0, false)]);
+    }
+
+    #[test]
+    fn test_symetryczne_wpisy_plik_z_dopasowaniem_dostaje_odwrocona_delte_i_sciezke_ufs() {
+        let scr_ids = vec![7];
+        let mut scr_best = HashMap::new();
+        // Delta zapisana w `scr_best` jest już odwrócona (patrz `run()`:
+        // `-delta`) względem oryginalnej pary UFS-Skrypt.
+        scr_best.insert(7, (95u32, "ufs/dawca.jpg".to_string(), -1024i64, false));
+
+        let wpisy = buduj_symetryczne_wpisy_skryptu(&scr_ids, &scr_best);
+
+        assert_eq!(wpisy.len(), 1);
+        let (id, m_type, pct, twin, delta, mism) = &wpisy[0];
+        assert_eq!(*id, 7);
+        assert_eq!(m_type, "TWIN");
+        assert_eq!(*pct, 95.0);
+        assert_eq!(twin.as_deref(), Some("ufs/dawca.jpg"));
+        assert_eq!(*delta, -1024);
+        assert!(!mism);
+    }
+
+    #[test]
+    fn test_symetryczne_wpisy_pusta_lista_daje_pusty_wynik() {
+        assert!(buduj_symetryczne_wpisy_skryptu(&[], &HashMap::new()).is_empty());
     }
 
     // ------------------------------------------------------------------

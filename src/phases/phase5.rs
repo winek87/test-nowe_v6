@@ -89,6 +89,38 @@ fn format_permissions(mode: u32, is_symlink: bool, is_dir: bool) -> String {
     s
 }
 
+/// Wylicza precyzyjny czas modyfikacji w nanosekundach od epoki Unix
+/// (`sekundy * 1_000_000_000 + nanosekundy`) w sposób ODPORNY na przepełnienie.
+///
+/// ## Dlaczego to jest konieczne (nie kosmetyka)
+///
+/// `meta.mtime()` pochodzi z surowego pola i-node (`st_mtime`, `i64`). Na
+/// ZDROWYM systemie plików mieści się to w rozsądnym zakresie dat. Ale to
+/// narzędzie działa właśnie na USZKODZONYCH i-node'ach po nieudanym odzysku —
+/// bity pola czasu mogą być fizycznie zniszczone i przyjąć DOWOLNĄ wartość
+/// `i64`, łącznie z wartościami bliskimi `i64::MIN`/`i64::MAX`. Naiwne mnożenie
+/// `meta.mtime() * 1_000_000_000` na takiej wartości przepełnia zakres `i64`:
+/// w trybie debug to panika (crash całej Fazy 5 na jednym uszkodzonym pliku
+/// wśród tysięcy), w trybie release — CICHE zawinięcie (wraparound) na losową
+/// wartość, która trafia do bazy jako rzekomo "precyzyjny" znacznik czasu i
+/// dalej zasila raport kryminalistyczny fałszywą datą.
+///
+/// Rozwiązanie: liczymy pośrednio w `i128` (który fizycznie nie może przepełnić
+/// się przy mnożeniu/dodawaniu dwóch wartości `i64`), a dopiero na końcu
+/// próbujemy bezpiecznie zwęzić wynik z powrotem do `i64` przez `try_from`.
+/// Gdy wynik nie mieści się w `i64` (anomalia i-node), zwracamy jawnie `None`
+/// zamiast panikować lub ciszej fałszować wartość — wołający zapisuje to jako
+/// `mtime_ns: None` i osobną anomalię "Przepełnienie znacznika czasu" w
+/// dziennikach (patrz `process_side_stream`), więc plik NIE znika po cichu z
+/// raportu — widać wprost, że jego i-node jest uszkodzony w polu czasu.
+fn compute_precise_mtime(sec: i64, nsec: i64) -> Option<i64> {
+    let sec = sec as i128;
+    let nsec = nsec as i128;
+    sec.checked_mul(1_000_000_000)
+        .and_then(|whole| whole.checked_add(nsec))
+        .and_then(|total| i64::try_from(total).ok())
+}
+
 // ============================================================================
 // STRUKTURY DANYCH
 // ============================================================================
@@ -111,7 +143,10 @@ struct FileStats {
     /// Same bity uprawnień (maska `0o7777`) — bez typu pliku, gotowe do zapisu w SQLite.
     mode: u32,
     /// Czas modyfikacji w nanosekundach od epoki Unix — pełna precyzja (sekundy × 1e9 + nsec).
-    mtime_ns: i64, 
+    /// `None` gdy `sekundy × 1e9 + nsec` przepełnia `i64` (uszkodzony i-node —
+    /// patrz [`compute_precise_mtime`]); w tym wypadku `mtime_ufs`/`mtime_script`
+    /// w bazie CELOWO pozostaje `NULL` zamiast fałszywej, zawiniętej wartości.
+    mtime_ns: Option<i64>,
     is_symlink: bool,
 }
 
@@ -156,6 +191,10 @@ pub(crate) struct LiveStats {
     /// Pliki z czasem modyfikacji <= 0 (epoka Unix 1970) — typowy ślad
     /// uszkodzonych metadanych po nieudanym odzysku.
     epoch_zero: AtomicUsize,
+    /// Pliki, gdzie `sekundy × 1e9 + nsec` przepełnia `i64` — i-node fizycznie
+    /// uszkodzony w polu czasu na tyle, że nawet nie mieści się w typie danych.
+    /// `mtime_ns` zapisany jako `None` (patrz [`compute_precise_mtime`]).
+    mtime_overflow: AtomicUsize,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas wywołań `lstat()` — patrz moduł `thread_activity`.
@@ -177,6 +216,7 @@ impl LiveStats {
             suid_sgid: AtomicUsize::new(0),
             executables: AtomicUsize::new(0),
             epoch_zero: AtomicUsize::new(0),
+            mtime_overflow: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -229,7 +269,7 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.0} plików/s\nTop format: {}\nTop UID: {}\nTop uprawnienia: {}\nDowiązania miękkie: {}\nDowiązania twarde: {}\nWłaściciel root: {}\nSUID/SGID: {}\nPliki wykonywalne: {}\nEpoka zerowa (1970): {}\nWątki lstat (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.0} plików/s\nTop format: {}\nTop UID: {}\nTop uprawnienia: {}\nDowiązania miękkie: {}\nDowiązania twarde: {}\nWłaściciel root: {}\nSUID/SGID: {}\nPliki wykonywalne: {}\nEpoka zerowa (1970): {}\nPrzepełnienie znacznika czasu: {}\nWątki lstat (Wariant A): {}\nBłędy I/O: {}",
         label, speed_files, display_ext, display_uid, display_mode,
         stats.symlinks.load(Ordering::Relaxed),
         stats.hardlinks.load(Ordering::Relaxed),
@@ -237,6 +277,7 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         stats.suid_sgid.load(Ordering::Relaxed),
         stats.executables.load(Ordering::Relaxed),
         stats.epoch_zero.load(Ordering::Relaxed),
+        stats.mtime_overflow.load(Ordering::Relaxed),
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -287,7 +328,12 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
             let (stats_opt, io_err) = match stats.thread_activity.track_current(|| fs::symlink_metadata(&full_path)) {
                 Ok(meta) => {
-                    let precise_mtime = (meta.mtime() * 1_000_000_000) + meta.mtime_nsec();
+                    // NAPRAWA (przepełnienie i64): patrz dokumentacja `compute_precise_mtime`.
+                    // Na uszkodzonym i-node `meta.mtime()` może być dowolną wartością i64 -
+                    // mnożenie przez 1e9 potrafi przepełnić zakres. Liczymy pośrednio w i128
+                    // (nie przepełnia się), a `None` (zamiast paniki lub cichego zawinięcia)
+                    // oznacza jawną anomalię, zapisaną niżej.
+                    let precise_mtime = compute_precise_mtime(meta.mtime(), meta.mtime_nsec());
                     let forensic_mode = meta.mode() & 0o7777;
                     let file_size = meta.len();
                     let is_sym = meta.file_type().is_symlink();
@@ -310,7 +356,14 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     if uid == 0 { stats.root_owned.fetch_add(1, Ordering::Relaxed); anomalies.push("Właściciel ROOT".to_string()); }
                     if forensic_mode & 0o6000 != 0 { stats.suid_sgid.fetch_add(1, Ordering::Relaxed); anomalies.push("SUID/SGID".to_string()); }
                     if forensic_mode & 0o0111 != 0 && !is_sym { stats.executables.fetch_add(1, Ordering::Relaxed); }
-                    if precise_mtime <= 0 { stats.epoch_zero.fetch_add(1, Ordering::Relaxed); anomalies.push("Epoka 1970".to_string()); }
+                    match precise_mtime {
+                        Some(v) if v <= 0 => { stats.epoch_zero.fetch_add(1, Ordering::Relaxed); anomalies.push("Epoka 1970".to_string()); }
+                        Some(_) => {}
+                        None => {
+                            stats.mtime_overflow.fetch_add(1, Ordering::Relaxed);
+                            anomalies.push("Nieprawidłowy znacznik czasu (przepełnienie)".to_string());
+                        }
+                    }
 
                     if !anomalies.is_empty()
                         && let Ok(mut f) = opr_log.lock() {
@@ -551,7 +604,15 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                             if res.stats.is_some() || res.io_error == Some(true) {
                                 stmt.execute(params![
                                     res.stats.as_ref().map(|s| s.uid), res.stats.as_ref().map(|s| s.gid),
-                                    res.stats.as_ref().map(|s| s.mode), res.stats.as_ref().map(|s| s.mtime_ns),
+                                    res.stats.as_ref().map(|s| s.mode),
+                                    // NAPRAWA: mtime_ns jest teraz Option<i64> (patrz
+                                    // compute_precise_mtime) - .and_then() spłaszcza
+                                    // Option<Option<i64>> zamiast panikować/zawijać wartość
+                                    // przy przepełnieniu. Gdy None, COALESCE zostawia
+                                    // mtime_ufs/script jak było (NULL), więc plik zostaje
+                                    // naturalnie ponownie zakolejkowany w kolejnym uruchomieniu
+                                    // Fazy 5 (patrz zapytanie w ETAP 1: `m_ufs.is_none()`).
+                                    res.stats.as_ref().and_then(|s| s.mtime_ns),
                                     res.stats.as_ref().map(|s| s.is_symlink), res.io_error, res.id
                                 ]).unwrap();
                             }
@@ -725,6 +786,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     print_anom_txt(&mut log_out, "Dowiązania Miękkie (Symlinks)", ufs_stats.symlinks.load(Ordering::SeqCst), script_stats.symlinks.load(Ordering::SeqCst), "Są to tylko skróty do innych ścieżek. Po odzyskaniu często prowadzą donikąd.");
     print_anom_txt(&mut log_out, "Złamanie Właściciela (UID = 0 / ROOT)", ufs_stats.root_owned.load(Ordering::SeqCst), script_stats.root_owned.load(Ordering::SeqCst), "Pliki z uprawnieniami superużytkownika. Może to być systemowy sterownik, lub ślad iniekcji.");
     print_anom_txt(&mut log_out, "Podwyższone Uprawnienia (SUID/SGID)", ufs_stats.suid_sgid.load(Ordering::SeqCst), script_stats.suid_sgid.load(Ordering::SeqCst), "Krytyczne ryzyko bezpieczeństwa. Uruchomienie tego pliku nadaje użytkownikowi prawa właściciela pliku.");
+    print_anom_txt(&mut log_out, "Przepełnienie Znacznika Czasu (i64)", ufs_stats.mtime_overflow.load(Ordering::SeqCst), script_stats.mtime_overflow.load(Ordering::SeqCst), "Pole czasu i-node jest fizycznie zniszczone do wartości, której nie da się już zapisać jako precyzyjny znacznik nanosekundowy. mtime pozostaje NULL w bazie (zamiast fałszywej, zawiniętej daty).");
     let _ = writeln!(&mut log_out);
 
     let _ = writeln!(&mut log_out, "[ 2 ] KORELACJA Z BAZĄ DANYCH (Porównanie Odzysków):");
@@ -921,6 +983,7 @@ mod tests {
         stats.suid_sgid.store(4, Ordering::Relaxed);
         stats.executables.store(10, Ordering::Relaxed);
         stats.epoch_zero.store(5, Ordering::Relaxed);
+        stats.mtime_overflow.store(6, Ordering::Relaxed);
         stats.errors.store(2, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -933,6 +996,7 @@ mod tests {
         assert!(block.contains("SUID/SGID: 4"));
         assert!(block.contains("Pliki wykonywalne: 10"));
         assert!(block.contains("Epoka zerowa (1970): 5"));
+        assert!(block.contains("Przepełnienie znacznika czasu: 6"));
         assert!(block.contains("Błędy I/O: 2"));
     }
 

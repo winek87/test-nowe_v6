@@ -27,6 +27,17 @@
 
 use std::path::Path;
 
+/// Górny limit rozmiaru bufora przyjmowanego przez [`read_mkv_bytes`]. Ten
+/// sam próg i uzasadnienie co `mp4_engines::boxes::LIMIT_DIAGNOZY_W_RAM`.
+/// `read_mkv_file` (odczyt z dysku, główna ścieżka Fazy 19) NIE potrzebuje
+/// tego limitu — `matroska::open` czyta przez `BufReader` i sięga tylko po
+/// konkretne elementy metadanych (Info/Tracks/Attachments/Chapters/Tags),
+/// nigdy nie ładując całego pliku (w tym `Cluster` z danymi audio/wideo) do
+/// pamięci — zweryfikowane w źródle crate'a `matroska` 0.30.1. Ryzyko
+/// dotyczy wyłącznie [`read_mkv_bytes`], gdzie wywołujący JUŻ ma cały plik
+/// w RAM (weryfikacja po naprawie w Fazie 17).
+const LIMIT_DIAGNOZY_W_RAM: u64 = 256 * 1024 * 1024; // 256 MB
+
 /// Informacje o poprawnie odczytanym kontenerze Matroska.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MkvInfo {
@@ -485,7 +496,10 @@ pub fn read_mkv_file(path: &Path) -> std::result::Result<MkvInfo, MkvDamage> {
 /// sumy przez [`wszystkie_crc_zgodne`]. Broni wyniku modułu `mkv_clone` oraz
 /// wyników ślepego `splice`, który bez tej gałęzi przechodził bez oporu.
 pub fn read_mkv_bytes(bytes: &[u8]) -> std::result::Result<MkvInfo, MkvDamage> {
-    match matroska::Matroska::open(std::io::Cursor::new(bytes.to_vec())) {
+    if bytes.len() as u64 > LIMIT_DIAGNOZY_W_RAM {
+        return Err(MkvDamage::Other);
+    }
+    match matroska::Matroska::open(std::io::Cursor::new(bytes)) {
         Ok(m) => {
             // Ta sama kontrola co w [`read_mkv_file`] - tu nawet tańsza, bo
             // cały bufor jest już w pamięci.
@@ -507,6 +521,14 @@ pub fn read_mkv_bytes(bytes: &[u8]) -> std::result::Result<MkvInfo, MkvDamage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESJA: `read_mkv_bytes` musi odrzucić bufor większy niż
+    /// `LIMIT_DIAGNOZY_W_RAM` zamiast przekazywać go dalej do parsera.
+    #[test]
+    fn test_read_mkv_bytes_odrzuca_bufor_wiekszy_niz_limit() {
+        let bufor = vec![0u8; (LIMIT_DIAGNOZY_W_RAM + 1) as usize];
+        assert_eq!(read_mkv_bytes(&bufor), Err(MkvDamage::Other));
+    }
 
     // ------------------------------------------------------------------
     // classify_mkv_error - wzorce potwierdzone empirycznie przez mkv_probe

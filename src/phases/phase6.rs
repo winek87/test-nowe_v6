@@ -540,9 +540,26 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                         for res in chunk {
                             if res.analysis.is_some() || res.io_error == Some(true) {
-                                let empty_pct = res.analysis.as_ref().map(|a| a.zeros_pct.max(a.ffs_pct));
+                                // NAPRAWA (patrz dokumentacja modułu, sekcja "zeros_pct vs
+                                // ffs_pct"): kolumna `zeros_pct_ufs`/`zeros_pct_script`
+                                // przechowuje WYŁĄCZNIE `a.zeros_pct` (prawdziwe zera 0x00).
+                                // Wcześniej był tu `.max(a.ffs_pct)`, co spłaszczało DWA
+                                // różne sygnały (wydmuszka HDD = zera, wydmuszka SSD/TRIM =
+                                // 0xFF) do jednej liczby - Fazy 8/9/diag.rs czytające tę
+                                // kolumnę nie miały jak odróżnić TRIM od realnych zer, więc
+                                // opisywały plik TRIM jako "wypełniony zerami", co jest
+                                // fałszywe kryminalistycznie. `a.ffs_pct` NIE trafia do tej
+                                // kolumny - schemat bazy nie dostaje nowej kolumny (zbyt
+                                // inwazyjne), za to fakt TRIM pozostaje w opisowym logu per
+                                // plik (patrz `anomalies.push("Wydmuszka SSD TRIM...")` w
+                                // `process_side_stream`, niezależne od tego zapisu do bazy) i
+                                // w zbiorczych licznikach `ffs_common`/`ffs_unique` tej sesji
+                                // w Dzienniku Końcowym (ETAP 5, sekcja WYDMUSZKI SSD) - więc
+                                // informacja nie znika całkowicie, nawet jeśli sama kolumna
+                                // liczbowa zostaje ograniczona do zer.
+                                let zeros_only_pct = res.analysis.as_ref().map(|a| a.zeros_pct);
                                 stmt.execute(params![
-                                    empty_pct,
+                                    zeros_only_pct,
                                     res.analysis.as_ref().and_then(|a| a.eof_ok),
                                     res.io_error,
                                     res.id

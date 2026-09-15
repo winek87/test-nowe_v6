@@ -31,6 +31,64 @@
 //!
 //! UWAGA ARCHITEKTONICZNA (WĄTKOWANIE): każda strona dostaje własną,
 //! dedykowaną pulę Rayon (`half_threads`, identycznie jak Fazy 2-7/10-15).
+//!
+//! NAPRAWIONY BUG KRYTYCZNY (pliki czyste nigdy nie kończyły fazy): zapis
+//! wyniku używał `yara_match_ufs = COALESCE(?, yara_match_ufs)`, gdzie `?`
+//! to `None` dla pliku BEZ trafień. `COALESCE` na `None` zostawia kolumnę BEZ
+//! ZMIAN — czyli wiecznie `NULL`. Kryterium `phase16_done` wymagało
+//! `yara_match_ufs IS NOT NULL OR io_error_ufs = 1`, więc dla pliku czystego
+//! (oba fałszywe) `phase16_done` NIGDY się nie ustawiało — każde wznowienie
+//! fazy skanowało od nowa CAŁY dotychczas-czysty korpus (w praktyce niemal
+//! wszystko, bo trafienia malware są rzadkością). Klasyczne pomylenie
+//! semantyki `NULL`: `None` oznaczał jednocześnie "nieprzeskanowany" I
+//! "przeskanowany, czysty" — nie do odróżnienia.
+//!
+//! ŚWIADOMIE ODRZUCONE ROZWIĄZANIE: zamiana sentinela "brak trafień" z
+//! `None` na `Some(String::new())` w `yara_match_ufs`/`_script` (pusty
+//! string = "przeskanowano, czysto"). Techniczne najprostsze, ale
+//! NIEBEZPIECZNE tutaj: `phases::phase8` (raport CSV) i `phases::phase9`
+//! (Smart Merge) czytają te SAME kolumny gdzie indziej z konwencją
+//! `.is_some() == zainfekowany` (np. `phase9::wybierz_strone_odrzucona`) —
+//! każdy przeskanowany-czysty plik zacząłby wyglądać jak zainfekowany dla
+//! tamtych faz. Ponieważ ten plik jest jedynym dozwolonym miejscem zmian w
+//! tej naprawie, semantyka `yara_match_ufs`/`_script` (`NULL` = brak
+//! trafienia LUB nieprzeskanowany, `Some(nazwy)` = realne trafienie)
+//! zostaje BEZ ZMIAN.
+//!
+//! ZASTOSOWANE ROZWIĄZANIE: nowa para kolumn `yara_scanned_ufs`/
+//! `yara_scanned_script` (BOOLEAN, `ALTER TABLE ... ADD COLUMN`, ten sam
+//! wzorzec no-opowej migracji co reszta faz — patrz `db.rs::migrate_schema`)
+//! ustawiana na `1` przy KAŻDYM zapisie wyniku tej strony (czysty,
+//! zainfekowany LUB błąd I/O — bezwarunkowo, bez `COALESCE`). Kryterium
+//! `phase16_done` i selekcja zadań (Etap 1) sprawdzają teraz `yara_scanned_*
+//! = 1` OBOK starych warunków (`yara_match_* IS NOT NULL OR io_error_* = 1`)
+//! — stare wiersze sprzed tej naprawy (infekcja/błąd I/O już zapisane, ale
+//! bez nowej kolumny) zostają natychmiast rozpoznane jako gotowe, BEZ
+//! ponownego skanowania; tylko wiersze faktycznie dotknięte bugiem (czyste,
+//! nieoznaczone) wpadają do zadań RAZ, dostają `yara_scanned_* = 1` i odtąd
+//! są trwale pomijane.
+//!
+//! NAPRAWIONY BUG WYSOKI (brak `catch_unwind` wokół silnika YARA):
+//! `scan_file_yara` woła `rules.scan_file` — silnik YARA (C) i, przy
+//! `features = ["module-magic"]` w `Cargo.toml`, pośrednio libmagic (C, ze
+//! zweryfikowaną historią awarii na spreparowanych danych) — na plikach z
+//! odzysku danych, z definicji niezaufanych/potencjalnie uszkodzonych, bez
+//! żadnej ochrony przed paniką. Niespójne z resztą projektu: `raw_image`,
+//! `heic_image`, `video_image` (dekodery zewnętrznych bibliotek) i
+//! `phases::phase17_repair` (moduły naprawcze operujące na uszkodzonych
+//! plikach) owijają analogiczne wywołania w `std::panic::catch_unwind` —
+//! bez tego jedna patologiczna próbka ubija cały wątek roboczy Rayon,
+//! tracąc resztę partii zadań tej strony. Naprawione przez
+//! [`catch_yara_panic`], wołane z `scan_file_yara` DOKŁADNIE tym samym
+//! wzorcem (`catch_unwind(AssertUnwindSafe(...))`) co `phase17_repair`. Ten
+//! plik CELOWO NIE dodaje thread-local flagi `is_expected_panic_in_progress`
+//! + rejestracji w globalnym panic hooku (`logging.rs`) jak `raw_image` —
+//! ten mechanizm wymagałby edycji `logging.rs`, poza dozwolonym zakresem tej
+//! naprawy — i zamiast tego świadomie stosuje prostszy, już obecny w
+//! projekcie wzorzec `phase17_repair` (goły `catch_unwind` bez rejestracji w
+//! hooku): panika nadal NIE ubija wątku/procesu, kosztem tego, że globalny
+//! hook potraktuje ją jako "niespodziewaną" (zaloguje `BŁĄD KRYTYCZNY` i
+//! przywróci terminal), zamiast po cichu przełknąć jak przy `raw_image`.
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
@@ -169,18 +227,36 @@ impl CategoryStats {
 // SILNIK DECYZYJNY (WERYFIKATOR YARA)
 // ============================================================================
 
+/// Wykonuje `f` chronione przed paniką — dokładnie ten sam wzorzec
+/// (`std::panic::catch_unwind(std::panic::AssertUnwindSafe(...))`) co
+/// `phases::phase17_repair` wokół wywołań modułów naprawczych operujących na
+/// uszkodzonych/niezaufanych plikach. Zamienia panikę silnika YARA (C) —
+/// albo, przy `features = ["module-magic"]`, pośrednio libmagic (C) — na
+/// bezpieczny `Err`, zamiast ubić cały wątek roboczy Rayon i stracić resztę
+/// partii zadań tej strony. Wydzielone jako osobna funkcja generyczna, żeby
+/// dało się to przetestować jednostkowo bez potrzeby spreparowania pliku,
+/// który faktycznie wywoła panikę WEWNĄTRZ `libyara`/`libmagic`.
+fn catch_yara_panic<F, T>(f: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
 /// Skanuje jeden plik skompilowanym zestawem reguł (limit 10s na plik, żeby
 /// pojedyncza patologiczna reguła/plik nie zawiesiła całej fazy). Zwraca
 /// `Ok(None)` dla pliku czystego, `Ok(Some("Regula1, Regula2"))` dla
-/// dopasowań (połączone przecinkiem), `Err` dla braku pliku lub błędu
-/// silnika YARA (w tym timeout).
+/// dopasowań (połączone przecinkiem), `Err` dla braku pliku, błędu silnika
+/// YARA (w tym timeout) lub PANIKI wewnątrz `rules.scan_file` przechwyconej
+/// przez [`catch_yara_panic`] (patrz dokumentacja modułu — NAPRAWIONY BUG
+/// WYSOKI).
 fn scan_file_yara(path: &Path, rel_path: &str, side_label: &str, rules: &Rules) -> std::result::Result<Option<String>, std::io::Error> {
     if !path.exists() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Plik nie istnieje"));
     }
 
-    match rules.scan_file(path, 10) {
-        Ok(matches) => {
+    match catch_yara_panic(|| rules.scan_file(path, 10)) {
+        Ok(Ok(matches)) => {
             if matches.is_empty() {
                 Ok(None)
             } else {
@@ -188,9 +264,18 @@ fn scan_file_yara(path: &Path, rel_path: &str, side_label: &str, rules: &Rules) 
                 Ok(Some(rule_names.join(", ")))
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(path = rel_path, side = side_label, error = %e, "Błąd I/O lub Timeout YARA");
             Err(std::io::Error::other("YARA Scan Error"))
+        }
+        Err(panika) => {
+            let opis = panika
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panika.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "nieznana przyczyna".to_string());
+            error!(path = rel_path, side = side_label, panika = %opis, "PANIKA silnika YARA (scan_file) - przechwycona, plik traktowany jak błąd I/O");
+            Err(std::io::Error::other("Panika silnika YARA (przechwycona przez catch_unwind)"))
         }
     }
 }
@@ -488,6 +573,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         )", []
     )?;
 
+    // NAPRAWA BUGU KRYTYCZNEGO (patrz dokumentacja modułu): dodatkowa para
+    // kolumn oznaczających WPROST "ta strona TEGO pliku przeszła przez
+    // skaner YARA", niezależnie od wyniku (czysty/zainfekowany/błąd I/O).
+    // Celowo NIE zwraca błędu — `ALTER TABLE ... ADD COLUMN` na kolumnie,
+    // która już istnieje (kolejne uruchomienia), kończy się oczekiwanym
+    // `duplicate column name`, dokładnie ten sam no-opowy wzorzec migracji
+    // co w innych fazach (patrz `db.rs::migrate_schema` i np.
+    // `phase18_smart_splice::run`).
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN yara_scanned_ufs BOOLEAN", []);
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN yara_scanned_script BOOLEAN", []);
+
     // INICJALIZACJA DUAL-LOGGING
     let raport_cfg = config.raporty_faz.get("Faza 16").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
         katalog: config.log_path.clone(),
@@ -507,11 +603,21 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
 
     // --- ETAP 1: POBIERANIE ZADAŃ ---
+    //
+    // NAPRAWA BUGU KRYTYCZNEGO: kryterium "trzeba przeskanować" sprawdza
+    // teraz TAKŻE nową kolumnę `yara_scanned_*` (`scanned_ufs`/`scanned_scr`
+    // poniżej), nie tylko `yara_match_* IS NULL`. Bez tego dodatku plik
+    // czysty (`y_ufs = None`, `err_ufs != true`, ale `scanned_ufs` USTAWIONE
+    // na `1` przez poprzedni przebieg) wpadałby tu w nieskończoność z
+    // powrotem do zadań — dokładnie ten sam bug, tylko przeniesiony z Etapu 4
+    // do Etapu 1. Stare warunki (`y_ufs.is_none()`, `err_ufs != Some(true)`)
+    // zostają, żeby wiersze sprzed tej naprawy (infekcja/błąd I/O zapisane,
+    // ale bez nowej kolumny) NIE zostały przypadkiem ponownie zakolejkowane.
     let mut stmt = conn.prepare(
-        "SELECT id, relative_path, found_in_ufs, found_in_script, yara_match_ufs, yara_match_script, io_error_ufs, io_error_script 
+        "SELECT id, relative_path, found_in_ufs, found_in_script, yara_match_ufs, yara_match_script, io_error_ufs, io_error_script, yara_scanned_ufs, yara_scanned_script
          FROM files WHERE phase16_done = 0 OR phase16_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped = 0;
@@ -519,18 +625,19 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?,
+            row.get::<_, Option<bool>>(8)?, row.get::<_, Option<bool>>(9)?
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel, in_ufs, in_script, y_ufs, y_scr, err_ufs, err_scr) = r;
+        let (id, rel, in_ufs, in_script, y_ufs, y_scr, err_ufs, err_scr, scanned_ufs, scanned_scr) = r;
         if in_ufs {
-            if y_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common: in_ufs && in_script }); } 
+            if y_ufs.is_none() && err_ufs != Some(true) && scanned_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common: in_ufs && in_script }); }
             else { skipped += 1; }
         }
         if in_script {
-            if y_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common: in_ufs && in_script }); } 
+            if y_scr.is_none() && err_scr != Some(true) && scanned_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common: in_ufs && in_script }); }
             else { skipped += 1; }
         }
     }

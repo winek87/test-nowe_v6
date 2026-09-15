@@ -371,8 +371,21 @@ pub fn is_ts_extension(path_str: &str) -> bool {
     lower.ends_with(".ts") || lower.ends_with(".m2ts") || lower.ends_with(".mts")
 }
 
-/// Wariant [`analyze_ts`] operujący na pliku na dysku.
+/// Górny limit rozmiaru pliku wczytywanego w całości do pamięci przed
+/// analizą. Ten sam próg i uzasadnienie co
+/// `mp4_engines::boxes::LIMIT_DIAGNOZY_W_RAM`/`video_image::LIMIT_DIAGNOZY_W_RAM`:
+/// Faza 19 przetwarza pliki równolegle (Rayon), więc szczyt zużycia RAM to
+/// wielokrotność tej wartości.
+const LIMIT_DIAGNOZY_W_RAM: u64 = 256 * 1024 * 1024; // 256 MB
+
+/// Wariant [`analyze_ts`] operujący na pliku na dysku. Odmawia wczytania
+/// plików większych niż [`LIMIT_DIAGNOZY_W_RAM`] (`None`, tak samo jak przy
+/// każdej innej porażce odczytu — patrz dokumentacja modułu).
 pub fn analyze_ts_file(path: &std::path::Path) -> Option<TsAnalysis> {
+    let rozmiar = std::fs::metadata(path).ok()?.len();
+    if rozmiar > LIMIT_DIAGNOZY_W_RAM {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     analyze_ts(&bytes)
 }
@@ -384,6 +397,20 @@ pub fn analyze_ts_file(path: &std::path::Path) -> Option<TsAnalysis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESJA: plik większy niż `LIMIT_DIAGNOZY_W_RAM` musi zostać
+    /// odrzucony przed wczytaniem w całości do pamięci. Plik rzadki
+    /// (sparse) - tani i szybki.
+    #[test]
+    fn test_analyze_ts_file_odrzuca_plik_wiekszy_niz_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("ogromny.ts");
+        let plik = std::fs::File::create(&sciezka).unwrap();
+        plik.set_len(LIMIT_DIAGNOZY_W_RAM + 1).unwrap();
+        drop(plik);
+
+        assert_eq!(analyze_ts_file(&sciezka), None);
+    }
 
     /// Buduje poprawny pakiet TS o zadanym PID i liczniku ciągłości.
     fn make_packet(pid: u16, cc: u8, with_payload: bool) -> Vec<u8> {

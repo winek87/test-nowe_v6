@@ -384,6 +384,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
+        // KRYMINALISTYCZNA POPRAWKA (nie usuwać bez zrozumienia scenariusza):
+        // mimo braku NOWYCH zadań I/O w tej sesji, finalizacja MUSI się
+        // wykonać. Scenariusz: proces przerwany DOKŁADNIE po zapisaniu
+        // rozmiarów obu stron, ale PRZED finalizacją macierzy — przy
+        // kolejnym starcie zapytanie z ETAPU 1 nie znajdzie już żadnych
+        // "nowych" zadań (rozmiary są już w bazie), więc total_db_rows == 0.
+        // Bez tego wywołania plik zostawałby TRWALE z size_match = NULL i
+        // phase2_done = 0, nigdy więcej nie trafiając do finalizacji.
+        // SQL_FINALIZACJA_MACIERZY jest idempotentny (WHERE phase2_done = 0
+        // OR phase2_done IS NULL), więc wywołanie go tu "na pusto" (gdy
+        // baza faktycznie jest już aktualna) jest bezpieczne i tanie.
+        conn.execute(SQL_FINALIZACJA_MACIERZY, [])?;
         let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających weryfikacji rozmiarów. Baza aktualna.".to_string()));
         return Ok(());
     }
@@ -552,6 +564,17 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH (Wyliczenie Larger Side) ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
         let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        // ŚWIADOMA DECYZJA: tu NIE wołamy pełnej finalizacji macierzy — sesja
+        // jest niekompletna (część zadań I/O mogła nie zostać w ogóle
+        // wysłana/zapisana przed przerwaniem), więc dociągnięcie CASE na
+        // wierszach czekających jeszcze na drugą stronę byłoby przedwczesne
+        // i mogłoby błędnie zamknąć plik jako "gotowy" (phase2_done = 1) bez
+        // realnego pomiaru drugiej strony.
+        // To NIE zostawia wierszy trwale utkniętych: te, którym faktycznie
+        // zapisano już obie strony (lub błąd I/O) przed przerwaniem, zostaną
+        // dociągnięte przy KOLEJNYM uruchomieniu Fazy 2 — a jeśli to będzie
+        // jedyne, co zostało do zrobienia, zadziała gałąź
+        // `total_db_rows == 0` powyżej, która finalizację wykonuje zawsze.
         return Ok(());
     }
 
@@ -1112,6 +1135,53 @@ mod tests {
         assert_eq!(
             zgodnosc, Some(1),
             "wiersz z phase2_done = 1 jest poza zakresem zapytania - jego wcześniejszy wynik zostaje nietknięty"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regresja: przerwanie MIĘDZY zapisem rozmiarów a finalizacją macierzy
+    // ------------------------------------------------------------------
+
+    /// Odtwarza proces przerwany DOKŁADNIE po zapisaniu rozmiarów obu stron,
+    /// ale PRZED finalizacją macierzy: `size_ufs`/`size_script` są już w
+    /// bazie, `phase2_done` wciąż 0. Przy kolejnym starcie ETAP 1 (SELECT
+    /// zadań) nie znajduje żadnych NOWYCH zadań I/O — `total_db_rows == 0` —
+    /// więc przed poprawką `run()` wracał natychmiast i wiersz zostawał
+    /// TRWALE z `size_match = NULL`, `phase2_done = 0`.
+    ///
+    /// Po poprawce finalizacja (`SQL_FINALIZACJA_MACIERZY`) musi się wykonać
+    /// także na tej gałęzi, więc wiersz zostaje domknięty już przy tym
+    /// (pierwszym po przerwaniu) uruchomieniu.
+    #[test]
+    fn test_run_finalizuje_macierz_mimo_braku_nowych_zadan_io() {
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
+             VALUES (1, 'utkniety.jpg', 1, 1, 500, 500, 0, 0, 0)",
+            [],
+        ).unwrap();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut config = Ustawienia::default();
+        config.log_path = log_dir.path().to_string_lossy().to_string();
+        config.raporty_faz.clear(); // wymusza gałąź unwrap_or_else -> katalog = log_path (tempdir)
+        config.max_threads = 1;
+
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        run(&mut conn, &config, tx_ui).expect("run() nie może zwrócić błędu przy pustej liście nowych zadań");
+
+        let (zgodnosc, gotowe): (Option<i64>, bool) = conn.query_row(
+            "SELECT size_match, phase2_done FROM files WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(
+            zgodnosc, Some(1),
+            "finalizacja macierzy musi się wykonać mimo braku nowych zadań I/O w tej sesji"
+        );
+        assert!(
+            gotowe,
+            "wiersz nie może zostać trwale utknięty z phase2_done = 0 tylko dlatego, że rozmiary zapisano w poprzedniej sesji"
         );
     }
 }

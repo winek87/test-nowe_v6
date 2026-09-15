@@ -294,8 +294,91 @@ pub fn get_report_value(u: &Ustawienia, phase: &str, field_idx: usize) -> String
     }
 }
 
+/// Waliduje ścieżkę katalogu docelowego raportów (pole 0 podmenu raportów,
+/// `RaportFazy::katalog`).
+///
+/// ## Dlaczego to w ogóle istnieje
+///
+/// `raport_cfg.katalog` trafia bezpośrednio, bez żadnej dalszej walidacji, do
+/// `fs::create_dir_all(...).unwrap_or_default()` (tolerancyjne - błąd
+/// ignorowany), a zaraz potem do `File::create(...).unwrap()` (NIE
+/// tolerancyjne - panika) w co najmniej 12 fazach (patrz `phase1..phase18`,
+/// `duplicate_finder`). Operator wpisujący tu pusty string, ścieżkę do
+/// istniejącego PLIKU albo ścieżkę na niezamontowanym wolumenie do tej pory
+/// widział zapis zaakceptowany bez ostrzeżenia - a odkrywał błąd dopiero jako
+/// panikę wątku roboczego pierwszej uruchomionej fazy, tracąc cały bieżący
+/// przebieg.
+///
+/// ## Reguła akceptacji
+///
+/// - Pusty string (także sam biały znak) - odrzucony.
+/// - Ścieżka, która już istnieje jako katalog - zaakceptowana.
+/// - Ścieżka, która już istnieje, ale NIE jest katalogiem (zwykły plik,
+///   urządzenie, ...) - odrzucona (`create_dir_all` na takiej ścieżce zawsze
+///   zawiedzie, a `File::create` na dziecku takiej ścieżki też).
+/// - Ścieżka jeszcze nieistniejąca - szukamy jej NAJBLIŻSZEGO ISTNIEJĄCEGO
+///   PRZODKA. Jeśli taki przodek istnieje, jest katalogiem i wygląda na
+///   zapisywalny (heurystyka - próba utworzenia i natychmiastowego usunięcia
+///   unikalnego podkatalogu tymczasowego w jego obrębie) - akceptujemy
+///   (`create_dir_all` dotworzy resztę drzewa przy starcie fazy). W
+///   przeciwnym razie (żaden przodek nie istnieje - np. niezamontowany
+///   wolumen sieciowy - albo istniejący przodek jest bez prawa zapisu) -
+///   odrzucamy.
+fn validate_report_katalog(val: &str) -> Result<(), String> {
+    if val.trim().is_empty() {
+        return Err("Katalog docelowy nie może być pusty.".to_string());
+    }
+    let path = std::path::Path::new(val);
+    if path.exists() {
+        if path.is_dir() {
+            return Ok(());
+        }
+        return Err("Ta ścieżka już istnieje, ale nie jest katalogiem (wskazuje na plik).".to_string());
+    }
+    // Ścieżka jeszcze nie istnieje - poszukaj najbliższego istniejącego przodka.
+    //
+    // `Path::ancestors()` dla ścieżki WZGLĘDNEJ (np. "nowy_katalog") kończy
+    // na pustym `""`, nie na `"."` - a `Path::new("").exists()` zawsze zwraca
+    // `false`, mimo że semantycznie to katalog roboczy procesu, który
+    // najczęściej istnieje. Bez tej normalizacji prosta względna nazwa bez
+    // separatora ścieżki byłaby zawsze odrzucana. Dotyczy to WYŁĄCZNIE ścieżek
+    // względnych - `ancestors()` ścieżki bezwzględnej zawsze kończy na `"/"`,
+    // nie na pustym stringu.
+    let ancestor = path.ancestors().skip(1).map(|a| if a.as_os_str().is_empty() { std::path::Path::new(".") } else { a }).find(|a| a.exists());
+    match ancestor {
+        None => Err("Ścieżka wskazuje na wolumin/dysk, który nie jest dostępny.".to_string()),
+        Some(a) if !a.is_dir() => {
+            Err("Najbliższy istniejący element tej ścieżki nie jest katalogiem.".to_string())
+        }
+        Some(a) => {
+            // Heurystyka zapisywalności: spróbuj utworzyć i natychmiast usunąć
+            // unikalny podkatalog tymczasowy wewnątrz `a`.
+            let probe = a.join(format!(".weryfikator_probe_{}", std::process::id()));
+            match std::fs::create_dir(&probe) {
+                Ok(()) => {
+                    let _ = std::fs::remove_dir(&probe);
+                    Ok(())
+                }
+                Err(_) => Err(format!(
+                    "Katalog '{}' nie jest zapisywalny - nie można w nim utworzyć nowej ścieżki.",
+                    a.display()
+                )),
+            }
+        }
+    }
+}
+
 /// Zapisuje nową wartość jednego z trzech pól raportu danej fazy.
-pub fn set_report_value(u: &mut Ustawienia, phase: &str, field_idx: usize, val: String) {
+///
+/// Pole 0 (`katalog`) przechodzi przez [`validate_report_katalog`] -
+/// niepoprawna wartość jest ODRZUCANA (`Err`, `u` NIETKNIĘTE), analogicznie do
+/// [`validate_and_set_text`] dla `ufs_path`/`script_path`. Pola 1 i 2 to
+/// same NAZWY plików (dołączane do `katalog` przez fazy przez `Path::join`),
+/// nie ścieżki - bez walidacji istnienia, tak jak dotąd.
+pub fn set_report_value(u: &mut Ustawienia, phase: &str, field_idx: usize, val: String) -> Result<(), String> {
+    if field_idx == 0 {
+        validate_report_katalog(&val)?;
+    }
     if let Some(r) = u.raporty_faz.get_mut(phase) {
         match field_idx {
             0 => r.katalog = val,
@@ -304,6 +387,7 @@ pub fn set_report_value(u: &mut Ustawienia, phase: &str, field_idx: usize, val: 
             _ => {}
         }
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -439,10 +523,7 @@ fn handle_text_edit_key(
         KeyCode::Enter => {
             let result = match &target {
                 EditTarget::Main(idx) => validate_and_set_text(u, *idx, &buffer),
-                EditTarget::Report { phase, field_idx } => {
-                    set_report_value(u, phase, *field_idx, buffer.clone());
-                    Ok(())
-                }
+                EditTarget::Report { phase, field_idx } => set_report_value(u, phase, *field_idx, buffer.clone()),
             };
             match result {
                 Ok(()) => {
@@ -886,8 +967,149 @@ mod tests {
     fn test_report_value_roundtrip() {
         let mut u = Ustawienia::default();
         let phase = sorted_phase_keys(&u)[0].clone();
-        set_report_value(&mut u, &phase, 0, "nowy_katalog".to_string());
+        // "nowy_katalog" - względna nazwa bez separatora, jeszcze nieutworzona,
+        // ale jej przodek (katalog roboczy ".") istnieje i jest zapisywalny
+        // (uruchamiamy testy z katalogu projektu) -> musi zostać zaakceptowana.
+        let result = set_report_value(&mut u, &phase, 0, "nowy_katalog".to_string());
+        assert!(result.is_ok(), "Poprawna, jeszcze nieutworzona ścieżka z zapisywalnym rodzicem powinna być zaakceptowana: {:?}", result);
         assert_eq!(get_report_value(&u, &phase, 0), "nowy_katalog");
+    }
+
+    #[test]
+    fn test_report_value_pole_1_i_2_bez_walidacji() {
+        // plik_operacyjny / plik_dziennika to same NAZWY plików, nie ścieżki
+        // katalogów - nie przechodzą przez walidację `katalog` i akceptują
+        // dowolny string, tak jak dotąd (żeby nie zepsuć istniejącego
+        // zachowania dla pól, które nie są przedmiotem tej poprawki).
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        assert!(set_report_value(&mut u, &phase, 1, String::new()).is_ok());
+        assert!(set_report_value(&mut u, &phase, 2, "  ".to_string()).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA: walidacja katalogu raportów per faza (set_report_value, pole 0)
+    //
+    // Bez tej walidacji dowolny string wpisany przez operatora w podmenu
+    // raportów trafiał NIEWALIDOWANY do `ustawienia.json`, a stamtąd do
+    // `fs::create_dir_all(...).unwrap_or_default()` (tolerancyjne) i zaraz
+    // potem `File::create(...).unwrap()` (panika) w co najmniej 12 fazach
+    // przy starcie pierwszej uruchomionej fazy — utrata całego przebiegu.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_report_katalog_pusty_string_odrzucony() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let original = get_report_value(&u, &phase, 0);
+
+        let result = set_report_value(&mut u, &phase, 0, String::new());
+
+        assert!(result.is_err(), "Pusty katalog musi zostać odrzucony");
+        assert_eq!(get_report_value(&u, &phase, 0), original, "Poprzednia poprawna wartość musi pozostać nietknięta");
+    }
+
+    #[test]
+    fn test_report_katalog_sam_bialy_znak_odrzucony() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let original = get_report_value(&u, &phase, 0);
+
+        let result = set_report_value(&mut u, &phase, 0, "   ".to_string());
+
+        assert!(result.is_err(), "Sam biały znak nie jest poprawnym katalogiem");
+        assert_eq!(get_report_value(&u, &phase, 0), original);
+    }
+
+    #[test]
+    fn test_report_katalog_wskazujacy_na_plik_regularny_odrzucony() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let original = get_report_value(&u, &phase, 0);
+
+        // Prawdziwy, istniejący PLIK (nie katalog) - operator pomylił pole.
+        let plik = NamedTempFile::new().expect("nie udało się utworzyć pliku tymczasowego");
+        let sciezka_pliku = plik.path().to_str().unwrap().to_string();
+
+        let result = set_report_value(&mut u, &phase, 0, sciezka_pliku);
+
+        assert!(result.is_err(), "Ścieżka do istniejącego PLIKU nie może zostać zaakceptowana jako katalog raportów");
+        assert_eq!(get_report_value(&u, &phase, 0), original, "Zła wartość nie może nadpisać poprzedniej poprawnej");
+    }
+
+    #[test]
+    fn test_report_katalog_niedostepny_wolumin_odrzucony() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let original = get_report_value(&u, &phase, 0);
+
+        // Prefiks tej ścieżki (/na/pewno/nie/istnieje/...) na pewno nie
+        // istnieje w żadnym rozsądnym środowisku CI/deweloperskim - symuluje
+        // niezamontowany dysk sieciowy: ŻADEN przodek tej ścieżki nie istnieje.
+        let result = set_report_value(&mut u, &phase, 0, "/na/pewno/nie/istnieje/xyz123/podkatalog/raporty".to_string());
+
+        assert!(result.is_err(), "Ścieżka na całkowicie niedostępnym wolumenie musi zostać odrzucona");
+        assert_eq!(get_report_value(&u, &phase, 0), original);
+    }
+
+    #[test]
+    fn test_report_katalog_poprawna_nieutworzona_sciezka_z_zapisywalnym_rodzicem_akceptowana() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+
+        // Rodzic (std::env::temp_dir()) istnieje i jest zapisywalny; sam
+        // podkatalog jeszcze nie istnieje - dokładnie ten przypadek, który
+        // walidacja MUSI dopuścić, żeby nie blokować legalnej konfiguracji
+        // nowych, jeszcze nieutworzonych katalogów raportów.
+        let nowy = std::env::temp_dir().join(format!("weryfikator_test_katalog_raportow_{}", std::process::id()));
+        // Sprzątanie na wypadek pozostałości po poprzednim (przerwanym) uruchomieniu.
+        let _ = std::fs::remove_dir(&nowy);
+        let sciezka = nowy.to_str().unwrap().to_string();
+
+        let result = set_report_value(&mut u, &phase, 0, sciezka.clone());
+
+        assert!(result.is_ok(), "Nowa, jeszcze nieutworzona ścieżka z zapisywalnym rodzicem musi być zaakceptowana: {:?}", result);
+        assert_eq!(get_report_value(&u, &phase, 0), sciezka);
+        assert!(!nowy.exists(), "Walidacja NIE powinna sama tworzyć katalogu - to zadanie `create_dir_all` przy starcie fazy");
+    }
+
+    #[test]
+    fn test_report_katalog_istniejacy_katalog_akceptowany() {
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let tmp = std::env::temp_dir();
+
+        let result = set_report_value(&mut u, &phase, 0, tmp.to_str().unwrap().to_string());
+
+        assert!(result.is_ok());
+        assert_eq!(get_report_value(&u, &phase, 0), tmp.to_str().unwrap());
+    }
+
+    #[test]
+    fn test_text_edit_key_enter_z_nieprawidlowym_katalogiem_raportu_pokazuje_blad_i_nie_zapisuje() {
+        // Ten sam kontrakt UI co `test_text_edit_enter_with_invalid_value_shows_error_and_stays_open`
+        // dla pola listy głównej, ale dla ścieżki EditTarget::Report - dowodzi,
+        // że handler klawisza Enter faktycznie korzysta z wyniku
+        // `set_report_value` (a nie ignoruje go), pokazuje błąd operatorowi i
+        // zostawia nakładkę otwartą zamiast cicho zapisać złą wartość.
+        let mut u = Ustawienia::default();
+        let phase = sorted_phase_keys(&u)[0].clone();
+        let original = get_report_value(&u, &phase, 0);
+        let mut state = SettingsUiState::new();
+        state.edit = EditMode::Text {
+            target: EditTarget::Report { phase: phase.clone(), field_idx: 0 },
+            buffer: String::new(),
+            cursor: 0,
+            error: None,
+        };
+
+        handle_key(key(KeyCode::Enter), &mut state, &mut u);
+
+        match state.edit {
+            EditMode::Text { error: Some(_), target: EditTarget::Report { field_idx: 0, .. }, .. } => {}
+            _ => panic!("Pusty katalog raportu powinien zostawić nakładkę otwartą z komunikatem błędu"),
+        }
+        assert_eq!(get_report_value(&u, &phase, 0), original, "Zła wartość nie mogła trafić do stanu");
     }
 
     // ------------------------------------------------------------------

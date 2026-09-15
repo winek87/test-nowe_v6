@@ -242,6 +242,70 @@ fn verify_candidate(ext: &str, bytes: &[u8]) -> bool {
 }
 
 // ============================================================================
+// DOBÓR ZADAŃ: KWALIFIKACJA PER KATEGORIA ROZSZERZENIA
+// ============================================================================
+
+/// Rozstrzyga, czy wiersz kwalifikuje się do Fazy 18 — WYŁĄCZNIE w obrębie
+/// swojej kategorii rozszerzenia (obraz ALBO archiwum, nigdy obie naraz).
+///
+/// Kolumny `structure_ok_*` ustawia wyłącznie Faza 11, i to tylko dla
+/// rozszerzeń archiwów; kolumny `media_decoded_*`/`pixels_ok_*` ustawia
+/// wyłącznie Faza 13, i to tylko dla rozszerzeń obrazkowych. Dla wiersza
+/// obrazu `structure_ok_*` jest więc ZAWSZE `NULL`, a dla wiersza archiwum
+/// `media_decoded_*`/`pixels_ok_*` jest ZAWSZE `NULL`. Gdyby którakolwiek
+/// gałąź patrzyła na kolumnę spoza swojej kategorii, `NULL` (nasza umowna
+/// wartość "nie wiadomo, spróbuj") fałszywie kwalifikowałby KAŻDY zdrowy
+/// plik drugiej kategorii — dlatego `is_image`/`is_archive` MUSZĄ całkowicie
+/// odgradzać gałęzie od siebie, zanim jakakolwiek kolumna zostanie sprawdzona.
+///
+/// Wewnątrz właściwej gałęzi `NULL` nadal oznacza "brak diagnostyki, spróbuj"
+/// — to bezpieczne, bo wynik i tak przechodzi przez obowiązkową weryfikację
+/// dekodowaniem/otwarciem archiwum ([`verify_candidate`]) przed zapisem.
+fn qualifies_for_splice(
+    is_image: bool,
+    is_archive: bool,
+    media_decoded_ufs: Option<bool>,
+    media_decoded_script: Option<bool>,
+    pixels_ok_ufs: Option<bool>,
+    pixels_ok_script: Option<bool>,
+    structure_ok_ufs: Option<bool>,
+    structure_ok_script: Option<bool>,
+) -> bool {
+    if is_image {
+        let ufs_zawiodl = media_decoded_ufs == Some(false)
+            || media_decoded_ufs.is_none()
+            || pixels_ok_ufs == Some(false);
+        let script_zawiodl = media_decoded_script == Some(false)
+            || media_decoded_script.is_none()
+            || pixels_ok_script == Some(false);
+        ufs_zawiodl && script_zawiodl
+    } else if is_archive {
+        let ufs_zawiodl = structure_ok_ufs == Some(false) || structure_ok_ufs.is_none();
+        let script_zawiodl = structure_ok_script == Some(false) || structure_ok_script.is_none();
+        ufs_zawiodl && script_zawiodl
+    } else {
+        false
+    }
+}
+
+/// Buduje unikalną, deterministyczną nazwę pliku wynikowego z PEŁNEJ
+/// względnej ścieżki źródłowej — nie tylko z `file_stem()`. Dwa różne pliki
+/// o tej samej nazwie z różnych podkatalogów (np. `DCIM/100/IMG_0001.JPG` i
+/// `DCIM/101/IMG_0001.JPG`) trafiają do WSPÓLNEGO, płaskiego `target_dir` i
+/// są przetwarzane równolegle (`tasks.par_chunks`) — bez tego rozróżnika
+/// jeden wynik cicho nadpisywałby drugi. Wzorowane na `unikalny_podkatalog`
+/// z `repair_modules::mp4_autopilot` (ten sam problem, ten sam pomysł:
+/// krótki, stabilny hash pełnej ścieżki źródłowej wpięty w wynikową nazwę).
+fn unikalna_nazwa_wyniku(rel_path: &str, ext: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rel_path.hash(&mut hasher);
+    let hash = hasher.finish();
+    let stem = Path::new(rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("plik");
+    format!("{}_{:016x}_smartsplice.{}", stem, hash, ext)
+}
+
+// ============================================================================
 // GŁÓWNA PĘTLA PRZETWARZANIA
 // ============================================================================
 
@@ -279,8 +343,7 @@ fn process_stream(
 
                     match accepted {
                         Some(final_bytes) => {
-                            let stem = Path::new(&task.rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("plik");
-                            let target_path = target_dir.join(format!("{}_smartsplice.{}", stem, task.ext));
+                            let target_path = target_dir.join(unikalna_nazwa_wyniku(&task.rel_path, &task.ext));
                             if let Some(parent) = target_path.parent() { let _ = fs::create_dir_all(parent); }
 
                             match File::create(&target_path).and_then(|mut f| f.write_all(&final_bytes)) {
@@ -374,29 +437,61 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // Brak danych (NULL) traktujemy jako "nie wiadomo, spróbuj" — warunek i
     // tak jest bramkowany OBOWIĄZKOWĄ weryfikacją wyniku, więc próba
     // niepotrzebna kosztuje tylko czas, nigdy poprawność.
+    //
+    // UWAGA: rozstrzygnięcie "czy zawiodło" MUSI się odbyć w Rust, PO
+    // ustaleniu kategorii rozszerzenia (`qualifies_for_splice`), a nie w
+    // samym SQL. `structure_ok_*` jest zawsze NULL dla obrazów, a
+    // `media_decoded_*`/`pixels_ok_*` zawsze NULL dla archiwów — warunek SQL
+    // typu "(gałąź obrazów) OR (gałąź archiwów)" byłby więc logicznie zawsze
+    // prawdziwy (jedna z gałęzi zawsze "wygrywa" przez same NULL-e),
+    // niezależnie od faktycznego stanu pliku. Dlatego zapytanie pobiera tu
+    // WSZYSTKIE potencjalne kolumny diagnostyczne, a kwalifikację per
+    // kategoria wykonuje czysta, testowalna funkcja.
     let mut stmt = conn.prepare(
-        "SELECT id, relative_path FROM files
+        "SELECT id, relative_path,
+                media_decoded_ufs, media_decoded_script,
+                pixels_ok_ufs, pixels_ok_script,
+                structure_ok_ufs, structure_ok_script
+         FROM files
          WHERE found_in_ufs = 1 AND found_in_script = 1
-           AND (phase18_done = 0 OR phase18_done IS NULL)
-           AND (
-                (   (media_decoded_ufs = 0 OR media_decoded_ufs IS NULL OR pixels_ok_ufs = 0)
-                AND (media_decoded_script = 0 OR media_decoded_script IS NULL OR pixels_ok_script = 0) )
-             OR (   (structure_ok_ufs = 0 OR structure_ok_ufs IS NULL)
-                AND (structure_ok_script = 0 OR structure_ok_script IS NULL) )
-           )"
+           AND (phase18_done = 0 OR phase18_done IS NULL)"
     )?;
 
     let mut tasks = Vec::new();
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<bool>>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
+        ))
+    })?;
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel) = r;
+        let (id, rel, media_decoded_ufs, media_decoded_script, pixels_ok_ufs, pixels_ok_script, structure_ok_ufs, structure_ok_script) = r;
         let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         let is_image = ext == "jpg" || ext == "jpeg" || ext == "png";
         let is_archive = crate::zip_splice::is_zip_based_extension(&format!(".{}", ext))
             || ext == "tar";
-        if is_image || is_archive {
-            tasks.push(Task { id, rel_path: rel, ext });
+        if !(is_image || is_archive) {
+            continue;
         }
+        if !qualifies_for_splice(
+            is_image,
+            is_archive,
+            media_decoded_ufs,
+            media_decoded_script,
+            pixels_ok_ufs,
+            pixels_ok_script,
+            structure_ok_ufs,
+            structure_ok_script,
+        ) {
+            continue;
+        }
+        tasks.push(Task { id, rel_path: rel, ext });
     }
     drop(stmt);
 
@@ -838,5 +933,107 @@ mod tests {
                 ".{}: śmieci nie mogą przejść weryfikacji", ext
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // qualifies_for_splice - regresja błędu KRYTYCZNEGO: zapytanie SQL nie
+    // może fałszywie kwalifikować zdrowych plików przez NULL w kolumnie
+    // spoza właściwej kategorii rozszerzenia.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_healthy_image_with_null_structure_ok_does_not_qualify() {
+        // Obraz: structure_ok_* jest zawsze NULL (ustawia je wyłącznie Faza
+        // 11, tylko dla archiwów), a media_decoded_* = 1 po OBU stronach ->
+        // plik jest w pełni sprawny i NIE może trafić do Fazy 18.
+        assert!(!qualifies_for_splice(
+            true,  // is_image
+            false, // is_archive
+            Some(true), Some(true),   // media_decoded_ufs/script - zdrowy
+            Some(true), Some(true),   // pixels_ok_ufs/script - zdrowy
+            None, None,               // structure_ok_ufs/script - zawsze NULL dla obrazu
+        ));
+    }
+
+    #[test]
+    fn test_healthy_archive_with_null_media_decoded_does_not_qualify() {
+        // Archiwum: media_decoded_*/pixels_ok_* jest zawsze NULL (ustawia je
+        // wyłącznie Faza 13, tylko dla obrazów), a structure_ok_* = 1 po OBU
+        // stronach -> plik jest w pełni sprawny i NIE może trafić do Fazy 18.
+        assert!(!qualifies_for_splice(
+            false, // is_image
+            true,  // is_archive
+            None, None,               // media_decoded_ufs/script - zawsze NULL dla archiwum
+            None, None,               // pixels_ok_ufs/script - zawsze NULL dla archiwum
+            Some(true), Some(true),   // structure_ok_ufs/script - zdrowy
+        ));
+    }
+
+    #[test]
+    fn test_image_failing_on_both_sides_qualifies() {
+        // Scenariusz właściwy dla Fazy 18: obraz nie zdekodował się poprawnie
+        // po ŻADNEJ stronie.
+        assert!(qualifies_for_splice(
+            true, false,
+            Some(false), Some(false),
+            Some(false), Some(false),
+            None, None,
+        ));
+    }
+
+    #[test]
+    fn test_archive_failing_on_both_sides_qualifies() {
+        assert!(qualifies_for_splice(
+            false, true,
+            None, None,
+            None, None,
+            Some(false), Some(false),
+        ));
+    }
+
+    #[test]
+    fn test_image_failing_only_on_one_side_does_not_qualify() {
+        // Jedna strona zdrowa -> zwykła ścieżka wyboru całościowego (Faza
+        // 8/9) wystarczy, nie potrzeba składania z dwóch uszkodzonych kopii.
+        assert!(!qualifies_for_splice(
+            true, false,
+            Some(false), Some(true), // UFS zawiódł, Skrypt zdrowy
+            Some(false), Some(true),
+            None, None,
+        ));
+    }
+
+    #[test]
+    fn test_unknown_extension_never_qualifies() {
+        // is_image=false i is_archive=false jednocześnie - musi być
+        // bezpiecznie odrzucone, niezależnie od zawartości kolumn.
+        assert!(!qualifies_for_splice(
+            false, false,
+            Some(false), Some(false),
+            Some(false), Some(false),
+            Some(false), Some(false),
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // unikalna_nazwa_wyniku - regresja błędu WYSOKIEGO: kolizja nazw plików
+    // wynikowych z różnych podkatalogów + wyścig wątków Rayon (dwa różne
+    // pliki źródłowe nadpisujące się nawzajem w płaskim target_dir).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_unikalna_nazwa_wyniku_rozroznia_pliki_o_tej_samej_nazwie_z_roznych_katalogow() {
+        let a = unikalna_nazwa_wyniku("DCIM/100/IMG_0001.JPG", "jpg");
+        let b = unikalna_nazwa_wyniku("DCIM/101/IMG_0001.JPG", "jpg");
+        assert_ne!(a, b, "Dwa różne pliki źródłowe o tej samej nazwie muszą dać RÓŻNE ścieżki wynikowe");
+    }
+
+    #[test]
+    fn test_unikalna_nazwa_wyniku_jest_deterministyczna() {
+        // Ten sam plik źródłowy zawsze musi dać tę samą nazwę wynikową
+        // (ważne przy ponownym przebiegu Fazy 18 na tym samym korpusie).
+        let a1 = unikalna_nazwa_wyniku("DCIM/100/IMG_0001.JPG", "jpg");
+        let a2 = unikalna_nazwa_wyniku("DCIM/100/IMG_0001.JPG", "jpg");
+        assert_eq!(a1, a2);
     }
 }

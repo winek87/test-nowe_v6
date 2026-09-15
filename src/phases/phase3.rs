@@ -363,17 +363,51 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 // Odczyt pierwszego fragmentu WYŁĄCZNIE do analizy forensycznej nagłówka
                 // (Magic Bytes, anomalie klastra). Właściwy hash liczy niżej hash_file().
-                let first_read = file.read(&mut buffer).unwrap_or(0);
+                //
+                // UWAGA KRYMINALISTYCZNA (nie zamieniać z powrotem na `.unwrap_or(0)`):
+                // musimy rozróżnić FAKTYCZNY błąd odczytu od zwykłego EOF na pustym
+                // pliku. `Ok(0)` z `Read::read()` przy świeżo otwartym pliku znaczy
+                // "plik ma 0 bajtów" - to jest poprawny, oczekiwany wynik. `Err(_)`
+                // znaczy realny błąd I/O (bad sector, odłączony nośnik, zniknięcie
+                // pliku) i NIE WOLNO go cicho zamieniać na "pusty plik" przez
+                // `unwrap_or(0)`, bo inaczej trafia w tę samą gałąź co wydmuszka 0 B.
+                let read_result = file.read(&mut buffer);
                 drop(file); // hash_file() otworzy plik ponownie samodzielnie (mmap/bufread)
 
+                let first_read = match read_result {
+                    Ok(n) => n,
+                    Err(_) => {
+                        stats.hash_errors.fetch_add(1, Ordering::Relaxed);
+                        log_buf.push(format!("[{}] Błąd I/O (odczyt nagłówka): \"{}\"", side_label, task.rel_path));
+                        results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        continue;
+                    }
+                };
+
                 if first_read == 0 {
-                    // Pusty plik: hash_file() poprawnie policzy hash pustego ciągu (BLAKE3 pustki)
-                    let empty_hash = stats.thread_activity.track_current(|| hash_file(&full_path)).ok();
-                    results.push(ScanResult {
-                        id: task.id,
-                        hash: empty_hash,
-                        magic_ok: Some(true), io_error: Some(false)
-                    });
+                    // Pusty plik: hash_file() poprawnie policzy hash pustego ciągu (BLAKE3 pustki).
+                    //
+                    // UWAGA KRYMINALISTYCZNA: jeśli hash_file() MIMO WSZYSTKO zawiedzie
+                    // (np. plik zniknął albo zmieniły się uprawnienia w okienku czasowym
+                    // między `File::open()` wyżej a tym wywołaniem), to jest to FAKTYCZNY
+                    // błąd I/O, a NIE pusty plik. `hash=None` razem z na sztywno wpisanym
+                    // `io_error=Some(false)` dawało kombinację, która nigdy nie spełnia
+                    // warunku `phase3_done` (`hash_ufs IS NOT NULL OR io_error_ufs = 1`) -
+                    // plik wracał do kolejki i był przetwarzany od nowa w nieskończoność.
+                    match stats.thread_activity.track_current(|| hash_file(&full_path)) {
+                        Ok(h) => {
+                            results.push(ScanResult {
+                                id: task.id,
+                                hash: Some(h),
+                                magic_ok: Some(true), io_error: Some(false)
+                            });
+                        }
+                        Err(_) => {
+                            stats.hash_errors.fetch_add(1, Ordering::Relaxed);
+                            log_buf.push(format!("[{}] Błąd I/O (hashowanie pustego pliku nie powiodło się): \"{}\"", side_label, task.rel_path));
+                            results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        }
+                    }
                     continue;
                 }
 
@@ -1282,5 +1316,98 @@ mod tests {
         for line in block.lines().skip(1) {
             assert!(line.ends_with(": 0"), "Oczekiwano zera dla świeżo utworzonych LiveStats: {}", line);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Regresja: prawdziwy błąd I/O nie może udawać pustego pliku
+    // ------------------------------------------------------------------
+
+    /// Pomocnicza konstrukcja `StreamCtx` z jednym zadaniem — resztę pól
+    /// wypełnia neutralnymi wartościami, zwraca też odbiorcę `ScanMsg`, żeby
+    /// test mógł zbadać wynik wysłany do wątku bazy.
+    fn uruchom_strumien_z_jednym_zadaniem(
+        base_path: &Path,
+        rel_path: &str,
+    ) -> Vec<ScanResult> {
+        let tasks = vec![Task { id: 42, rel_path: rel_path.to_string() }];
+        let stats = LiveStats::new(1);
+        let other_stats = LiveStats::new(1);
+        let (tx_db, rx_db) = mpsc::sync_channel(8);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let opr_log = Arc::new(Mutex::new(File::create(log_dir.path().join("log.txt")).unwrap()));
+
+        process_side_stream(StreamCtx {
+            base_path,
+            tasks: &tasks,
+            side_label: "UFS Explorer",
+            stats: &stats,
+            other_stats: &other_stats,
+            tx_db,
+            is_ufs: true,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            opr_log,
+            start_time: Instant::now(),
+        });
+
+        let mut wyniki = Vec::new();
+        while let Ok(msg) = rx_db.try_recv() {
+            match msg {
+                ScanMsg::UfsChunk(r) | ScanMsg::ScriptChunk(r) => wyniki.extend(r),
+            }
+        }
+        wyniki
+    }
+
+    /// Odtwarza dokładnie opisany scenariusz: `File::open()` się udaje, ale
+    /// właściwy odczyt zawodzi FAKTYCZNYM błędem I/O (nie EOF na pustym
+    /// pliku). Na Linuksie otwarcie katalogu jako "pliku" jest legalne, ale
+    /// `read()` na takim uchwycie zwraca błąd (EISDIR) — to niezawodny,
+    /// przenośny w obrębie Linuksa sposób na wywołanie w teście dokładnie tej
+    /// klasy błędu, bez potrzeby manipulacji uprawnieniami czy odłączania
+    /// nośnika.
+    ///
+    /// Przed poprawką `file.read(&mut buffer).unwrap_or(0)` zamieniał ten
+    /// błąd w `first_read == 0`, program traktował plik jak pustą wydmuszkę,
+    /// próbował go zahashować przez `hash_file()` (co też się nie udaje na
+    /// katalogu) i w efekcie zapisywał `hash = None`, `io_error = Some(false)`
+    /// — kombinację, która NIGDY nie spełnia warunku `phase3_done` i
+    /// powodowała nieskończone ponawianie.
+    #[test]
+    fn test_prawdziwy_blad_io_przy_odczycie_naglowka_nie_jest_pustym_plikiem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nie_jest_plikiem")).unwrap();
+
+        let wyniki = uruchom_strumien_z_jednym_zadaniem(dir.path(), "nie_jest_plikiem");
+
+        assert_eq!(wyniki.len(), 1);
+        let r = &wyniki[0];
+        assert_eq!(r.id, 42);
+        assert_eq!(r.hash, None, "przy błędzie I/O nie ma sensownego hashu do zapisania");
+        assert_eq!(
+            r.io_error, Some(true),
+            "prawdziwy błąd I/O MUSI zostać zgłoszony jako io_error=true - inaczej phase3_done \
+             (hash_ufs IS NOT NULL OR io_error_ufs = 1) nigdy się nie spełnia i plik wraca do \
+             kolejki w nieskończoność"
+        );
+    }
+
+    /// Kontrola pozytywna dla powyższego: PRAWDZIWIE pusty plik (0 bajtów) w
+    /// dalszym ciągu musi zostać poprawnie policzony i oznaczony jako
+    /// `io_error = Some(false)` — rozróżnienie EOF-na-pustym-pliku od
+    /// faktycznego błędu I/O nie może zepsuć poprawnej ścieżki.
+    #[test]
+    fn test_naprawde_pusty_plik_nadal_dostaje_hash_i_brak_bledu() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pusty.bin"), b"").unwrap();
+
+        let wyniki = uruchom_strumien_z_jednym_zadaniem(dir.path(), "pusty.bin");
+
+        assert_eq!(wyniki.len(), 1);
+        let r = &wyniki[0];
+        assert!(r.hash.is_some(), "pusty plik ma poprawny hash BLAKE3 pustego ciągu, nie None");
+        assert_eq!(r.io_error, Some(false), "pusty plik to NIE jest błąd I/O");
     }
 }

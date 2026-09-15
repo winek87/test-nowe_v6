@@ -332,8 +332,21 @@ pub fn splice_flv(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
     Some(wynik)
 }
 
-/// Wariant [`analyze_flv`] operujący na pliku na dysku.
+/// Górny limit rozmiaru pliku wczytywanego w całości do pamięci przed
+/// analizą. Ten sam próg i uzasadnienie co
+/// `mp4_engines::boxes::LIMIT_DIAGNOZY_W_RAM`/`video_image::LIMIT_DIAGNOZY_W_RAM`:
+/// Faza 19 przetwarza pliki równolegle (Rayon), więc szczyt zużycia RAM to
+/// wielokrotność tej wartości.
+const LIMIT_DIAGNOZY_W_RAM: u64 = 256 * 1024 * 1024; // 256 MB
+
+/// Wariant [`analyze_flv`] operujący na pliku na dysku. Odmawia wczytania
+/// plików większych niż [`LIMIT_DIAGNOZY_W_RAM`] (`None`, tak samo jak przy
+/// każdej innej porażce odczytu).
 pub fn analyze_flv_file(path: &std::path::Path) -> Option<FlvAnalysis> {
+    let rozmiar = std::fs::metadata(path).ok()?.len();
+    if rozmiar > LIMIT_DIAGNOZY_W_RAM {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     analyze_flv(&bytes)
 }
@@ -345,6 +358,20 @@ pub fn analyze_flv_file(path: &std::path::Path) -> Option<FlvAnalysis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESJA: plik większy niż `LIMIT_DIAGNOZY_W_RAM` musi zostać
+    /// odrzucony przed wczytaniem w całości do pamięci. Plik rzadki
+    /// (sparse) - tani i szybki.
+    #[test]
+    fn test_analyze_flv_file_odrzuca_plik_wiekszy_niz_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("ogromny.flv");
+        let plik = std::fs::File::create(&sciezka).unwrap();
+        plik.set_len(LIMIT_DIAGNOZY_W_RAM + 1).unwrap();
+        drop(plik);
+
+        assert_eq!(analyze_flv_file(&sciezka), None);
+    }
 
     /// Buduje pojedynczy tag FLV wraz z następującym po nim polem
     /// `PreviousTagSize` (poprawnym, chyba że `corrupt_chain`).

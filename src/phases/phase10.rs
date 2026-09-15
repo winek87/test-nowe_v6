@@ -242,8 +242,14 @@ impl AnomalyCategory {
 /// Metody 3 (one-liner).
 ///
 /// **Metoda 2 — Profilowanie Kodowania:** wykrywa BOM (`FF FE`/`FE FF` →
-/// UTF-16, `EF BB BF` → UTF-8 z BOM) na starcie bufora. Dla pozostałych:
-/// obecność bajtu `0x00` → nieważny (`"Twardy Bajt NULL"`); poprawny UTF-8
+/// UTF-16, `EF BB BF` → UTF-8 z BOM) na starcie bufora. Dla BOM UTF-16
+/// zawartość PO BOM jest dekodowana jako jednostki 16-bitowe (`char::decode_utf16`,
+/// z odpowiednią endianness) i walidowana: >1% niesparowanych surogatów
+/// (błędów dekodowania) LUB >5% znaków kontrolnych → nieważny (`"Zupa
+/// Binarna"`) — to chroni przed podrobionym BOM przemycającym dowolny
+/// binarny payload (2 bajty `FF FE` przed losowymi danymi nie wystarczą
+/// już do ominięcia walidacji). Dla pozostałych (bez BOM UTF-16): obecność
+/// bajtu `0x00` → nieważny (`"Twardy Bajt NULL"`); poprawny UTF-8
 /// złożony z samych bajtów <128 → `"ASCII"`; poprawny UTF-8 z bajtami ≥128 →
 /// zostaje `"UTF-8"`; niepoprawny UTF-8 z >5% znaków kontrolnych → nieważny
 /// (`"Zupa Binarna"`); niepoprawny UTF-8 z niewielkim odsetkiem kontrolnych →
@@ -271,8 +277,50 @@ fn analyze_text_file(path: &Path, file_size: u64) -> std::result::Result<TextAna
     let mut is_oneliner = false;
 
     // METODA 2: Profil Kodowania (Detekcja BOM)
-    if slice.starts_with(&[0xFF, 0xFE]) || slice.starts_with(&[0xFE, 0xFF]) {
+    // UWAGA BEZPIECZEŃSTWA: BOM to tylko 2 pierwsze bajty pliku - łatwo je
+    // podrobić i przemycić dowolny binarny payload jako rzekomy "UTF-16".
+    // Dlatego zawartość PO BOM jest tu walidowana analogicznie do gałęzi
+    // UTF-8 poniżej (dekodowanie jednostek 16-bitowych + próg znaków
+    // kontrolnych/błędów dekodowania), zamiast być całkowicie pomijana.
+    let utf16_le = slice.starts_with(&[0xFF, 0xFE]);
+    let utf16_be = !utf16_le && slice.starts_with(&[0xFE, 0xFF]);
+    if utf16_le || utf16_be {
         encoding = "UTF-16";
+        let payload = &slice[2..];
+        let units: Vec<u16> = payload
+            .chunks_exact(2)
+            .map(|c| if utf16_le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .collect();
+
+        // Próg statystyczny zastosowany tylko przy wystarczającej próbce -
+        // dla garści bajtów po BOM szum losowy uniemożliwia wiarygodną ocenę
+        // (analogicznie do progu `n.saturating_sub(4)` w gałęzi UTF-8 niżej).
+        if units.len() >= 16 {
+            let mut decode_errors = 0usize;
+            let mut ctrl = 0usize;
+            for r in char::decode_utf16(units.iter().copied()) {
+                match r {
+                    Ok(c) => {
+                        if (c as u32) < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+                            ctrl += 1;
+                        }
+                    }
+                    Err(_) => decode_errors += 1,
+                }
+            }
+            let total = units.len() as f64;
+            let error_ratio = decode_errors as f64 / total;
+            let ctrl_ratio = ctrl as f64 / total;
+            // Losowe/binarne dane podszywające się pod UTF-16 (fałszywy BOM)
+            // generują sporo niesparowanych surogatów (statystycznie >1.6%
+            // przy pełnym spektrum bajtów - patrz testy), czego prawdziwy
+            // tekst UTF-16 praktycznie nigdy nie produkuje. Próg znaków
+            // kontrolnych (>5%) pozostaje analogiczny do gałęzi UTF-8.
+            if error_ratio > 0.01 || ctrl_ratio > 0.05 {
+                is_valid = false;
+                reason = Some("Zupa Binarna (nieprawidłowe jednostki UTF-16 pod podrobionym BOM)".to_string());
+            }
+        }
     } else if slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
         encoding = "UTF-8 (BOM)";
     }
@@ -1033,6 +1081,45 @@ mod tests {
         let f = make_temp_file(&content);
         let a = analyze_text_file(f.path(), content.len() as u64).unwrap();
         assert_eq!(a.encoding, "UTF-16");
+    }
+
+    /// Regresja: podrobiony BOM UTF-16 (`FF FE`) poprzedzający binarny/losowy
+    /// payload NIE MOŻE dawać `is_valid=true`. Przed poprawką cały blok
+    /// walidacji był pomijany, gdy tylko `encoding == "UTF-16"`, więc 2 bajty
+    /// BOM wystarczały, by przemycić dowolny payload jako "poprawny tekst".
+    /// Payload generowany deterministycznym LCG (bez zależności od `rand`),
+    /// zweryfikowany empirycznie jako dający >1% niesparowanych surogatów
+    /// UTF-16 (próg walidacji), analogicznie do prawdziwych losowych bajtów.
+    #[test]
+    fn test_analyze_encoding_utf16_fake_bom_random_binary_is_invalid() {
+        let mut content = vec![0xFF, 0xFE]; // podrobiony BOM UTF-16 LE
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        for _ in 0..4000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            content.push((state >> 33) as u8);
+        }
+        let f = make_temp_file(&content);
+        let a = analyze_text_file(f.path(), content.len() as u64).unwrap();
+        assert_eq!(a.encoding, "UTF-16");
+        assert!(!a.is_valid, "Podrobiony BOM UTF-16 z losową zawartością musi zostać odrzucony");
+        assert!(a.reason.unwrap().contains("Zupa Binarna"));
+    }
+
+    /// Kontrola przeciw-fałszywie-dodatniemu: prawdziwy tekst UTF-16LE
+    /// (z polskimi znakami diakrytycznymi) pod poprawnym BOM nadal ma dawać
+    /// `is_valid=true` - nowa walidacja nie może psuć obsługi legalnych
+    /// plików UTF-16.
+    #[test]
+    fn test_analyze_encoding_utf16_bom_genuine_text_is_valid() {
+        let text = "Zażółć gęślą jaźń. Zwykly tekst UTF-16 z duza iloscia znakow.".repeat(5);
+        let mut content = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            content.extend_from_slice(&unit.to_le_bytes());
+        }
+        let f = make_temp_file(&content);
+        let a = analyze_text_file(f.path(), content.len() as u64).unwrap();
+        assert_eq!(a.encoding, "UTF-16");
+        assert!(a.is_valid, "Prawdziwy tekst UTF-16 nie powinien zostac odrzucony");
     }
 
     #[test]

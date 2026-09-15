@@ -376,7 +376,17 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
         let mut has_manifest = false; let mut has_meta = false;
         let mut has_encrypted = false;
 
-        for i in 0..std::cmp::min(archive.len(), 2000) { 
+        // UWAGA BEZPIECZEŃSTWA (naprawiony bug zip-bomby): poprzednio suma
+        // `uncompressed_total` (i detekcja szyfrowania/DNA formatu DOCX/XLSX/
+        // APK/EPUB) liczyła TYLKO pierwsze 2000 wpisów, mimo że limit liczby
+        // wpisów dopuszczał archiwa do `MASS_FILES_THRESHOLD` (50 000) - wpis
+        // o dużym nieskompresowanym rozmiarze umieszczony na indeksie >=2000
+        // przechodził KOMPLETNIE niezauważony. `archive.by_index()` czyta
+        // wyłącznie metadane nagłówka lokalnego (nie dekompresuje danych), więc
+        // iteracja po WSZYSTKICH wpisach jest tania nawet dla maksymalnej
+        // dopuszczalnej liczby wpisów (`archive.len()` jest już ograniczone do
+        // <= `MASS_FILES_THRESHOLD` przez sprawdzenie kilka linii wyżej).
+        for i in 0..archive.len() {
             if let Ok(inner_file) = archive.by_index(i) {
                 uncompressed_total = uncompressed_total.saturating_add(inner_file.size());
                 if inner_file.encrypted() { has_encrypted = true; }
@@ -1433,6 +1443,64 @@ mod tests {
         let a = analyze_archive(&path, size, false).unwrap();
         assert!(a.is_valid);
         assert_eq!(a.internal_files_count, 1);
+    }
+
+    /// Regresja: suma `uncompressed_total` (a wraz z nią detekcja bomby
+    /// plikowej) MUSI uwzględniać WSZYSTKIE wpisy archiwum, nie tylko
+    /// pierwsze 2000. Przed poprawką pętla sumująca była ograniczona do
+    /// `0..min(archive.len(), 2000)`, więc duży wpis umieszczony na indeksie
+    /// >= 2000 (a limit LICZBY wpisów dopuszcza aż `MASS_FILES_THRESHOLD` =
+    /// 50 000) całkowicie omijał sumowanie i zip bomba przechodziła jako
+    /// poprawna.
+    ///
+    /// Budujemy ZIP z >2000 malutkimi wpisami + jednym wpisem o indeksie
+    /// 2050 (a więc poza starym limitem 2000) zawierającym ponad 1 GB
+    /// wysoce kompresowalnych (samych zer) danych — na dysku archiwum
+    /// pozostaje małe (dzięki kompresji), ale zadeklarowany rozmiar
+    /// nieskompresowany w metadanych ZIP jest ogromny. Dane zapisujemy
+    /// w małych porcjach (bez alokowania 1 GB naraz), by test był lekki
+    /// pamięciowo.
+    #[test]
+    fn test_analyze_zip_bomb_hidden_beyond_old_2000_sample_cap_is_detected() {
+        const ENTRY_COUNT: usize = 2100;
+        const BOMB_ENTRY_INDEX: usize = 2050; // poza starym limitem `min(len, 2000)`
+        const BOMB_ENTRY_SIZE: u64 = 1_050_000_000; // >1GB (próg BOMB_ABSOLUTE_THRESHOLD)
+
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut writer = ZipWriter::new(cursor);
+            let options: FileOptions<()> = FileOptions::default();
+            let zero_chunk = vec![0u8; 1_048_576]; // 1 MiB, zapisywany wielokrotnie
+
+            for i in 0..ENTRY_COUNT {
+                let name = format!("wpis_{i:05}.txt");
+                writer.start_file(&name, options).unwrap();
+                if i == BOMB_ENTRY_INDEX {
+                    let mut remaining = BOMB_ENTRY_SIZE;
+                    while remaining > 0 {
+                        let take = std::cmp::min(remaining, zero_chunk.len() as u64) as usize;
+                        writer.write_all(&zero_chunk[..take]).unwrap();
+                        remaining -= take as u64;
+                    }
+                } else {
+                    writer.write_all(b"x").unwrap();
+                }
+            }
+            writer.finish().unwrap();
+        }
+
+        let (_g, path) = temp_with_ext(&buf, "zip");
+        // Fizyczny rozmiar na dysku jest mały dzięki kompresji - to właśnie
+        // stwarza wysoki stosunek kompresji, cechę charakterystyczną zip bomby.
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size < 10_000_000, "Skompresowany plik powinien pozostać mały (samo zero się dobrze kompresuje)");
+
+        let a = analyze_archive(&path, file_size, false).unwrap();
+        assert_eq!(a.internal_files_count, ENTRY_COUNT);
+        assert!(a.uncompressed_size >= BOMB_ENTRY_SIZE, "Suma nieskompresowanego rozmiaru musi uwzględniać wpis poza starym limitem 2000");
+        assert!(!a.is_valid, "Zip bomba ukryta za indeksem 2000 musi zostać wykryta");
+        assert!(a.reason.unwrap().contains("Zip Bomb"));
     }
 
     #[test]

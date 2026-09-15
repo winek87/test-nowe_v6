@@ -36,16 +36,25 @@ use std::fs::{self, File};
 
 const CHUNK_SIZE: usize = 200;
 
+// `phase2_done = CASE WHEN found_in_ufs/found_in_script = 0 THEN 0 ELSE phase2_done END`:
+// nazwa kolumny bez kwalifikatora w `ON CONFLICT DO UPDATE` czyta wartość SPRZED
+// tego zapisu — `found_in_ufs/script = 0` znaczy więc "ta strona NIE była wcześniej
+// widziana", czyli ten UPSERT to prawdziwe przejście 0->1 (dysk/skrypt drugiej
+// strony dołączony PO fakcie), a nie zwykłe powtórne skanowanie tej samej,
+// niezmienionej strony korpusu — patrz testy `test_dopisanie_drugiej_strony_...`
+// i `test_powtorny_zapis_tej_samej_strony_...` niżej.
 const INSERT_SQL_UFS: &str = "
-    INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan) 
-    VALUES (?1, 1, 0, 1, ?2) 
-    ON CONFLICT(relative_path) DO UPDATE SET found_in_ufs = 1, phase1_done = 1, is_orphan = ?2
+    INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan)
+    VALUES (?1, 1, 0, 1, ?2)
+    ON CONFLICT(relative_path) DO UPDATE SET found_in_ufs = 1, phase1_done = 1, is_orphan = ?2,
+        phase2_done = CASE WHEN found_in_ufs = 0 THEN 0 ELSE phase2_done END
 ";
 
 const INSERT_SQL_SCRIPT: &str = "
-    INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan) 
-    VALUES (?1, 0, 1, 1, ?2) 
-    ON CONFLICT(relative_path) DO UPDATE SET found_in_script = 1, phase1_done = 1, is_orphan = ?2
+    INSERT INTO files (relative_path, found_in_ufs, found_in_script, phase1_done, is_orphan)
+    VALUES (?1, 0, 1, 1, ?2)
+    ON CONFLICT(relative_path) DO UPDATE SET found_in_script = 1, phase1_done = 1, is_orphan = ?2,
+        phase2_done = CASE WHEN found_in_script = 0 THEN 0 ELSE phase2_done END
 ";
 
 pub(crate) enum ScanMsg {
@@ -115,6 +124,39 @@ fn hash_path(path: &str) -> u64 {
     hasher.finish()
 }
 
+/// Zamienia ścieżkę względną na string bezpieczny do zapisu w `relative_path`
+/// (kolumna `UNIQUE`).
+///
+/// ## Dlaczego nie wystarczy `to_string_lossy()`
+///
+/// Odzyskane systemy plików regularnie dają nazwy z bajtami spoza UTF-8 —
+/// `to_string_lossy()` zamienia KAŻDY taki bajt na U+FFFD, więc DWIE różne,
+/// realne ścieżki (różne surowe bajty) mogą dać IDENTYCZNY string. Ponieważ
+/// `relative_path` jest kluczem `UNIQUE` z `ON CONFLICT DO UPDATE`, druga z
+/// nich cicho SCALA SIĘ z pierwszym wierszem zamiast dostać własny — jeden z
+/// dwóch dowodów znika bezpowrotnie z bazy, bez żadnego błędu ani logu.
+///
+/// Naprawa: gdy ścieżka NIE JEST poprawnym UTF-8, doklejamy do wersji lossy
+/// deterministyczny sufiks policzony z PRAWDZIWYCH, surowych bajtów ścieżki
+/// (`OsStr::as_encoded_bytes()` — przenośne między Unix/Windows, stabilne od
+/// Rust 1.74). Dwie różne ścieżki o tych samych bajtach zawsze dostają ten
+/// sam sufiks (idempotentne między przebiegami Fazy 1), a dwie RÓŻNE ścieżki
+/// nigdy nie mogą już wylądować pod tym samym kluczem — kolizja jest
+/// strukturalnie niemożliwa, nie tylko mało prawdopodobna. Poprawne UTF-8
+/// (zdecydowana większość przypadków) przechodzi bez żadnej zmiany.
+fn sanitize_relative_path(rel: &Path) -> String {
+    let raw = rel.as_os_str();
+    match raw.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let lossy = raw.to_string_lossy().into_owned();
+            let mut hasher = DefaultHasher::new();
+            raw.as_encoded_bytes().hash(&mut hasher);
+            format!("{}__nieutf8_{:016x}", lossy, hasher.finish())
+        }
+    }
+}
+
 /// Sprawdza w systemie operacyjnym, czy ścieżka znajduje się na talerzowym dysku HDD
 fn is_hdd(path: &Path) -> bool {
     let disks = Disks::new_with_refreshed_list();
@@ -177,7 +219,7 @@ fn pre_scan_directory(
             let path = entry.path();
 
             if let Ok(rel) = path.strip_prefix(base_path) {
-                let rel_str = rel.to_string_lossy();
+                let rel_str = sanitize_relative_path(rel);
                 let path_hash = hash_path(&rel_str);
 
                 if known_hashes.contains(&path_hash) {
@@ -251,7 +293,7 @@ fn scan_directory_stream(
                 if entry.file_type().is_file() {
                     let path = entry.path();
                     if let Ok(rel) = path.strip_prefix(base_path) {
-                        let rel_str = rel.to_string_lossy().into_owned();
+                        let rel_str = sanitize_relative_path(rel);
                         let path_hash = hash_path(&rel_str);
                         
                         if !known_hashes.contains(&path_hash) {
@@ -681,6 +723,60 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Sanityzacja ścieżek spoza UTF-8 (REGRESJA — Gemini review)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sanityzacja_nie_rusza_poprawnego_utf8() {
+        let sciezka = Path::new("zdjecia/2023/DSC_0001.jpg");
+        assert_eq!(sanitize_relative_path(sciezka), "zdjecia/2023/DSC_0001.jpg");
+    }
+
+    #[test]
+    fn test_sanityzacja_polskich_znakow_nie_dodaje_sufiksu() {
+        let sciezka = Path::new("zażółć/gęślą.jaźń");
+        assert_eq!(sanitize_relative_path(sciezka), "zażółć/gęślą.jaźń");
+    }
+
+    /// Sedno naprawy: dwie RÓŻNE ścieżki (różne surowe bajty), których
+    /// `to_string_lossy()` dałoby IDENTYCZNY string (oba nieprawidłowe bajty
+    /// zamieniają się na to samo U+FFFD), muszą po sanityzacji dać RÓŻNE
+    /// wyniki — inaczej druga cicho nadpisuje/scala się z pierwszą w bazie
+    /// (kolumna `relative_path` jest `UNIQUE`).
+    #[cfg(unix)]
+    #[test]
+    fn test_sanityzacja_rozroznia_kolidujace_sciezki_spoza_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let a = OsStr::from_bytes(b"plik_\xFF.jpg");
+        let b = OsStr::from_bytes(b"plik_\xFE.jpg");
+
+        // Obie dają identyczny string przy naiwnym to_string_lossy() - to
+        // właśnie ta kolizja, którą naprawa eliminuje.
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+
+        let sa = sanitize_relative_path(Path::new(a));
+        let sb = sanitize_relative_path(Path::new(b));
+        assert_ne!(sa, sb, "różne surowe bajty muszą dać różne klucze relative_path");
+    }
+
+    /// Stabilność między przebiegami Fazy 1: te same surowe bajty muszą
+    /// zawsze dać ten sam wynik, inaczej ten sam plik dostawałby nowy wiersz
+    /// (duplikat) przy każdym kolejnym skanie.
+    #[cfg(unix)]
+    #[test]
+    fn test_sanityzacja_jest_deterministyczna_dla_tych_samych_bajtow() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"dziwna_\xC0\xC1nazwa.bin");
+        let raz = sanitize_relative_path(Path::new(raw));
+        let dwa = sanitize_relative_path(Path::new(raw));
+        assert_eq!(raz, dwa);
+    }
+
+    // ------------------------------------------------------------------
     // Hashowanie ścieżek
     // ------------------------------------------------------------------
 
@@ -1103,5 +1199,54 @@ mod tests {
             "SELECT COUNT(*) FROM files WHERE phase1_done = 1", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(ile, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Reset phase2_done na realnej zmianie found_in_* (REGRESJA — Gemini review)
+    // ------------------------------------------------------------------
+
+    fn ustaw_phase2_done(conn: &Connection, rel: &str, wartosc: bool) {
+        conn.execute(
+            "UPDATE files SET phase2_done = ?1 WHERE relative_path = ?2",
+            params![wartosc, rel],
+        ).unwrap();
+    }
+
+    fn phase2_done(conn: &Connection, rel: &str) -> bool {
+        conn.query_row(
+            "SELECT phase2_done FROM files WHERE relative_path = ?1", params![rel], |r| r.get(0),
+        ).unwrap()
+    }
+
+    /// Sedno naprawy: plik dograny do korpusu z DRUGIEJ strony PÓŹNIEJ (np.
+    /// dysk Skryptu podłączony po fakcie) musi zresetować `phase2_done`, bo
+    /// inaczej Faza 2 nigdy nie przeliczy nowo doszłej strony — jej `WHERE
+    /// phase2_done = 0` na zawsze odfiltruje ten wiersz.
+    #[test]
+    fn test_dopisanie_drugiej_strony_resetuje_phase2_done() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+
+        wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false);
+        ustaw_phase2_done(&conn, "plik.jpg", true); // symuluje wcześniejszy przebieg Fazy 2
+
+        wstaw(&conn, INSERT_SQL_SCRIPT, "plik.jpg", false); // Skrypt dochodzi PÓŹNIEJ
+
+        assert!(!phase2_done(&conn, "plik.jpg"), "realna zmiana found_in_script 0->1 musi zresetować phase2_done");
+    }
+
+    /// Zwykłe, idempotentne powtórne uruchomienie Fazy 1 na NIEZMIENIONYM
+    /// korpusie nie może kasować już policzonego wyniku Fazy 2 — inaczej
+    /// każdy kolejny przebieg Fazy 1 marnowałby całą pracę Fazy 2 na nowo.
+    #[test]
+    fn test_powtorny_zapis_tej_samej_strony_nie_resetuje_phase2_done() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+
+        wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false);
+        wstaw(&conn, INSERT_SQL_SCRIPT, "plik.jpg", false);
+        ustaw_phase2_done(&conn, "plik.jpg", true);
+
+        wstaw(&conn, INSERT_SQL_UFS, "plik.jpg", false); // ponowny skan UFS, found_in_ufs już = 1
+
+        assert!(phase2_done(&conn, "plik.jpg"), "brak realnej zmiany found_in_* nie może zresetować phase2_done");
     }
 }
