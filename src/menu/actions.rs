@@ -271,18 +271,25 @@ fn run_phase_z_opcjami(
                     .split(main_vertical[0]);
 
                 // Krok C: Dynamiczny podział LEWEJ strony
+                // REGRESJA (measure twice — druga weryfikacja Gemini, todo.menu.md):
+                // ten sam panel co `dashboard.rs` (`draw_paths_panel`), teraz
+                // przez WSPÓLNĄ stałą (`hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX`)
+                // zamiast osobnego magicznego `11` — ta zduplikowana kopia layoutu
+                // nie dostała bumpu przy dodaniu linii "Ścieżka Docelowa" w
+                // `5c444f5`, więc panel był tu obcinany na każdym ekranie fazy
+                // "na żywo". Wspólna stała eliminuje TĘ KLASĘ błędu na przyszłość.
                 let left_constraints = if !ui_state.side_texts.is_empty() {
                     vec![
-                        ratatui::layout::Constraint::Length(3), // HW
-                        ratatui::layout::Constraint::Length(8), // Disks
-                        ratatui::layout::Constraint::Length(9), // Config
-                        ratatui::layout::Constraint::Min(5),    // Aktywny Skaner (Live) pod spodem
+                        ratatui::layout::Constraint::Length(3),  // HW
+                        ratatui::layout::Constraint::Length(8),  // Disks
+                        ratatui::layout::Constraint::Length(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX), // Config
+                        ratatui::layout::Constraint::Min(5),     // Aktywny Skaner (Live) pod spodem
                     ]
                 } else {
                     vec![
-                        ratatui::layout::Constraint::Length(3), // HW
-                        ratatui::layout::Constraint::Length(8), // Disks
-                        ratatui::layout::Constraint::Min(9),    // Config do końca
+                        ratatui::layout::Constraint::Length(3),  // HW
+                        ratatui::layout::Constraint::Length(8),  // Disks
+                        ratatui::layout::Constraint::Min(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX), // Config do końca
                     ]
                 };
 
@@ -337,18 +344,25 @@ fn run_phase_z_opcjami(
                 .constraints([ratatui::layout::Constraint::Percentage(50), ratatui::layout::Constraint::Percentage(50)])
                 .split(main_vertical[0]);
 
+            // REGRESJA (measure twice — druga weryfikacja Gemini, todo.menu.md):
+            // ten sam panel co `dashboard.rs` (`draw_paths_panel`), teraz przez
+            // WSPÓLNĄ stałą (`hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX`)
+            // zamiast osobnego magicznego `11` — ta zduplikowana kopia layoutu
+            // (ekran końcowy fazy/autopilota) nie dostała bumpu przy dodaniu
+            // linii "Ścieżka Docelowa" w `5c444f5`. Wspólna stała eliminuje TĘ
+            // KLASĘ błędu na przyszłość.
             let left_constraints = if !ui_state.side_texts.is_empty() {
                 vec![
-                    ratatui::layout::Constraint::Length(3), 
-                    ratatui::layout::Constraint::Length(8), 
-                    ratatui::layout::Constraint::Length(9), 
-                    ratatui::layout::Constraint::Min(5),    
+                    ratatui::layout::Constraint::Length(3),
+                    ratatui::layout::Constraint::Length(8),
+                    ratatui::layout::Constraint::Length(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX),
+                    ratatui::layout::Constraint::Min(5),
                 ]
             } else {
                 vec![
-                    ratatui::layout::Constraint::Length(3), 
-                    ratatui::layout::Constraint::Length(8), 
-                    ratatui::layout::Constraint::Min(9),    
+                    ratatui::layout::Constraint::Length(3),
+                    ratatui::layout::Constraint::Length(8),
+                    ratatui::layout::Constraint::Min(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX),
                 ]
             };
 

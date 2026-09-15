@@ -82,6 +82,22 @@ pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect) {
     f.render_widget(disks_table, area);
 }
 
+/// Wysokość (w wierszach terminala) wymagana przez [`draw_paths_panel`], żeby
+/// zmieścić CAŁĄ treść bez obcięcia: 8 stałych linii (UFS, Skrypt, Ścieżka
+/// Docelowa, Baza Danych, Logi, Tryb I/O, Wątki CPU, Szybki Skan) + 1
+/// warunkowa ("DNG do przeglądu", widoczna tylko gdy jest coś do przejrzenia)
+/// + 2 linie obramowania (`Borders::ALL`).
+///
+/// JEDYNE źródło prawdy dla WSZYSTKICH miejsc wywołania tego panelu — patrz
+/// `dashboard.rs`/`menu/actions.rs` (dwie zduplikowane kopie layoutu ekranu
+/// fazy). Historia: `5c444f5` dodał linię "Ścieżka Docelowa" i podniósł
+/// wysokość TYLKO w `dashboard.rs`, zostawiając obie kopie w `actions.rs`
+/// obcięte (`todo.menu.md`) — druga, niezależna weryfikacja to potwierdziła.
+/// Stała istnieje właśnie po to, żeby TA KONKRETNA klasa błędu (jedno miejsce
+/// zaktualizowane, inne zapomniane) nie mogła się powtórzyć przy kolejnej
+/// zmianie treści panelu — zmiana liczby linii wymaga zmiany TYLKO tutaj.
+pub const WYSOKOSC_PANELU_SCIEZEK_MAX: u16 = 11;
+
 pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
     let max_path_len = area.width.saturating_sub(25) as usize;
     let ufs_trunc = truncate_path(&app.ustawienia.ufs_path, max_path_len);
@@ -275,6 +291,36 @@ mod tests {
             let _ = wyrenderuj(szer, wys, &mut u, draw_hw_panel);
             let _ = wyrenderuj(szer, wys, &mut u, draw_disks_panel);
             let _ = wyrenderuj(szer, wys, &mut u, draw_paths_panel);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (measure twice — druga weryfikacja Gemini, todo.menu.md):
+    // WYSOKOSC_PANELU_SCIEZEK_MAX musi faktycznie starczyć na WSZYSTKIE
+    // linie treści panelu, łącznie z warunkową ("DNG do przeglądu") - inaczej
+    // każde miejsce wywołania, które ją wykorzystuje (dashboard.rs,
+    // menu/actions.rs ×2), dziedziczyłoby to samo obcięcie, mimo współdzielenia
+    // JEDNEJ stałej. Ten test to jedyne miejsce, które musiałoby się zmienić,
+    // gdyby `draw_paths_panel` kiedyś zyskało kolejną linię treści bez
+    // odpowiedniej aktualizacji stałej — dokładnie ta "realna przyczyna, dla
+    // której problem przetrwał dwie niezależne rundy audytu", którą wskazał
+    // raport.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_wysokosc_panelu_sciezek_miesci_wszystkie_linie_wliczajac_warunkowa() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+        // Najgorszy przypadek: linia warunkowa "DNG do przeglądu" WIDOCZNA.
+        app.dng_pending_review = 3;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, WYSOKOSC_PANELU_SCIEZEK_MAX)).unwrap();
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area())).unwrap();
+        let widok = ekran(terminal.backend().buffer());
+
+        for etykieta in ["Źródło UFS", "Skrypt Aut.", "Ścieżka Docelowa", "Baza Danych", "Ścieżka Logów", "Parametry", "Wątki CPU", "Szybki Skan", "DNG do przeglądu"] {
+            assert!(widok.contains(etykieta), "etykieta \"{}\" musi zmieścić się w WYSOKOSC_PANELU_SCIEZEK_MAX={} wierszach, ale nie ma jej w renderze:\n{}", etykieta, WYSOKOSC_PANELU_SCIEZEK_MAX, widok);
         }
     }
 }

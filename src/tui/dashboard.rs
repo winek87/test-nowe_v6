@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::menu::state::AppState;
-use crate::tui::hardware_panel::{draw_disks_panel, draw_hw_panel, draw_paths_panel};
+use crate::tui::hardware_panel::{draw_disks_panel, draw_hw_panel, draw_paths_panel, WYSOKOSC_PANELU_SCIEZEK_MAX};
 
 /// Główna funkcja rysująca cały dashboard Ratatui (Menu Główne)
 pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
@@ -26,7 +26,7 @@ pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
             Constraint::Length(1),  // 0: Tytuł
             Constraint::Length(3),  // 1: Zasoby systemowe (CPU/RAM)
             Constraint::Length(8),  // 2: Tablica Dysków
-            Constraint::Length(11), // 3: Ścieżki i Parametry (8 stałych linii, w tym Ścieżka Docelowa, + 1 warunkowa "DNG do przeglądu" + obramowanie)
+            Constraint::Length(WYSOKOSC_PANELU_SCIEZEK_MAX), // 3: Ścieżki i Parametry — patrz dokumentacja stałej w hardware_panel.rs
             // Menu: `Min(0)`, nie `Min(13)`. Sztywny próg powodował, że na
             // niskim terminalu suma ograniczeń przekraczała wysokość ekranu.
             // Przy `Min(0)` lista kompresuje się do dostępnego miejsca, a
@@ -165,9 +165,12 @@ mod tests {
 
     /// Sedno punktu 3: brak paniki przy skurczonym oknie.
     ///
-    /// Suma sztywnych ograniczeń wysokości (1+3+8+10+13+1 = 36) przekraczała
-    /// wysokość niskiego terminala. Lista menu ma teraz `Min(0)`, więc
-    /// kompresuje się zamiast wypychać układ poza ekran.
+    /// Suma sztywnych ograniczeń wysokości (1+3+8+11+1 = 24, patrz stałe w
+    /// `draw_dashboard` — komentarz zaktualizowany po bumpie panelu ścieżek
+    /// 10→11 w `5c444f5`) przekraczała wysokość niskiego terminala. Lista
+    /// menu ma `Min(0)`, więc kompresuje się zamiast wypychać układ poza
+    /// ekran — dzięki temu suma sztywnych ograniczeń nie musi już nigdy
+    /// mieścić się w wysokości terminala.
     #[test]
     fn test_dashboard_nie_panikuje_na_niskim_terminalu() {
         for (szer, wys) in [(120u16, 40u16), (120, 24), (120, 12), (80, 8), (40, 5), (20, 3), (10, 1)] {
