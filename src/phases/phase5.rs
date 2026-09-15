@@ -121,6 +121,27 @@ fn compute_precise_mtime(sec: i64, nsec: i64) -> Option<i64> {
         .and_then(|total| i64::try_from(total).ok())
 }
 
+/// Rozstrzyga, czy plik (jedna strona: UFS albo Skrypt) musi wrócić na listę
+/// zadań ETAP 1. Wydzielone jako czysta funkcja — testowalna bez budowania
+/// bazy/wątków, mirror wzorca z `phase14::wolno_zapisac_symetryczne_wpisy_skryptu`.
+///
+/// NAPRAWIONY BUG (measure twice — druga weryfikacja Gemini, N2): plik z
+/// TRWALE uszkodzonym polem czasu i-node ma `lstat()` udane
+/// (`io_error_ufs = Some(false)`, zapisane jawnie — patrz komentarz przy
+/// zapisie w `process_side_stream`), ale `compute_precise_mtime`
+/// deterministycznie zwraca `None` za KAŻDYM razem — `mtime_ufs` w bazie
+/// zostaje `NULL` na zawsze. Wcześniejszy warunek (`mtime.is_none() &&
+/// io_error != Some(true)`) dopuszczał zarówno "nigdy nie przetworzono"
+/// (`io_error IS NULL`), jak i "przetworzono, ale nie da się policzyć
+/// mtime" (`io_error == Some(false)`) — taki plik trafiał z powrotem na
+/// listę zadań przy KAŻDYM uruchomieniu Fazy 5, bez końca, bez żadnej
+/// korzyści (wynik i tak zawsze `None`). Teraz wymagane jest jawnie "nigdy
+/// nie przetworzono" — plik raz przetworzony (z dowolnym wynikiem
+/// `io_error`) nie wraca do kolejki.
+fn wymaga_ponownego_odczytu(mtime: Option<i64>, io_error: Option<bool>) -> bool {
+    mtime.is_none() && io_error.is_none()
+}
+
 // ============================================================================
 // STRUKTURY DANYCH
 // ============================================================================
@@ -531,14 +552,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, m_ufs, m_scr, err_ufs, err_scr) = r;
-        
+
         if in_ufs {
-            if m_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone() }); } 
+            if wymaga_ponownego_odczytu(m_ufs, err_ufs) { ufs_tasks.push(Task { id, rel_path: rel.clone() }); }
             else { skipped_ufs += 1; }
         }
-        
+
         if in_script {
-            if m_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel }); } 
+            if wymaga_ponownego_odczytu(m_scr, err_scr) { script_tasks.push(Task { id, rel_path: rel }); }
             else { skipped_script += 1; }
         }
     }
@@ -609,9 +630,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                                     // compute_precise_mtime) - .and_then() spłaszcza
                                     // Option<Option<i64>> zamiast panikować/zawijać wartość
                                     // przy przepełnieniu. Gdy None, COALESCE zostawia
-                                    // mtime_ufs/script jak było (NULL), więc plik zostaje
-                                    // naturalnie ponownie zakolejkowany w kolejnym uruchomieniu
-                                    // Fazy 5 (patrz zapytanie w ETAP 1: `m_ufs.is_none()`).
+                                    // mtime_ufs/script jak było (NULL) - ALE `io_error_ufs`
+                                    // (kilka parametrów niżej) i tak dostaje jawne `Some(false)`
+                                    // z `res.io_error`, więc plik NIE wraca do kolejki w ETAP 1
+                                    // (`err_ufs.is_none()`) ani nie blokuje `phase5_done`
+                                    // (`io_error_ufs IS NOT NULL` w ETAP 4) - "podjęto próbę,
+                                    // wynik trwale nieobliczalny" jest odróżnione od "nigdy nie
+                                    // podjęto próby". Patrz N2 w todo.faza05.md.
                                     res.stats.as_ref().and_then(|s| s.mtime_ns),
                                     res.stats.as_ref().map(|s| s.is_symlink), res.io_error, res.id
                                 ]).unwrap();
@@ -713,10 +738,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 WHEN uid_ufs = uid_script AND gid_ufs = gid_script AND mode_ufs = mode_script AND mtime_ufs = mtime_script AND is_symlink_ufs = is_symlink_script THEN 1 
                 ELSE 0 
              END, 
-             phase5_done = CASE 
-                WHEN (found_in_ufs = 0 OR mtime_ufs IS NOT NULL OR io_error_ufs = 1) 
-                 AND (found_in_script = 0 OR mtime_script IS NOT NULL OR io_error_script = 1) THEN 1 
-                ELSE 0 
+             phase5_done = CASE
+                -- REGRESJA (measure twice, N2): io_error_ufs = 1 dopuszczało
+                -- jako ukonczone WYLACZNIE realny blad I/O - plik z udanym
+                -- lstat() ale TRWALE nieobliczalnym mtime (io_error_ufs = 0,
+                -- jawnie zapisane, patrz komentarz przy zapisie w
+                -- process_side_stream) nigdy nie spelnial zadnego warunku i
+                -- wracal do kolejki bez konca. IS NOT NULL obejmuje OBA
+                -- jawnie zapisane wyniki (0 i 1) - ukonczone znaczy teraz
+                -- podjeto probe, nie proba sie powiodla.
+                WHEN (found_in_ufs = 0 OR mtime_ufs IS NOT NULL OR io_error_ufs IS NOT NULL)
+                 AND (found_in_script = 0 OR mtime_script IS NOT NULL OR io_error_script IS NOT NULL) THEN 1
+                ELSE 0
             END
          WHERE phase5_done = 0 OR phase5_done IS NULL",
         []
@@ -900,6 +933,81 @@ mod tests {
     #[test]
     fn test_compute_activity_slots_sequential_uses_full_actual_threads() {
         assert_eq!(compute_activity_slots("SEQUENTIAL", 4, 2), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // compute_precise_mtime — REGRESJA (measure twice — druga weryfikacja
+    // Gemini, N1): brak bezpośredniego testu na tę funkcję pozwoliłby
+    // przyszłej refaktoryzacji (np. powrót do zwykłego `*`/`i64` "dla
+    // wydajności") po cichu przywrócić panikę/przepełnienie i przejść
+    // `cargo test` bez ostrzeżenia — ta funkcja jest odpowiedzialna
+    // dokładnie za błąd, który ta naprawa miała wyeliminować.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_precise_mtime_normal_value() {
+        assert_eq!(compute_precise_mtime(1_700_000_000, 123_456_789), Some(1_700_000_000_123_456_789));
+    }
+
+    #[test]
+    fn test_compute_precise_mtime_negative_epoch_is_valid_not_overflow() {
+        // Data sprzed 1970 (ujemny mtime) jest samym w sobie poprawną,
+        // policzalną wartością (osobna anomalia "Epoka 1970" wykrywa to
+        // wyżej, w process_side_stream, nie tutaj) - odróżnić od `None`
+        // (fizycznego przepełnienia i64).
+        assert_eq!(compute_precise_mtime(-1_000, 0), Some(-1_000_000_000_000));
+    }
+
+    #[test]
+    fn test_compute_precise_mtime_exact_i64_max_boundary_fits() {
+        // sec * 1e9 + nsec == i64::MAX dokładnie - musi się zmieścić.
+        assert_eq!(compute_precise_mtime(9_223_372_036, 854_775_807), Some(i64::MAX));
+    }
+
+    #[test]
+    fn test_compute_precise_mtime_one_nanosecond_past_i64_max_overflows_to_none() {
+        // Ten sam `sec` co wyżej, +1ns - o jeden krok za granicą i64::MAX.
+        assert_eq!(compute_precise_mtime(9_223_372_036, 854_775_808), None);
+    }
+
+    #[test]
+    fn test_compute_precise_mtime_i64_max_sec_overflows_to_none() {
+        assert_eq!(compute_precise_mtime(i64::MAX, 0), None);
+    }
+
+    #[test]
+    fn test_compute_precise_mtime_i64_min_sec_overflows_to_none() {
+        assert_eq!(compute_precise_mtime(i64::MIN, 0), None);
+    }
+
+    // ------------------------------------------------------------------
+    // wymaga_ponownego_odczytu — REGRESJA N2: plik z trwale nieobliczalnym
+    // mtime (lstat udane, io_error=Some(false)) nie może wracać do kolejki
+    // w nieskończoność.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_wymaga_ponownego_odczytu_gdy_nigdy_nie_przetworzono() {
+        assert!(wymaga_ponownego_odczytu(None, None));
+    }
+
+    #[test]
+    fn test_nie_wymaga_ponownego_odczytu_gdy_mtime_policzone() {
+        assert!(!wymaga_ponownego_odczytu(Some(1_700_000_000_000_000_000), None));
+    }
+
+    #[test]
+    fn test_nie_wymaga_ponownego_odczytu_przy_prawdziwym_bledzie_io() {
+        assert!(!wymaga_ponownego_odczytu(None, Some(true)));
+    }
+
+    #[test]
+    fn test_nie_wymaga_ponownego_odczytu_gdy_lstat_udane_ale_mtime_trwale_nieobliczalne() {
+        // Sedno naprawy: lstat się powiodło (io_error jawnie zapisane jako
+        // false), ale mtime pozostaje NULL (przepełnienie i64) - plik NIE
+        // może wrócić do kolejki, bo wynik będzie identyczny przy każdej
+        // kolejnej próbie.
+        assert!(!wymaga_ponownego_odczytu(None, Some(false)));
     }
 
     // ------------------------------------------------------------------
