@@ -82,6 +82,17 @@ pub struct FileRecord {
     pub repaired_path_script: Option<String>,
     pub repair_log_ufs: Option<String>,
     pub repair_log_script: Option<String>,
+    /// `Some(ścieżka)` gdy Faza 18 (Smart Splice) złożyła ten plik z
+    /// fragmentów OBU kopii jednocześnie — kolumna WSPÓLNA, nie per-strona
+    /// (Smart Splice miesza obie strony w jeden wynik, tak samo jak czyta ją
+    /// `phase9::decide_winner`).
+    pub smart_splice_path: Option<String>,
+    /// Diagnostyka kontenera wideo z Fazy 19 — `Some(false)` = uszkodzona
+    /// struktura (MP4/MOV/MKV/TS).
+    pub video_ok_ufs: Option<bool>,
+    pub video_ok_script: Option<bool>,
+    pub video_reason_ufs: Option<String>,
+    pub video_reason_script: Option<String>,
 }
 
 /// Wynik oceny jednego pliku przez [`evaluate_file`]: status kategoryczny
@@ -139,6 +150,20 @@ pub fn evaluate_file(record: &FileRecord) -> Evaluation {
         };
     }
 
+    // PRIORYTET: Plik złożony przez Fazę 18 (Smart Splice) z fragmentów OBU
+    // kopii — ten sam priorytet ("NAJWYŻSZY PO YARA") co w `phase9::decide_winner`.
+    // Bez tego sprawdzenia plik pomyślnie złożony przez Fazę 18 dostawał tu
+    // gwarantowaną rekomendację odrzucenia (kolumny structure_ok_*/media_decoded_*
+    // wciąż pokazują stan SPRZED złożenia), mimo że system sam uznaje go za
+    // w pełni odzyskany.
+    if record.smart_splice_path.is_some() {
+        return Evaluation {
+            status: "ZREKONSTRUOWANY (SMART SPLICE)".to_string(),
+            recommendation: "Użyć wersji złożonej (Smart Splice) - plik zrekonstruowany z fragmentów obu kopii".to_string(),
+            yara_rule: "Brak".to_string(),
+        };
+    }
+
     // PRIORYTET NAPRAWCZY: Plik odratowany przez Fazę 17
     if record.repaired_path_ufs.is_some() || record.repaired_path_script.is_some() {
         let action = record.repair_log_ufs.as_deref().or(record.repair_log_script.as_deref()).unwrap_or("Zrekonstruowano plik");
@@ -164,6 +189,20 @@ pub fn evaluate_file(record: &FileRecord) -> Evaluation {
     // 3. Walidacja wizualna (Gray Banding / Przepełnienie)
     if record.media_decoded_ufs == Some(false) || record.media_decoded_script == Some(false) {
         return Evaluation { status: "USZKODZONY (UCIĘTY OBRAZ)".to_string(), recommendation: "Odrzucić - niedekodowalny obraz / wideo (Gray Banding)".to_string(), yara_rule: "Brak".to_string() };
+    }
+
+    // 3b. Diagnostyka kontenera wideo (Faza 19) — MP4/MOV/MKV/TS z uszkodzoną
+    // strukturą. Wcześniej Faza 8 w ogóle nie znała tych kolumn, więc
+    // uszkodzenia kontenerów wideo wykryte przez Fazę 19 nigdy nie wpływały
+    // na Status_Decyzyjny.
+    if record.video_ok_ufs == Some(false) || record.video_ok_script == Some(false) {
+        let powod = record.video_reason_ufs.clone().or_else(|| record.video_reason_script.clone())
+            .unwrap_or_else(|| "uszkodzona struktura kontenera wideo".to_string());
+        return Evaluation {
+            status: "USZKODZONY (KONTENER WIDEO)".to_string(),
+            recommendation: format!("Odrzucić - {}", powod),
+            yara_rule: "Brak".to_string(),
+        };
     }
 
     // 4. Walidacja kodowania znaków (UTF-8 / Zupa Binarna)
@@ -221,7 +260,7 @@ pub fn evaluate_file(record: &FileRecord) -> Evaluation {
 /// średnik, cudzysłów lub nową linię, otacza go cudzysłowami i podwaja
 /// wewnętrzne cudzysłowy (standard RFC 4180). W przeciwnym razie zwraca
 /// tekst bez zmian — nie każda wartość wymaga otoczenia.
-fn escape_csv(val: &str) -> String { if val.contains(';') || val.contains('"') || val.contains('\n') { format!("\"{}\"", val.replace('"', "\"\"")) } else { val.to_string() } }
+fn escape_csv(val: &str) -> String { if val.contains(';') || val.contains('"') || val.contains('\n') || val.contains('\r') { format!("\"{}\"", val.replace('"', "\"\"")) } else { val.to_string() } }
 /// `Some(true)` → "Tak", `Some(false)` → "Nie", `None` → "Brak" (kolumna nie dotyczy/nie zbadano).
 fn fmt_opt_bool(o: Option<bool>) -> String { o.map(|b| if b { "Tak" } else { "Nie" }).unwrap_or("Brak").to_string() }
 /// Formatuje z 2 miejscami po przecinku, z przecinkiem dziesiętnym (konwencja
@@ -309,7 +348,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             hash_ufs, hash_script, hash_match, fuzzy_match_pct, zeros_pct_ufs, zeros_pct_script, eof_ok_ufs, eof_ok_script,
             entropy_ufs, entropy_script, utf8_ok_ufs, utf8_ok_script, structure_ok_ufs, structure_ok_script, exif_ok_ufs, exif_ok_script,
             media_decoded_ufs, media_decoded_script, has_xattr_ufs, has_xattr_script, io_error_ufs, io_error_script, yara_match_ufs, yara_match_script,
-            repaired_path_ufs, repaired_path_script, repair_log_ufs, repair_log_script
+            repaired_path_ufs, repaired_path_script, repair_log_ufs, repair_log_script,
+            smart_splice_path, video_ok_ufs, video_ok_script, video_reason_ufs, video_reason_script
          FROM files"
     )?;
 
@@ -324,6 +364,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             media_decoded_ufs: row.get(22)?, media_decoded_script: row.get(23)?, has_xattr_ufs: row.get(24)?, has_xattr_script: row.get(25)?,
             io_error_ufs: row.get(26)?, io_error_script: row.get(27)?, yara_match_ufs: row.get(28)?, yara_match_script: row.get(29)?,
             repaired_path_ufs: row.get(30)?, repaired_path_script: row.get(31)?, repair_log_ufs: row.get(32)?, repair_log_script: row.get(33)?,
+            smart_splice_path: row.get(34)?, video_ok_ufs: row.get(35)?, video_ok_script: row.get(36)?,
+            video_reason_ufs: row.get(37)?, video_reason_script: row.get(38)?,
         })
     })?;
 
@@ -345,13 +387,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
         writeln!(writer, "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
             escape_csv(&rec.relative_path), lokacja, fmt_opt_i64(rec.size_ufs), fmt_opt_i64(rec.size_script), fmt_opt_bool(rec.size_match),
-            fmt_opt_str(rec.hash_ufs), fmt_opt_str(rec.hash_script), fmt_opt_bool(rec.hash_match), fmt_opt_f64(rec.fuzzy_match_pct),
+            escape_csv(&fmt_opt_str(rec.hash_ufs)), escape_csv(&fmt_opt_str(rec.hash_script)), fmt_opt_bool(rec.hash_match), fmt_opt_f64(rec.fuzzy_match_pct),
             fmt_opt_f64(rec.zeros_pct_ufs), fmt_opt_f64(rec.zeros_pct_script), fmt_opt_bool(rec.eof_ok_ufs), fmt_opt_bool(rec.eof_ok_script),
             fmt_opt_f64(rec.entropy_ufs), fmt_opt_f64(rec.entropy_script), fmt_opt_bool(rec.utf8_ok_ufs), fmt_opt_bool(rec.utf8_ok_script),
             fmt_opt_bool(rec.structure_ok_ufs), fmt_opt_bool(rec.structure_ok_script), fmt_opt_bool(rec.exif_ok_ufs), fmt_opt_bool(rec.exif_ok_script),
             fmt_opt_bool(rec.media_decoded_ufs), fmt_opt_bool(rec.media_decoded_script), fmt_opt_bool(rec.has_xattr_ufs), fmt_opt_bool(rec.has_xattr_script),
             fmt_opt_bool(rec.io_error_ufs), fmt_opt_bool(rec.io_error_script), escape_csv(&eval.yara_rule),
-            fmt_opt_str(rec.repaired_path_ufs), fmt_opt_str(rec.repaired_path_script), fmt_opt_str(rec.repair_log_ufs), fmt_opt_str(rec.repair_log_script),
+            escape_csv(&fmt_opt_str(rec.repaired_path_ufs)), escape_csv(&fmt_opt_str(rec.repaired_path_script)),
+            escape_csv(&fmt_opt_str(rec.repair_log_ufs)), escape_csv(&fmt_opt_str(rec.repair_log_script)),
             escape_csv(&eval.status), escape_csv(&eval.recommendation),
         ).unwrap();
 
@@ -508,6 +551,11 @@ mod tests {
             repaired_path_script: None,
             repair_log_ufs: None,
             repair_log_script: None,
+            smart_splice_path: None,
+            video_ok_ufs: None,
+            video_ok_script: None,
+            video_reason_ufs: None,
+            video_reason_script: None,
         }
     }
 
@@ -857,5 +905,111 @@ mod tests {
         let block = build_summary_block(5, 0, 0, 0, &empty, &empty);
         assert!(block.contains("Top powody odrzuceń: -"));
         assert!(block.contains("Top powody podejrzeń: -"));
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (Gemini review): Faza 8 była ślepa na wynik Fazy 18 (Smart
+    // Splice) i Fazy 19 (diagnostyka wideo) — każdy pomyślnie złożony/
+    // naprawiony plik dostawał gwarantowaną rekomendację odrzucenia, mimo
+    // że system sam uznaje go za w pełni odzyskany.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_evaluate_smart_splice_path_present_is_reconstructed_not_rejected() {
+        // Celowo z "starymi" structure_ok/media_decoded=false (stan sprzed
+        // złożenia) - dokładnie scenariusz z PoC review.
+        let r = FileRecord {
+            smart_splice_path: Some("_smart_splice_repaired/plik.jpg".to_string()),
+            structure_ok_ufs: Some(false),
+            media_decoded_ufs: Some(false),
+            ..base_clean_record()
+        };
+        let eval = evaluate_file(&r);
+        assert_eq!(eval.status, "ZREKONSTRUOWANY (SMART SPLICE)");
+        assert!(!eval.status.contains("USZKODZONY"));
+        assert!(!eval.recommendation.to_lowercase().contains("odrzucić"));
+    }
+
+    #[test]
+    fn test_evaluate_smart_splice_wins_over_repaired_path() {
+        let r = FileRecord {
+            smart_splice_path: Some("x".to_string()),
+            repaired_path_ufs: Some("y".to_string()),
+            ..base_clean_record()
+        };
+        assert_eq!(evaluate_file(&r).status, "ZREKONSTRUOWANY (SMART SPLICE)");
+    }
+
+    #[test]
+    fn test_evaluate_yara_wins_over_smart_splice() {
+        let r = FileRecord {
+            smart_splice_path: Some("x".to_string()),
+            yara_match_ufs: Some("EICAR".to_string()),
+            ..base_clean_record()
+        };
+        assert_eq!(evaluate_file(&r).status, "ZAINFEKOWANY (MALWARE)");
+    }
+
+    #[test]
+    fn test_evaluate_video_ok_false_ufs_is_rejected() {
+        let r = FileRecord {
+            video_ok_ufs: Some(false),
+            video_reason_ufs: Some("Brak tablic indeksowych (moov)".to_string()),
+            ..base_clean_record()
+        };
+        let eval = evaluate_file(&r);
+        assert_eq!(eval.status, "USZKODZONY (KONTENER WIDEO)");
+        assert!(eval.recommendation.contains("Brak tablic indeksowych (moov)"));
+    }
+
+    #[test]
+    fn test_evaluate_video_ok_false_script_is_rejected() {
+        let r = FileRecord { video_ok_script: Some(false), ..base_clean_record() };
+        assert_eq!(evaluate_file(&r).status, "USZKODZONY (KONTENER WIDEO)");
+    }
+
+    #[test]
+    fn test_evaluate_video_ok_true_is_not_rejected() {
+        let r = FileRecord { video_ok_ufs: Some(true), video_ok_script: Some(true), ..base_clean_record() };
+        assert_eq!(evaluate_file(&r).status, "ZGODNY");
+    }
+
+    #[test]
+    fn test_escape_csv_lone_carriage_return_gets_quoted() {
+        let out = escape_csv("linia1\rlinia2");
+        assert!(out.starts_with('"') && out.ends_with('"'), "samotny CR musi wymusić cudzysłów: {}", out);
+    }
+
+    #[test]
+    fn test_escape_csv_repair_log_with_semicolon_and_quote_roundtrips_without_column_shift() {
+        // Dokładnie PoC z review: log naprawy z nazwą pliku-dawcy zawierającą
+        // średnik i cudzysłów.
+        let log = r#"donor;"plik z cudzysłowem".jpg"#;
+        let escaped = escape_csv(log);
+
+        // Minimalny parser CSV zgodny z RFC4180 - tylko na potrzeby tego testu.
+        fn parse_csv_row(row: &str) -> Vec<String> {
+            let mut fields = Vec::new();
+            let mut current = String::new();
+            let mut in_quotes = false;
+            let mut chars = row.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' if in_quotes && chars.peek() == Some(&'"') => { current.push('"'); chars.next(); }
+                    '"' => in_quotes = !in_quotes,
+                    ';' if !in_quotes => { fields.push(std::mem::take(&mut current)); }
+                    other => current.push(other),
+                }
+            }
+            fields.push(current);
+            fields
+        }
+
+        let row = format!("PRZED;{};PO", escaped);
+        let fields = parse_csv_row(&row);
+        assert_eq!(fields.len(), 3, "log ze średnikiem/cudzysłowem nie może przesunąć kolumn: {:?}", fields);
+        assert_eq!(fields[0], "PRZED");
+        assert_eq!(fields[1], log, "treść loga musi wrócić bajt w bajt po eskejpowaniu i parsowaniu");
+        assert_eq!(fields[2], "PO");
     }
 }
