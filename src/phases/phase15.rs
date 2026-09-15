@@ -638,29 +638,35 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let ufs_base = PathBuf::from(&config.ufs_path);
         let script_base = PathBuf::from(&config.script_path);
 
-        std::thread::scope(|s| {
+        // REGRESJA (measure twice — druga weryfikacja Gemini): każdy błąd
+        // SQLite w wątku bazy był wcześniej `.unwrap()`, czyli paniką w
+        // wątku pisarza wewnątrz `thread::scope`. Ten sam wzorzec co
+        // `phase17_repair::run`/`phase1::run`/`phase3::run` — `db_thread`
+        // zwraca `Result<()>`, panika jest przechwytywana przez `.join()` i
+        // zamieniana na błąd domenowy.
+        let wynik_zapisu: Result<()> = std::thread::scope(|s| {
         let (tx_db, rx_db) = mpsc::sync_channel(200);
         let conn_ref = &mut *conn;
-        
+
         // KLONUJEMY NADAJNIK UI DLA WĄTKU BAZY DANYCH
         let tx_ui_db = tx_ui.clone();
 
-        let _db_thread = s.spawn(move || {
+        let db_thread = s.spawn(move || -> Result<()> {
             let mut db_inserted = 0;
             let mut last_db_update = Instant::now();
 
-            let update_sql = |c: &mut Connection, chunk: &[SideXattrResult], is_ufs: bool| {
-                let tx_db = c.transaction().unwrap();
+            let update_sql = |c: &mut Connection, chunk: &[SideXattrResult], is_ufs: bool| -> Result<()> {
+                let tx_db = c.transaction()?;
                 {
                     // OPTYMALIZACJA CPU: prepare_cached
                     let mut stmt_insert = tx_db.prepare_cached(
-                        "INSERT OR REPLACE INTO phase15_analysis (file_id, has_xattr, xattr_count, xattr_size, xattr_keys, uid, gid, has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr) 
+                        "INSERT OR REPLACE INTO phase15_analysis (file_id, has_xattr, xattr_count, xattr_size, xattr_keys, uid, gid, has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-                    ).unwrap();
+                    )?;
 
                     let mut stmt_update = match is_ufs {
-                        true => tx_db.prepare_cached("UPDATE files SET has_xattr_ufs = COALESCE(?1, has_xattr_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3").unwrap(),
-                        false => tx_db.prepare_cached("UPDATE files SET has_xattr_script = COALESCE(?1, has_xattr_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3").unwrap()
+                        true => tx_db.prepare_cached("UPDATE files SET has_xattr_ufs = COALESCE(?1, has_xattr_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3")?,
+                        false => tx_db.prepare_cached("UPDATE files SET has_xattr_script = COALESCE(?1, has_xattr_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3")?
                     };
 
                     for res in chunk {
@@ -668,32 +674,32 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         if let Some(meta) = &res.meta {
                             has_x = Some(meta.xattr_count > 0);
                             stmt_insert.execute(params![
-                                res.id, 
-                                has_x, 
-                                meta.xattr_count as i64, 
-                                meta.xattr_size_bytes as i64, 
-                                meta.xattr_keys, 
-                                meta.uid, 
-                                meta.gid, 
+                                res.id,
+                                has_x,
+                                meta.xattr_count as i64,
+                                meta.xattr_size_bytes as i64,
+                                meta.xattr_keys,
+                                meta.uid,
+                                meta.gid,
                                 meta.has_url,
                                 meta.has_zone_identifier,
                                 meta.has_quarantine,
                                 meta.has_wherefroms,
                                 meta.has_large_xattr,
-                            ]).unwrap();
+                            ])?;
                         }
                         if has_x.is_some() || res.io_error == Some(true) {
-                            stmt_update.execute(params![has_x, res.io_error, res.id]).unwrap();
+                            stmt_update.execute(params![has_x, res.io_error, res.id])?;
                         }
                     }
                 }
-                tx_db.commit().unwrap();
+                tx_db.commit()
             };
 
             for msg in rx_db {
                 let c_len = match &msg {
-                    ScanMsg::UfsChunk(chunk) => { update_sql(conn_ref, chunk, true); chunk.len() }
-                    ScanMsg::ScriptChunk(chunk) => { update_sql(conn_ref, chunk, false); chunk.len() }
+                    ScanMsg::UfsChunk(chunk) => { update_sql(conn_ref, chunk, true)?; chunk.len() }
+                    ScanMsg::ScriptChunk(chunk) => { update_sql(conn_ref, chunk, false)?; chunk.len() }
                 };
                 
                 db_inserted += c_len;
@@ -704,6 +710,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 }
             }
             let _ = tx_ui_db.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Atrybuty zsynchronizowane z SQLite.".to_string() });
+            Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
@@ -747,16 +754,40 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             drop(tx_db); 
         } else {
             let info_u = opr_log.clone(); let info_s = opr_log.clone();
-            if !ufs_tasks.is_empty() { 
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: &tx_ui, bar_idx: 0, opr_log: info_u, }); 
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów UFS zakończone.".to_string())); 
+            if !ufs_tasks.is_empty() {
+                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: &tx_ui, bar_idx: 0, opr_log: info_u, });
+                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów UFS zakończone.".to_string()));
             }
-            if !script_tasks.is_empty() { 
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db, is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, opr_log: info_s, }); 
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów Skrypt zakończone.".to_string())); 
+            if !script_tasks.is_empty() {
+                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, opr_log: info_s, });
+                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów Skrypt zakończone.".to_string()));
+            }
+            // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
+            // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
+            // przenoszony - kanał nie zamykał się, dopóki ta zmienna nie
+            // wyszła z zasięgu na końcu CAŁEGO domknięcia `thread::scope`,
+            // czyli PO `db_thread.join()` niżej - klasyczny deadlock (wątek
+            // czeka na zamknięcie kanału, który sam trzyma otwarty). Jawny
+            // `drop` zamyka kanał deterministycznie, zanim `.join()` zacznie
+            // czekać.
+            drop(tx_db);
+        }
+
+        match db_thread.join() {
+            Ok(wynik) => wynik,
+            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+            // dalej i żeby wywołujący nie uznał przebiegu za udany.
+            Err(_) => {
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 15 mógł nie zostać w pełni zapisany.".to_string()
+                ));
+                Err(rusqlite::Error::UnwindingPanic)
             }
         }
     });
+    wynik_zapisu?;
 }
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
