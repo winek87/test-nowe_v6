@@ -247,7 +247,24 @@ impl<'a> AppState<'a> {
             if !self.selections[self.selected_index].0.contains("───") { break; }
         }
     }
+
+    /// Przyspieszona nawigacja w dół o [`STRONA_LISTY`] pozycji (PageDown).
+    /// Powtarza `next_selection()` — zero duplikacji logiki omijania
+    /// separatorów ani zawijania na końcu listy (dashboard jest krótki, więc
+    /// zawinięcie w środku "strony" nie dezorientuje operatora tak jak w
+    /// dłuższych listach ustawień).
+    pub fn page_down(&mut self) {
+        for _ in 0..STRONA_LISTY { self.next_selection(); }
+    }
+
+    /// Przyspieszona nawigacja w górę o [`STRONA_LISTY`] pozycji (PageUp).
+    pub fn page_up(&mut self) {
+        for _ in 0..STRONA_LISTY { self.previous_selection(); }
+    }
 }
+
+/// Rozmiar "strony" dla PageUp/PageDown w listach menu (dashboard, ustawienia).
+const STRONA_LISTY: usize = 10;
 
 // ============================================================================
 // TESTY JEDNOSTKOWE
@@ -418,6 +435,55 @@ mod tests {
             assert_eq!(stan.selected_index, przed, "Kursor zdryfował");
             stan.next_selection();
         }
+    }
+
+    #[test]
+    fn test_page_down_przesuwa_o_wiele_pozycji_naraz() {
+        let (_d, mut u) = srodowisko();
+        let mut stan = AppState::new(&mut u).unwrap();
+        let przed = stan.selected_index;
+
+        stan.page_down();
+
+        assert_ne!(stan.selected_index, przed, "PageDown musi ruszyć kursor");
+        assert!(!stan.selections[stan.selected_index].0.contains(SEPARATOR));
+    }
+
+    #[test]
+    fn test_page_up_przesuwa_o_wiele_pozycji_naraz() {
+        let (_d, mut u) = srodowisko();
+        let mut stan = AppState::new(&mut u).unwrap();
+
+        stan.page_up();
+
+        assert!(!stan.selections[stan.selected_index].0.contains(SEPARATOR));
+    }
+
+    /// Krok po kroku (`next_selection` × N) i skok naraz (`page_down`)
+    /// muszą wylądować w tym samym miejscu — `page_down` to tylko skrót,
+    /// nie osobna logika nawigacji.
+    #[test]
+    fn test_page_down_daje_to_samo_co_n_pojedynczych_krokow() {
+        let (_d, mut u1) = srodowisko();
+        let mut stan1 = AppState::new(&mut u1).unwrap();
+        let (_d2, mut u2) = srodowisko();
+        let mut stan2 = AppState::new(&mut u2).unwrap();
+
+        stan1.page_down();
+        for _ in 0..10 { stan2.next_selection(); }
+
+        assert_eq!(stan1.selected_index, stan2.selected_index);
+    }
+
+    #[test]
+    fn test_page_up_i_page_down_nie_panikuja_przy_wielokrotnym_odbiciu() {
+        let (_d, mut u) = srodowisko();
+        let mut stan = AppState::new(&mut u).unwrap();
+        for _ in 0..20 {
+            stan.page_down();
+            stan.page_up();
+        }
+        assert!(!stan.selections[stan.selected_index].0.contains(SEPARATOR));
     }
 
     // ------------------------------------------------------------------

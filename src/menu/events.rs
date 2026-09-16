@@ -32,7 +32,17 @@ pub fn handle_key(key: KeyEvent, app: &mut AppState) -> bool {
             app.next_selection();
             debug!("Ruch kursora (Dół): Aktualny indeks -> {}", app.selected_index);
         }
-        
+
+        // Przyspieszona nawigacja (PageUp/PageDown) — skok o kilka pozycji naraz.
+        KeyCode::PageUp => {
+            app.page_up();
+            debug!("Skok kursora (PageUp): Aktualny indeks -> {}", app.selected_index);
+        }
+        KeyCode::PageDown => {
+            app.page_down();
+            debug!("Skok kursora (PageDown): Aktualny indeks -> {}", app.selected_index);
+        }
+
         // Zatwierdzenie akcji
         KeyCode::Enter => {
             // Zapisujemy indeks akcji w State. 
@@ -170,6 +180,32 @@ mod tests {
                     !app.selections[app.selected_index].0.contains("───"),
                     "Kursor stanął na separatorze (indeks {})", app.selected_index
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn test_page_down_przesuwa_kursor_o_wiecej_niz_jeden_krok() {
+        ze_stanem!(|app| {
+            let po_jednym_kroku = { let przed = app.selected_index; app.next_selection(); let po = app.selected_index; app.selected_index = przed; po };
+
+            assert!(!handle_key(klawisz(KeyCode::PageDown), &mut app));
+
+            assert_ne!(
+                app.selected_index, po_jednym_kroku,
+                "PageDown musi przesunąć kursor DALEJ niż pojedyncza strzałka w dół"
+            );
+        });
+    }
+
+    #[test]
+    fn test_page_up_i_page_down_nigdy_nie_staja_na_separatorze() {
+        ze_stanem!(|app| {
+            for _ in 0..10 {
+                handle_key(klawisz(KeyCode::PageDown), &mut app);
+                assert!(!app.selections[app.selected_index].0.contains("───"));
+                handle_key(klawisz(KeyCode::PageUp), &mut app);
+                assert!(!app.selections[app.selected_index].0.contains("───"));
             }
         });
     }

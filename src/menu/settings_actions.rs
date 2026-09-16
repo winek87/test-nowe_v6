@@ -473,6 +473,22 @@ impl Default for SettingsUiState {
 /// [`handle_key_do_pliku`].
 const DOMYSLNA_SCIEZKA_USTAWIEN: &str = "ustawienia.json";
 
+/// Rozmiar "strony" dla PageUp/PageDown w listach ekranu ustawień.
+const STRONA_USTAWIEN: usize = 10;
+
+/// Przesuwa zaznaczenie listy ustawień o `delta` pozycji (dodatnie = w dół),
+/// DOCISKAJĄC do granic `0..len-1` zamiast zawijać.
+///
+/// W przeciwieństwie do `AppState::next_selection`/`page_down` (dashboard,
+/// gdzie zawinięcie krótkiej listy jest naturalne), page-jump w dłuższych
+/// listach ustawień NIE powinien teleportować operatora z góry na dół listy —
+/// to zaskakujące i utrudnia orientację. Stąd `clamp`, nie modulo.
+fn clamp_page_jump(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 { return 0; }
+    let max = (len - 1) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
+
 /// Główny punkt wejścia obsługi klawiatury — zapisuje zmiany do domyślnego
 /// pliku konfiguracyjnego ([`DOMYSLNA_SCIEZKA_USTAWIEN`]).
 ///
@@ -667,6 +683,12 @@ fn handle_main_navigation(key: KeyEvent, state: &mut SettingsUiState, u: &mut Us
         KeyCode::Down | KeyCode::Char('j') => {
             state.selected_main = (state.selected_main + 1) % FIELD_LABELS.len();
         }
+        KeyCode::PageUp => {
+            state.selected_main = clamp_page_jump(state.selected_main, -(STRONA_USTAWIEN as isize), FIELD_LABELS.len());
+        }
+        KeyCode::PageDown => {
+            state.selected_main = clamp_page_jump(state.selected_main, STRONA_USTAWIEN as isize, FIELD_LABELS.len());
+        }
         KeyCode::Esc => { state.should_exit = true; }
         KeyCode::Enter => {
             let idx = state.selected_main;
@@ -705,6 +727,12 @@ fn handle_reports_navigation(key: KeyEvent, state: &mut SettingsUiState, u: &mut
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.screen = Screen::Reports { selected: (selected + 1) % count.max(1) };
+        }
+        KeyCode::PageUp => {
+            state.screen = Screen::Reports { selected: clamp_page_jump(selected, -(STRONA_USTAWIEN as isize), count) };
+        }
+        KeyCode::PageDown => {
+            state.screen = Screen::Reports { selected: clamp_page_jump(selected, STRONA_USTAWIEN as isize, count) };
         }
         KeyCode::Esc => { state.screen = Screen::Main; }
         KeyCode::Enter => {
@@ -1132,6 +1160,70 @@ mod tests {
         state.selected_main = 0;
         handle_key(key(KeyCode::Up), &mut state, &mut u);
         assert_eq!(state.selected_main, FIELD_LABELS.len() - 1);
+    }
+
+    #[test]
+    fn test_clamp_page_jump_nie_przekracza_gornej_granicy() {
+        assert_eq!(clamp_page_jump(5, 10, 8), 7, "Musi się zatrzymać na ostatnim indeksie, nie zawinąć na początek");
+    }
+
+    #[test]
+    fn test_clamp_page_jump_nie_schodzi_ponizej_zera() {
+        assert_eq!(clamp_page_jump(3, -10, 8), 0, "Musi się zatrzymać na zerze, nie zawinąć na koniec");
+    }
+
+    #[test]
+    fn test_clamp_page_jump_pusta_lista_daje_zero() {
+        assert_eq!(clamp_page_jump(0, 5, 0), 0);
+    }
+
+    #[test]
+    fn test_page_down_na_liscie_glownej_przesuwa_o_strone_bez_zawijania() {
+        let mut u = Ustawienia::default();
+        let mut state = SettingsUiState::new();
+        state.selected_main = 0;
+        handle_key(key(KeyCode::PageDown), &mut state, &mut u);
+        assert_eq!(state.selected_main, STRONA_USTAWIEN.min(FIELD_LABELS.len() - 1));
+    }
+
+    #[test]
+    fn test_page_down_blisko_konca_listy_glownej_docisketa_do_ostatniej_pozycji() {
+        let mut u = Ustawienia::default();
+        let mut state = SettingsUiState::new();
+        state.selected_main = FIELD_LABELS.len() - 1;
+        handle_key(key(KeyCode::PageDown), &mut state, &mut u);
+        assert_eq!(state.selected_main, FIELD_LABELS.len() - 1, "PageDown na końcu nie może zawinąć na początek listy");
+    }
+
+    #[test]
+    fn test_page_up_na_poczatku_listy_glownej_zostaje_na_zerze() {
+        let mut u = Ustawienia::default();
+        let mut state = SettingsUiState::new();
+        state.selected_main = 0;
+        handle_key(key(KeyCode::PageUp), &mut state, &mut u);
+        assert_eq!(state.selected_main, 0, "PageUp na początku nie może zawinąć na koniec listy");
+    }
+
+    #[test]
+    fn test_page_up_po_page_down_wraca_blisko_poczatku() {
+        let mut u = Ustawienia::default();
+        let mut state = SettingsUiState::new();
+        state.selected_main = FIELD_LABELS.len() - 1;
+        handle_key(key(KeyCode::PageUp), &mut state, &mut u);
+        assert_eq!(state.selected_main, FIELD_LABELS.len() - 1 - STRONA_USTAWIEN);
+    }
+
+    #[test]
+    fn test_page_down_w_liscie_raportow_przesuwa_bez_zawijania() {
+        let mut u = Ustawienia::default();
+        let mut state = SettingsUiState::new();
+        state.screen = Screen::Reports { selected: 0 };
+        handle_key(key(KeyCode::PageDown), &mut state, &mut u);
+        let count = sorted_phase_keys(&u).len() + 1;
+        match state.screen {
+            Screen::Reports { selected } => assert_eq!(selected, STRONA_USTAWIEN.min(count - 1)),
+            _ => panic!("Ekran musi pozostać Reports"),
+        }
     }
 
     #[test]
