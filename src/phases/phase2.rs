@@ -274,6 +274,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         message: format_display_path(&task.rel_path),
                     });
 
+                    // REGRESJA (menu/dashboard — naprawa dolnego panelu ścieżek):
+                    // brakowało tu tej wysyłki — dolny panel "Aktualnie skanowane
+                    // ścieżki" zostawał pusty przez CAŁĄ Fazę 2. Ten sam wzorzec co
+                    // `phase4.rs`/`phase5.rs`/`phase6.rs`/`phase7.rs`.
+                    let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
+                        idx: bar_idx,
+                        path: full_path.to_string_lossy().to_string(),
+                    });
+
                     // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
                     let _ = tx_ui.send(PhaseEvent::UpdateSideText {
                         idx: bar_idx,

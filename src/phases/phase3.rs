@@ -537,6 +537,18 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         message: format_display_path(&task.rel_path),
                     });
 
+                    // REGRESJA (menu/dashboard — naprawa dolnego panelu ścieżek):
+                    // brakowało tu tej wysyłki, mimo że blok odświeżania UI już
+                    // istniał — dolny panel "Aktualnie skanowane ścieżki" (patrz
+                    // `tui::scanner_panel::draw_bottom_paths_panel`) zostawał na
+                    // "(Oczekiwanie na dane...)" przez CAŁĄ Fazę 3, w przeciwieństwie
+                    // do 14 pozostałych faz. Ten sam wzorzec co `phase4.rs`/
+                    // `phase5.rs`/`phase6.rs`/`phase7.rs`.
+                    let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
+                        idx: bar_idx,
+                        path: full_path.to_string_lossy().to_string(),
+                    });
+
                     let _ = tx_ui.send(PhaseEvent::UpdateSideText {
                         idx: 0,
                         text: build_crypto_block(stats, other_stats, start_time),
