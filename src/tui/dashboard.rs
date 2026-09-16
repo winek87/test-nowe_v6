@@ -91,7 +91,7 @@ pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
     f.render_stateful_widget(menu_list, chunks[4], &mut list_state);
 
     // --- 5: STOPKA ---
-    let footer = Paragraph::new(" [↑/↓] Nawigacja | [ENTER] Wybierz | [Ctrl+C] lub [Q] Wyjście z programu ")
+    let footer = Paragraph::new(" [↑/↓] Nawigacja | [PgUp/PgDn] Skok | [ENTER] Wybierz | [Ctrl+C] lub [Q] Wyjście z programu ")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     f.render_widget(footer, chunks[5]);

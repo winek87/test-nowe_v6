@@ -98,7 +98,7 @@ fn draw_main_list(f: &mut Frame, state: &SettingsUiState, u: &Ustawienia, area: 
     list_state.select(Some(state.selected_main));
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let footer = Paragraph::new(" [↑/↓] Nawigacja | [ENTER] Edytuj/Przełącz | [ESC] Wyjdź bez zapisu tej pozycji ")
+    let footer = Paragraph::new(" [↑/↓] Nawigacja | [PgUp/PgDn] Skok | [ENTER] Edytuj/Przełącz | [ESC] Wyjdź bez zapisu tej pozycji ")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[1]);
 }
@@ -143,7 +143,7 @@ fn draw_reports_list(f: &mut Frame, u: &Ustawienia, selected: usize, area: Rect)
     list_state.select(Some(selected));
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let footer = Paragraph::new(" [↑/↓] Nawigacja | [ENTER] Edytuj fazę | [ESC] Wróć ")
+    let footer = Paragraph::new(" [↑/↓] Nawigacja | [PgUp/PgDn] Skok | [ENTER] Edytuj fazę | [ESC] Wróć ")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[1]);
 }
