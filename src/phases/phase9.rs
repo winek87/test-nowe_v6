@@ -458,10 +458,37 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Ścieżka pliku tymczasowego w TYM SAMYM katalogu co `docelowa` — konieczne,
 /// żeby końcowy `fs::rename` był atomowy (rename między różnymi systemami
 /// plików/punktami montowania NIE jest atomowy i może się nie udać z EXDEV).
+/// Górny limit (w bajtach) osadzanej w nazwie tymczasowej oryginalnej nazwy
+/// pliku — patrz dokumentacja [`sciezka_tymczasowa`].
+const MAX_OSADZONEJ_NAZWY_BAJTOW: usize = 200;
+
+/// Obcina `s` do co najwyżej `max_bajtow` bajtów, cofając się do najbliższej
+/// granicy znaku UTF-8 — nigdy nie tnie w środku wielobajtowego znaku.
+fn obetnij_do_granicy_utf8(s: &str, max_bajtow: usize) -> &str {
+    if s.len() <= max_bajtow {
+        return s;
+    }
+    let mut koniec = max_bajtow;
+    while koniec > 0 && !s.is_char_boundary(koniec) {
+        koniec -= 1;
+    }
+    &s[..koniec]
+}
+
 fn sciezka_tymczasowa(docelowa: &Path) -> PathBuf {
     let nazwa = docelowa.file_name().and_then(|n| n.to_str()).unwrap_or("plik");
     let licznik = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    docelowa.with_file_name(format!(".{}.tmp-{}-{}", nazwa, std::process::id(), licznik))
+    // REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza09.md N2):
+    // poprzednia wersja doklejała stały sufiks DO PEŁNEJ oryginalnej nazwy —
+    // plik o nazwie bliskiej limitowi `NAME_MAX` (255 B na typowych systemach
+    // Linux) dostawał `ENAMETOOLONG` na `fs::copy` do pliku tymczasowego i
+    // był odnotowywany jako błąd I/O, mimo że dałby się skopiować pod
+    // finalną (krótszą) nazwą — realna regresja wobec stanu SPRZED wzorca
+    // tmp+rename. Nazwa tymczasowa jest i tak odrzucana zaraz po `rename`,
+    // więc jej pełna czytelność nie ma znaczenia — tylko unikalność
+    // (licznik) i mieszczenie się w limicie systemu plików.
+    let obcieta = obetnij_do_granicy_utf8(nazwa, MAX_OSADZONEJ_NAZWY_BAJTOW);
+    docelowa.with_file_name(format!(".{}.tmp-{}-{}", obcieta, std::process::id(), licznik))
 }
 
 fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Path, script_path: &Path, target_base: &Path, stats: &LiveStats) -> (bool, String, String) {
@@ -1556,6 +1583,61 @@ mod tests {
             kanon(Path::new("___test_kanon_wspolny___")),
             kanon(Path::new("./___test_kanon_wspolny___")),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // sciezka_tymczasowa / obetnij_do_granicy_utf8 — REGRESJA (measure
+    // twice — druga weryfikacja Gemini, todo.faza09.md N2): nazwa
+    // tymczasowa nie może przekroczyć NAME_MAX dla plików o nazwie
+    // źródłowej bliskiej limitowi.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sciezka_tymczasowa_nie_przekracza_name_max_dla_dlugiej_nazwy() {
+        const NAME_MAX: usize = 255;
+        // Nazwa na granicy typowego NAME_MAX systemu plików Linux.
+        let dlugie_imie = "a".repeat(250);
+        let docelowa = Path::new("/tmp").join(format!("{}.jpg", dlugie_imie));
+
+        let tmp = sciezka_tymczasowa(&docelowa);
+        let tmp_nazwa = tmp.file_name().and_then(|n| n.to_str()).unwrap();
+
+        assert!(
+            tmp_nazwa.len() <= NAME_MAX,
+            "nazwa tymczasowa ({} bajtów) musi mieścić się w NAME_MAX={}: {:?}",
+            tmp_nazwa.len(), NAME_MAX, tmp_nazwa
+        );
+    }
+
+    #[test]
+    fn test_sciezka_tymczasowa_krotka_nazwa_pozostaje_nietknieta() {
+        let docelowa = Path::new("/tmp/plik.jpg");
+        let tmp = sciezka_tymczasowa(&docelowa);
+        let tmp_nazwa = tmp.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(tmp_nazwa.contains("plik.jpg"), "krótka nazwa nie powinna być obcinana: {:?}", tmp_nazwa);
+    }
+
+    #[test]
+    fn test_sciezka_tymczasowa_dwa_wywolania_daja_rozne_nazwy() {
+        let docelowa = Path::new("/tmp/plik.jpg");
+        assert_ne!(sciezka_tymczasowa(&docelowa), sciezka_tymczasowa(&docelowa), "licznik musi zapewniać unikalność nazw tymczasowych");
+    }
+
+    #[test]
+    fn test_obetnij_do_granicy_utf8_nie_tnie_w_srodku_wielobajtowego_znaku() {
+        // "ó" to 2 bajty w UTF-8 - obcięcie dokładnie w środku tego znaku
+        // musiałoby cofnąć się o jeden bajt, żeby zostać poprawnym UTF-8.
+        let s = "zdjęcie_wakacje_nad_jeziorem_długi_tytuł_pliku";
+        for limit in 0..=s.len() {
+            let wynik = obetnij_do_granicy_utf8(s, limit);
+            assert!(std::str::from_utf8(wynik.as_bytes()).is_ok(), "wynik musi być poprawnym UTF-8 dla limitu {}", limit);
+            assert!(wynik.len() <= limit, "wynik nie może przekroczyć limitu {} (jest {})", limit, wynik.len());
+        }
+    }
+
+    #[test]
+    fn test_obetnij_do_granicy_utf8_krotszy_niz_limit_nie_jest_zmieniany() {
+        assert_eq!(obetnij_do_granicy_utf8("krotka", 200), "krotka");
     }
 
     /// REGRESJA (Gemini review — druga weryfikacja): `target_path` JESZCZE
