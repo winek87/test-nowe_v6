@@ -131,6 +131,20 @@ impl LiveStats {
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
+
+    /// Dostęp do mapy wag rozszerzeń ODPORNY NA ZATRUCIE muteksa.
+    ///
+    /// REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
+    /// obs. 4): `.lock().unwrap()` na zatrutym mutexie (bo jakiś wątek
+    /// spanikował trzymając blokadę) zamieniałby cudzą panikę w KOLEJNĄ
+    /// panikę tu, w tym wątku — wywracając całą fazę zamiast dokończyć pracę
+    /// i zaraportować wynik. Ten sam wzorzec co
+    /// `phase17_repair::LiveStats::liczniki` — mapa to zwykłe liczniki bez
+    /// stanu, który mógłby stracić spójność przez zatrucie, więc
+    /// `into_inner()` jest tu właściwym zachowaniem.
+    fn wagi_rozszerzen(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.ext_weights.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
@@ -152,7 +166,7 @@ fn build_source_block(label: &str, stats: &LiveStats) -> String {
     let bytes = stats.total_bytes.load(Ordering::Relaxed);
 
     let top_ext_str = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.wagi_rozszerzen();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         sorted.into_iter().take(3).map(|(ext, w)| {
@@ -247,7 +261,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     *last_ui_update = now;
                     
                     if !local_ext_weights.is_empty() {
-                        let mut global_map = stats.ext_weights.lock().unwrap();
+                        let mut global_map = stats.wagi_rozszerzen();
                         for (k, v) in local_ext_weights.drain() {
                             *global_map.entry(k).or_insert(0) += v;
                         }
@@ -273,7 +287,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             // --- Zrzuty zbiorcze na koniec pętli nad pojedynczą paczką ---
 
             if !local_ext_weights.is_empty() {
-                let mut global_map = stats.ext_weights.lock().unwrap();
+                let mut global_map = stats.wagi_rozszerzen();
                 for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
             }
 
@@ -616,24 +630,50 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut matched_bytes: u64 = 0;
     let mut mismatched_bytes_lost: u64 = 0;
 
-    let mut stmt = conn.prepare("SELECT found_in_ufs, found_in_script, size_match, larger_side, size_ufs, size_script FROM files WHERE phase2_done = 1")?;
+    // REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
+    // obs. 2): `empty_ufs`/`empty_scr`/`errors` liczone były wcześniej z
+    // liczników RAM (`LiveStats`), zerowanych przy KAŻDYM `run()` — podczas
+    // gdy `total_common`/`matches`/`mismatches`/`only_ufs`/`only_script`
+    // liczone są zapytaniem SQL obejmującym CAŁĄ historię bazy
+    // (`WHERE phase2_done = 1`). W trybie wznowienia (część plików
+    // zmierzona w poprzedniej, przerwanej sesji) sekcja "ANOMALIE I BŁĘDY
+    // ODCZYTU I/O" zaniżała faktyczną liczbę błędów I/O i pustych plików,
+    // pokazując tylko przyrost bieżącej sesji zamiast sumy zapisanej w
+    // bazie. Naprawa: te trzy liczniki liczone są teraz w TEJ SAMEJ pętli,
+    // z TEGO SAMEGO zapytania SQL, w tym samym zakresie `phase2_done = 1`.
+    let mut empty_ufs: u64 = 0;
+    let mut empty_scr: u64 = 0;
+    let mut errors: u64 = 0;
+
+    let mut stmt = conn.prepare("SELECT found_in_ufs, found_in_script, size_match, larger_side, size_ufs, size_script, io_error_ufs, io_error_script FROM files WHERE phase2_done = 1")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, Option<bool>>(2)?,
-            row.get::<_, Option<String>>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?
+            row.get::<_, Option<String>>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (in_ufs, in_script, is_match, larger, s_ufs, s_scr) = r;
+        let (in_ufs, in_script, is_match, larger, s_ufs, s_scr, err_ufs, err_scr) = r;
+
+        if in_ufs {
+            if s_ufs == Some(0) { empty_ufs += 1; }
+            if err_ufs == Some(true) { errors += 1; }
+        }
+        if in_script {
+            if s_scr == Some(0) { empty_scr += 1; }
+            if err_scr == Some(true) { errors += 1; }
+        }
+
         match (in_ufs, in_script) {
             (true, true) => {
                 total_common += 1;
-                if is_match == Some(true) { 
+                if is_match == Some(true) {
                     matches += 1;
                     if let Some(s) = s_ufs { matched_bytes += s as u64; }
                 }
-                else if is_match == Some(false) { 
+                else if is_match == Some(false) {
                     mismatches += 1;
                     if let (Some(u), Some(s)) = (s_ufs, s_scr) { mismatched_bytes_lost += u.abs_diff(s); }
                     if larger.as_deref() == Some("UFS") { ufs_won += 1; }
@@ -647,9 +687,6 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
     drop(stmt);
 
-    let empty_ufs = ufs_stats.empty_files.load(Ordering::Relaxed);
-    let empty_scr = script_stats.empty_files.load(Ordering::Relaxed);
-    let errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
     let elapsed = start_time.elapsed();
 
     let mut final_report = String::new();
@@ -828,11 +865,40 @@ mod tests {
         }
     }
 
+    /// REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
+    /// obs. 4): dostęp do mapy wag rozszerzeń nie może panikować z powodu
+    /// ZATRUCIA muteksa. Wcześniejsze `.lock().unwrap()` zamieniało panikę
+    /// jednego wątku w panikę każdego następnego, wywracając całą fazę
+    /// zamiast dokończyć pracę i zaraportować wynik. Ten sam wzorzec testu
+    /// co `phase17_repair::tests::test_liczniki_odporne_na_zatruty_muteks`.
+    #[test]
+    fn test_wagi_rozszerzen_odporne_na_zatruty_muteks() {
+        let stats = Arc::new(LiveStats::new(1));
+
+        let stats_w_watku = Arc::clone(&stats);
+        let _ = std::thread::spawn(move || {
+            let _guard = stats_w_watku.ext_weights.lock().unwrap();
+            panic!("celowa panika testowa trzymając blokadę");
+        })
+        .join();
+
+        assert!(stats.ext_weights.is_poisoned(), "Setup testu: muteks MUSI być zatruty");
+
+        {
+            let mut m = stats.wagi_rozszerzen();
+            m.insert("jpg".into(), 7);
+        }
+        assert_eq!(stats.wagi_rozszerzen().get("jpg").copied(), Some(7));
+
+        let blok = build_source_block("UFS Explorer", &stats);
+        assert!(blok.contains(".jpg"), "panel boczny musi się zbudować mimo zatrutego mutexa:\n{}", blok);
+    }
+
     #[test]
     fn test_top_format_sortuje_po_wadze_i_bierze_trzy() {
         let stats = LiveStats::new(2);
         {
-            let mut m = stats.ext_weights.lock().unwrap();
+            let mut m = stats.wagi_rozszerzen();
             m.insert("jpg".into(), 100);
             m.insert("mp4".into(), 900);
             m.insert("dng".into(), 500);
@@ -854,7 +920,7 @@ mod tests {
         // Kategoria "brak" nie może dostać wiodącej kropki - to nie jest
         // rozszerzenie, tylko jego brak.
         let stats = LiveStats::new(2);
-        stats.ext_weights.lock().unwrap().insert("brak".into(), 42);
+        stats.wagi_rozszerzen().insert("brak".into(), 42);
 
         let linia = build_source_block("UFS", &stats)
             .lines().find(|l| l.contains("Top format")).unwrap().to_string();
@@ -972,7 +1038,7 @@ mod tests {
 
         let (stats, _) = uruchom_strumien(dir.path(), &zadania, true);
 
-        let m = stats.ext_weights.lock().unwrap();
+        let m = stats.wagi_rozszerzen();
         assert_eq!(m.get("jpg"), Some(&150), "oba warianty wielkości liter w jednym koszyku: {:?}", *m);
         assert!(!m.contains_key("JPG"), "wielkie litery nie mogą tworzyć osobnej kategorii");
         assert_eq!(m.get("brak"), Some(&25), "pliki bez rozszerzenia mają własną kategorię");
@@ -1205,6 +1271,67 @@ mod tests {
         assert!(
             gotowe,
             "wiersz nie może zostać trwale utknięty z phase2_done = 0 tylko dlatego, że rozmiary zapisano w poprzedniej sesji"
+        );
+    }
+
+    /// REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
+    /// obs. 2): wiersz oznaczony jako pusty/błędny w POPRZEDNIEJ sesji
+    /// (phase2_done=1 już przed tym `run()`, więc liczniki RAM tej sesji
+    /// zostają na zerze - nie ma żadnych nowych zadań I/O) musi mimo to
+    /// trafić do sekcji "Puste pliki"/"Trwałe błędy dyskowe" Dziennika
+    /// Końcowego, bo ten raport liczy CAŁĄ bazę (`WHERE phase2_done = 1`),
+    /// nie tylko bieżącą sesję.
+    #[test]
+    fn test_dziennik_koncowy_liczy_puste_pliki_i_bledy_z_calej_bazy_nie_tylko_biezacej_sesji() {
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        // Dwa wiersze UDAJĄCE stan z POPRZEDNIEJ sesji: już zmierzone/oznaczone
+        // jako gotowe (phase2_done=1), więc liczniki RAM (LiveStats) TEJ sesji
+        // zostają na zerze dla obu - żaden z nich nie wygeneruje nowego zadania I/O.
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
+             VALUES (1, 'pusty_z_poprzedniej_sesji.jpg', 1, 0, 0, NULL, 0, NULL, 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
+             VALUES (2, 'blad_io_z_poprzedniej_sesji.jpg', 0, 1, NULL, NULL, NULL, 1, 1)",
+            [],
+        ).unwrap();
+        // Trzeci wiersz, GENUINE nowe zadanie tej sesji (phase2_done=0, brak
+        // zmierzonego rozmiaru) - niezbędny, żeby run() faktycznie doszedł do
+        // ETAPU 5 (gałąź `total_db_rows == 0` kończy się wcześniej, bez
+        // zapisania Dziennika Końcowego - to inny, celowo odrębny tor).
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, phase2_done)
+             VALUES (3, 'nowy.jpg', 1, 0, 0)",
+            [],
+        ).unwrap();
+
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc").unwrap();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut config = Ustawienia::default();
+        config.ufs_path = ufs_dir.path().to_string_lossy().to_string();
+        config.script_path = script_dir.path().to_string_lossy().to_string();
+        config.log_path = log_dir.path().to_string_lossy().to_string();
+        config.raporty_faz.clear();
+        config.max_threads = 1;
+
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        run(&mut conn, &config, tx_ui).expect("run() musi wygenerować Dziennik Końcowy");
+
+        let dziennik = std::fs::read_to_string(log_dir.path().join("dziennik_koncowy_faza2.txt"))
+            .expect("Dziennik Końcowy musi powstać nawet bez nowych zadań tej sesji");
+
+        assert!(
+            dziennik.contains("Puste pliki (Wydmuszki 0 B): 1 (UFS: 1, Skrypt: 0)"),
+            "raport musi zliczyć pusty plik zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}", dziennik
+        );
+        assert!(
+            dziennik.contains("Trwałe błędy dyskowe (I/O):  1"),
+            "raport musi zliczyć błąd I/O zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}", dziennik
         );
     }
 }
