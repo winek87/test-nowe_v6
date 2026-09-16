@@ -62,10 +62,24 @@ pub struct PhaseUIState {
     /// Logi terminalowe przewijające się w prawym oknie
     pub logs: Vec<String>,
     pub max_logs: usize,
-    
+
+    /// Ręczne przewijanie panelu logów (PageUp/PageDown/End). `None` = tryb
+    /// domyślny, śledzenie najnowszych wpisów (jak dotąd - zawsze pokazuje
+    /// ogon). `Some(n)` = operator ręcznie cofnął widok o `n` (zawiniętych,
+    /// czyli już po zawinięciu długich linii — patrz `logs_panel::draw_logs`)
+    /// linii od dołu. Celowo liczone OD DOŁU, nie jako bezwzględny indeks
+    /// początku: `logs` to bufor FIFO ograniczony do `max_logs` wpisów
+    /// (`process_event` usuwa najstarsze przy przepełnieniu) — bezwzględny
+    /// indeks zapamiętany podczas przewijania cicho rozjechałby się z
+    /// rzeczywistą treścią, gdy w międzyczasie coś wypadnie z początku
+    /// bufora. Przy tym podejściu nowy log NIE psuje przewijania (patrz
+    /// `scroll_logs_up`/`_down`) - widok po prostu przesuwa się razem z nowym
+    /// wpisem, zachowując tę samą odległość od aktualnego dołu.
+    pub log_scroll: Option<usize>,
+
     /// Teksty w lewym panelu "Aktywny Skaner (Live)" (Indeks 0 = UFS, 1 = Skrypt)
     pub side_texts: Vec<String>,
-    
+
     /// Ścieżki wyświetlane w szerokim dolnym panelu (Indeks 0 = UFS, 1 = Skrypt)
     pub bottom_paths: Vec<String>,
 }
@@ -81,9 +95,42 @@ impl PhaseUIState {
             progress_bars: Vec::new(),
             logs: Vec::new(),
             max_logs: 250, // Ograniczenie do 250 linii chroni pamięć RAM przed wyciekiem
+            log_scroll: None,
             side_texts: Vec::new(),
             bottom_paths: Vec::new(),
         }
+    }
+
+    /// Przewija panel logów o `n` (zawiniętych) linii W GÓRĘ, wstecz do
+    /// starszych wpisów. Wchodzi w tryb ręcznego przewijania, jeśli jeszcze w
+    /// nim nie byliśmy — dopóki operator nie wróci na sam dół
+    /// ([`scroll_logs_down`]) albo nie naciśnie End
+    /// ([`jump_to_latest_log`]), nowe logi nie przesuwają już widoku same z
+    /// siebie tak agresywnie jak w trybie domyślnym.
+    ///
+    /// Górny limit (`self.logs.len()`) to tylko bezpiecznik przeciw
+    /// nieograniczonemu wzrostowi przy przytrzymanym PageUp — rzeczywiste
+    /// dociśnięcie do najstarszego wpisu widocznego na ekranie liczy render
+    /// (`logs_panel::draw_logs`, zna faktyczną wysokość panelu).
+    pub fn scroll_logs_up(&mut self, n: usize) {
+        let obecny = self.log_scroll.unwrap_or(0);
+        self.log_scroll = Some((obecny + n).min(self.logs.len()));
+    }
+
+    /// Przewija panel logów o `n` linii W DÓŁ, do przodu, do nowszych wpisów.
+    /// Po dojechaniu do samego dołu WYŁĄCZA ręczne przewijanie (powrót do
+    /// `None`) — dokładnie tak, jakby operator nacisnął End.
+    pub fn scroll_logs_down(&mut self, n: usize) {
+        if let Some(obecny) = self.log_scroll {
+            let nowy = obecny.saturating_sub(n);
+            self.log_scroll = if nowy == 0 { None } else { Some(nowy) };
+        }
+    }
+
+    /// Natychmiastowy powrót do najnowszych wpisów (klawisz End) — bez
+    /// względu na to, jak daleko operator odjechał w górę.
+    pub fn jump_to_latest_log(&mut self) {
+        self.log_scroll = None;
     }
 
     /// Odbiera eventy z kanału MPSC i odpowiednio mutuje stan widoku.
@@ -286,5 +333,94 @@ mod tests {
         s.process_event(PhaseEvent::Done);
 
         assert_eq!(s.logs.len(), logow_przed, "Done to wyłącznie sygnał zakończenia");
+    }
+
+    // ------------------------------------------------------------------
+    // PRZEWIJANIE PANELU LOGÓW (PageUp/PageDown/End)
+    // ------------------------------------------------------------------
+
+    fn stan_z_n_logami(n: usize) -> PhaseUIState {
+        let mut s = stan();
+        for i in 0..n {
+            s.process_event(PhaseEvent::Log(format!("wpis {}", i)));
+        }
+        s
+    }
+
+    #[test]
+    fn test_nowy_stan_ma_wylaczone_reczne_przewijanie() {
+        assert_eq!(stan().log_scroll, None);
+    }
+
+    #[test]
+    fn test_scroll_logs_up_wlacza_reczne_przewijanie() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(5);
+        assert_eq!(s.log_scroll, Some(5));
+    }
+
+    #[test]
+    fn test_scroll_logs_up_kumuluje_sie_przy_kolejnych_wywolaniach() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(5);
+        s.scroll_logs_up(3);
+        assert_eq!(s.log_scroll, Some(8));
+    }
+
+    #[test]
+    fn test_scroll_logs_up_nie_przekracza_liczby_wpisow() {
+        let mut s = stan_z_n_logami(10);
+        s.scroll_logs_up(1000);
+        assert_eq!(s.log_scroll, Some(10), "przewinięcie dalej niż jest historii musi się zatrzymać na jej długości");
+    }
+
+    #[test]
+    fn test_scroll_logs_down_zmniejsza_cofniecie() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(8);
+        s.scroll_logs_down(3);
+        assert_eq!(s.log_scroll, Some(5));
+    }
+
+    #[test]
+    fn test_scroll_logs_down_do_zera_wylacza_reczne_przewijanie() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(5);
+        s.scroll_logs_down(5);
+        assert_eq!(s.log_scroll, None, "dojechanie do samego dołu musi wrócić do trybu Auto-Scroll");
+    }
+
+    #[test]
+    fn test_scroll_logs_down_za_daleko_zatrzymuje_sie_na_dole_nie_panikuje() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(3);
+        s.scroll_logs_down(1000);
+        assert_eq!(s.log_scroll, None);
+    }
+
+    #[test]
+    fn test_scroll_logs_down_bez_wczesniejszego_przewiniecia_nic_nie_robi() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_down(5);
+        assert_eq!(s.log_scroll, None, "nie ma jak przewinąć w dół, skoro już jesteśmy na dole");
+    }
+
+    #[test]
+    fn test_jump_to_latest_log_resetuje_z_dowolnego_cofniecia() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(30);
+        s.jump_to_latest_log();
+        assert_eq!(s.log_scroll, None);
+    }
+
+    /// Regresja: nowy log NIE MOŻE po cichu zresetować ręcznego przewijania —
+    /// operator czytający historię musi zostać na miejscu, dopóki sam nie
+    /// wróci (patrz dokumentacja `log_scroll`).
+    #[test]
+    fn test_nowy_log_nie_resetuje_recznego_przewijania() {
+        let mut s = stan_z_n_logami(50);
+        s.scroll_logs_up(10);
+        s.process_event(PhaseEvent::Log("swiezy wpis".into()));
+        assert_eq!(s.log_scroll, Some(10), "napływający log nie może przerwać przewijania w toku");
     }
 }

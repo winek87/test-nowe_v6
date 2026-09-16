@@ -57,18 +57,35 @@ pub fn draw_logs(f: &mut Frame, state: &PhaseUIState, area: Rect) {
         }
     }
 
-    // Wyliczamy, ile linii można wyświetlić i tniemy początek (Auto-Scroll do dołu)
+    // Wyliczamy, ile linii można wyświetlić i tniemy początek.
+    //
+    // Bez ręcznego przewijania (`log_scroll == None`): Auto-Scroll do dołu,
+    // jak dotąd — pokazujemy ogon.
+    //
+    // Z ręcznym przewijaniem (`log_scroll == Some(n)`): cofamy punkt startu o
+    // `n` (już ZAWINIĘTYCH — patrz `display_lines` wyżej — nie surowych
+    // wpisów `state.logs`) linii od dołu, tak żeby PageUp/PageDown operowały
+    // na tym, co operator faktycznie widzi na ekranie, a nie na logicznych
+    // wpisach, które mogą zajmować różną liczbę linii po zawinięciu.
+    // `saturating_sub` dociska do 0, gdy `n` przekracza dostępną historię —
+    // przewinięcie "za daleko" po prostu pokazuje sam początek, bez panic.
     let visible_lines = area.height.saturating_sub(2) as usize;
-    let start_idx = if display_lines.len() > visible_lines {
-        display_lines.len() - visible_lines
+    let bottom_start = display_lines.len().saturating_sub(visible_lines);
+    let start_idx = match state.log_scroll {
+        None => bottom_start,
+        Some(cofniecie) => bottom_start.saturating_sub(cofniecie),
+    };
+
+    let tytul = if state.log_scroll.is_some() {
+        " Logi Operacyjne (Przewijanie ręczne — [End] wróć do końca) "
     } else {
-        0
+        " Logi Operacyjne (Auto-Scroll) "
     };
 
     let list = List::new(display_lines[start_idx..].to_vec())
         .block(Block::default()
             .borders(Borders::ALL)
-            .title(" Logi Operacyjne (Auto-Scroll) ")
+            .title(tytul)
             .border_style(Style::default().fg(Color::DarkGray)));
 
     f.render_widget(list, area);
@@ -127,6 +144,57 @@ mod tests {
 
         assert!(widok.contains("wpis numer 99"), "Najnowszy wpis musi być widoczny:\n{}", widok);
         assert!(!widok.contains("wpis numer 0 "), "Najstarszy wpis nie mieści się w oknie:\n{}", widok);
+    }
+
+    // ------------------------------------------------------------------
+    // RĘCZNE PRZEWIJANIE (PageUp/PageDown/End)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_reczne_przewiniecie_pokazuje_starsze_wpisy_nie_najnowsze() {
+        let mut s = stan_z_logami(100);
+        s.scroll_logs_up(20);
+
+        let widok = wyrenderuj(80, 10, &s);
+
+        assert!(!widok.contains("wpis numer 99"), "po przewinięciu w górę najnowszy wpis nie może być widoczny:\n{}", widok);
+    }
+
+    #[test]
+    fn test_bez_przewiniecia_tytul_mowi_auto_scroll() {
+        let widok = wyrenderuj(80, 10, &stan_z_logami(5));
+        assert!(widok.contains("Auto-Scroll"), "domyślny tytuł musi wprost nazywać tryb:\n{}", widok);
+    }
+
+    #[test]
+    fn test_po_przewinieciu_tytul_ostrzega_o_recznym_trybie() {
+        let mut s = stan_z_logami(100);
+        s.scroll_logs_up(10);
+
+        let widok = wyrenderuj(80, 10, &s);
+        assert!(
+            widok.contains("Przewijanie ręczne") && widok.contains("End"),
+            "tytuł musi ostrzec, że operator NIE patrzy na najnowsze wpisy, i podpowiedzieć jak wrócić:\n{}", widok
+        );
+    }
+
+    #[test]
+    fn test_powrot_do_konca_przywraca_widok_najnowszych() {
+        let mut s = stan_z_logami(100);
+        s.scroll_logs_up(20);
+        s.jump_to_latest_log();
+
+        let widok = wyrenderuj(80, 10, &s);
+        assert!(widok.contains("wpis numer 99"), "po End najnowszy wpis musi znowu być widoczny:\n{}", widok);
+        assert!(widok.contains("Auto-Scroll"), "tytuł musi wrócić do trybu domyślnego:\n{}", widok);
+    }
+
+    #[test]
+    fn test_przewiniecie_dalej_niz_historia_nie_panikuje_i_pokazuje_poczatek() {
+        let mut s = stan_z_logami(20);
+        s.scroll_logs_up(1000);
+        let widok = wyrenderuj(80, 10, &s);
+        assert!(widok.contains("wpis numer 0"), "przewinięcie za daleko musi dociskać do samego początku, nie panikować:\n{}", widok);
     }
 
     #[test]

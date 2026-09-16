@@ -41,6 +41,14 @@ use tracing::{debug, info, warn};
 /// faz — każdy element `fn(...)` automatycznie spełnia ten typ.
 pub type PhaseFn = Box<dyn FnOnce(&mut Connection, &Ustawienia, mpsc::Sender<PhaseEvent>) -> rusqlite::Result<()> + Send>;
 
+/// Rozmiar "strony" dla PageUp/PageDown w panelu logów ekranu fazy (patrz
+/// `PhaseUIState::scroll_logs_up`/`_down`). Stała, niezależna od faktycznej
+/// wysokości panelu — ta jest znana dopiero wewnątrz `terminal.draw`, a
+/// klawiatura jest odczytywana wcześniej, w tej samej pętli. Wartość dobrana
+/// tak, żeby jedno naciśnięcie odpowiadało w przybliżeniu jednemu ekranowi
+/// logów na typowym terminalu.
+const STRONA_LOGOW: usize = 10;
+
 // ============================================================================
 // GŁÓWNY DYSTRYBUTOR AKCJI
 // ============================================================================
@@ -229,14 +237,25 @@ fn run_phase_z_opcjami(
                 last_tick = Instant::now();
             }
 
-            // 3. Przechwytywanie klawiatury użytkownika (Ratunkowe Ctrl+C)
+            // 3. Przechwytywanie klawiatury użytkownika (Ratunkowe Ctrl+C,
+            // przewijanie panelu logów PageUp/PageDown/End — patrz
+            // dokumentacja `PhaseUIState::scroll_logs_up`).
             if event::poll(Duration::from_millis(0)).unwrap_or(false)
                 && let Ok(event::Event::Key(key)) = event::read()
-                    && key.kind == KeyEventKind::Press && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        crate::utils::CANCEL_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if cancel_requested_at.is_none() {
-                            cancel_requested_at = Some(Instant::now());
-                            ui_state.process_event(PhaseEvent::Log("⚠️ WYKRYTO PRZERWANIE UŻYTKOWNIKA (Ctrl+C). Oczekiwanie na bezpieczne zamknięcie szyny I/O...".to_string()));
+                    && key.kind == KeyEventKind::Press {
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            crate::utils::CANCEL_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if cancel_requested_at.is_none() {
+                                cancel_requested_at = Some(Instant::now());
+                                ui_state.process_event(PhaseEvent::Log("⚠️ WYKRYTO PRZERWANIE UŻYTKOWNIKA (Ctrl+C). Oczekiwanie na bezpieczne zamknięcie szyny I/O...".to_string()));
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::PageUp => ui_state.scroll_logs_up(STRONA_LOGOW),
+                                KeyCode::PageDown => ui_state.scroll_logs_down(STRONA_LOGOW),
+                                KeyCode::End => ui_state.jump_to_latest_log(),
+                                _ => {}
+                            }
                         }
                     }
 
@@ -389,8 +408,17 @@ fn run_phase_z_opcjami(
 
         if event::poll(Duration::from_millis(50)).unwrap_or(false)
             && let Ok(event::Event::Key(key)) = event::read()
-                && key.kind == KeyEventKind::Press && (key.code == KeyCode::Enter || key.code == KeyCode::Esc) {
-                    break;
+                && key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Esc => break,
+                        // Przewijanie historii logów NA EKRANIE KOŃCOWYM —
+                        // operator dostaje szansę przejrzeć cały przebieg
+                        // fazy przed powrotem do menu, nie tylko jej ogon.
+                        KeyCode::PageUp => ui_state.scroll_logs_up(STRONA_LOGOW),
+                        KeyCode::PageDown => ui_state.scroll_logs_down(STRONA_LOGOW),
+                        KeyCode::End => ui_state.jump_to_latest_log(),
+                        _ => {}
+                    }
                 }
     }
 
