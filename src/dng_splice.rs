@@ -116,6 +116,23 @@ impl<'a> TiffReader<'a> {
         let value_pos = entry_offset + 8;
         let data_start = if total_size <= 4 { value_pos } else { self.u32_at(value_pos)? as usize };
 
+        // REGRESJA (todo.dng_archive_repair.md): `count` pochodzi wprost z
+        // 4 bajtów PLIKU, bez żadnego związku z jego rzeczywistym rozmiarem
+        // — zniekształcony, kilkudziesięciobajtowy DNG mógł zadeklarować
+        // `count` bliski `u32::MAX`, wymuszając `Vec::with_capacity(count)`
+        // niżej na wiele GB PRZED jakąkolwiek próbą odczytu spod tego
+        // adresu. Nieudana alokacja woła `handle_alloc_error` i ABORTUJE
+        // CAŁY PROCES — to NIE jest panika, więc żaden `catch_unwind`
+        // (używany gdzie indziej w projekcie dla `rawloader`/`zip`) tego nie
+        // łapie. Sprawdzamy więc PRZED alokacją, że zadeklarowana tablica w
+        // ogóle MIEŚCI SIĘ w rzeczywistych danych pliku — i tak musielibyśmy
+        // to zweryfikować podczas odczytu każdego elementu niżej (`self.
+        // data.get(pos)?`), tylko wtedy już po kosztownej/zabójczej alokacji.
+        let data_end = data_start.checked_add(total_size)?;
+        if data_end > self.data.len() {
+            return None;
+        }
+
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             let pos = data_start + i * elem_size;
@@ -496,6 +513,54 @@ mod tests {
     fn test_find_pixel_data_ranges_truncated_header_returns_none() {
         let garbage = vec![0x00u8; 4]; // za krótkie nawet na nagłówek TIFF (8 bajtów)
         assert!(find_pixel_data_ranges(&garbage).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // read_value_array — regresja (todo.dng_archive_repair.md): `count`
+    // pochodzi wprost z pliku, bez związku z jego rzeczywistym rozmiarem.
+    // Bez sprawdzenia PRZED alokacją, zniekształcony plik mógł wymusić
+    // Vec::with_capacity() na wiele GB i ABORTOWAĆ cały proces (nie panika
+    // — handle_alloc_error, catch_unwind tego nie łapie).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_read_value_array_odrzuca_ogromny_count_zamiast_probowac_alokacji() {
+        // Nagłówek TIFF (little-endian, magic=42) + jeden wpis IFD (12
+        // bajtów) pod offsetem 8, deklarujący count bliski u32::MAX dla
+        // typu LONG (elem_size=4) — zadeklarowany rozmiar tablicy wielokrotnie
+        // przekracza rozmiar całego (20-bajtowego) bufora danych.
+        let mut data = vec![0u8; 20];
+        data[0] = b'I'; data[1] = b'I';
+        data[2] = 42; data[3] = 0;
+        data[8..10].copy_from_slice(&0u16.to_le_bytes()); // tag (nieistotny w tym teście)
+        data[10..12].copy_from_slice(&4u16.to_le_bytes()); // typ = LONG (elem_size = 4)
+        data[12..16].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // count — ogromny
+        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // offset danych (nieistotny — musi odrzucić wcześniej)
+
+        let reader = TiffReader::new(&data).expect("nagłówek TIFF jest poprawny");
+        assert_eq!(
+            reader.read_value_array(8), None,
+            "ogromny, niewiarygodny count musi dać None natychmiast, nie próbę alokacji GB pamięci"
+        );
+    }
+
+    /// Kontrola pozytywna: mały, realny `count`, który faktycznie mieści się
+    /// w buforze, musi nadal działać poprawnie — naprawa nie może odrzucać
+    /// prawidłowych plików.
+    #[test]
+    fn test_read_value_array_akceptuje_maly_count_ktory_faktycznie_miesci_sie_w_danych() {
+        let mut data = vec![0u8; 28];
+        data[0] = b'I'; data[1] = b'I';
+        data[2] = 42; data[3] = 0;
+        data[8..10].copy_from_slice(&0u16.to_le_bytes());
+        data[10..12].copy_from_slice(&4u16.to_le_bytes()); // typ LONG
+        data[12..16].copy_from_slice(&2u32.to_le_bytes()); // count = 2 (realny)
+        data[16..20].copy_from_slice(&20u32.to_le_bytes()); // offset danych = 20 (zaraz po wpisie)
+        data[20..24].copy_from_slice(&111u32.to_le_bytes());
+        data[24..28].copy_from_slice(&222u32.to_le_bytes());
+
+        let reader = TiffReader::new(&data).unwrap();
+        assert_eq!(reader.read_value_array(8), Some(vec![111, 222]));
     }
 
     // ------------------------------------------------------------------
