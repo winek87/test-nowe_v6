@@ -1,3 +1,5 @@
 /target
 .db/
 *.bak
+/dziennik/
+*.log
