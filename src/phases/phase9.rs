@@ -33,7 +33,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, Result};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -382,12 +382,40 @@ pub(crate) fn sciezki_bezpieczne(target_path: &Path, ufs_path: &Path, script_pat
     Ok(())
 }
 
-/// Wylicza bezpieczną ścieżkę docelową, unikając nadpisania już istniejącego
-/// pliku o tej samej nazwie (może się zdarzyć, gdy dwa różne wpisy z bazy
-/// mapują się na tę samą ścieżkę względną z powodu wcześniejszych anomalii).
-/// Przy kolizji dopisuje sufiks `_[UFS]`/`_[SKRYPT]` do nazwy pliku (przed
-/// rozszerzeniem), a przy kolejnych kolizjach tej samej pary — `_v2`, `_v3`
-/// itd. Zwraca `(pełna_ścieżka_docelowa, ścieżka_względna_finalna, czy_zmieniono_nazwę)`.
+/// Etykieta źródła osadzana w nazwie pliku przy kolizji nazw — patrz
+/// [`get_safe_target_path`] i [`commit_bez_nadpisania`].
+fn etykieta_zwyciezcy(winner: &str) -> &'static str {
+    if winner == "splice" { "ZLOZONY" } else if winner == "script" { "SKRYPT" } else { "UFS" }
+}
+
+/// Nazwa N-tego kandydata przy kolizji nazw: dla `counter == 1` sam tag
+/// źródła (bez numeru wersji), dla kolejnych kolizji tej samej pary —
+/// dopisek `_vN`. Wspólna między optymistycznym sprawdzeniem w
+/// [`get_safe_target_path`] a atomowym domknięciem wyścigu wątków w
+/// [`commit_bez_nadpisania`] — jedno miejsce prawdy o formacie nazwy,
+/// żeby obie ścieżki kodu nigdy nie rozjechały się w konwencji nazewnictwa.
+fn nazwa_kandydata(stem: &str, tag: &str, ext: &str, counter: u32) -> String {
+    if counter == 1 { format!("{}_[{}]{}", stem, tag, ext) } else { format!("{}_[{}]_v{}{}", stem, tag, counter, ext) }
+}
+
+/// Wylicza OPTYMISTYCZNĄ bezpieczną ścieżkę docelową, unikając nadpisania już
+/// istniejącego pliku o tej samej nazwie (może się zdarzyć, gdy dwa różne
+/// wpisy z bazy mapują się na tę samą ścieżkę względną z powodu wcześniejszych
+/// anomalii). Przy kolizji dopisuje sufiks `_[UFS]`/`_[SKRYPT]` do nazwy pliku
+/// (przed rozszerzeniem), a przy kolejnych kolizjach tej samej pary — `_v2`,
+/// `_v3` itd. Zwraca `(pełna_ścieżka_docelowa, ścieżka_względna_finalna,
+/// czy_zmieniono_nazwę)`.
+///
+/// ## UWAGA: to tylko "best effort" pierwsza próba, NIE ostateczna decyzja
+///
+/// Sprawdzenie opiera się o `Path::exists()` — a między tym sprawdzeniem a
+/// faktycznym zapisem pliku inny wątek Rayon (przetwarzający RÓWNOLEGLE inną
+/// paczkę kandydatów) mógł w międzyczasie zarezerwować dokładnie tę samą
+/// nazwę. Ten wynik wystarcza do wcześniejszego utworzenia katalogu
+/// nadrzędnego i do rekonstrukcji dowiązań symbolicznych (`symlink(2)` sam z
+/// siebie nigdy nie nadpisuje — zawodzi z `AlreadyExists`, więc jest z
+/// natury bezpieczny na wyścig). Dla zwykłych plików ostateczną, odporną na
+/// wyścig decyzję podejmuje dopiero [`commit_bez_nadpisania`].
 fn get_safe_target_path(target_base: &Path, rel_path: &str, winner: &str) -> (PathBuf, String, bool) {
     let mut target_path = target_base.join(rel_path);
     let mut final_rel_path = rel_path.to_string();
@@ -399,14 +427,14 @@ fn get_safe_target_path(target_base: &Path, rel_path: &str, winner: &str) -> (Pa
         let stem = original_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
         let ext = original_path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
         let parent = original_path.parent().unwrap_or(Path::new(""));
-        let source_tag = if winner == "splice" { "ZLOZONY" } else if winner == "script" { "SKRYPT" } else { "UFS" };
-        
+        let source_tag = etykieta_zwyciezcy(winner);
+
         let mut counter = 1;
         loop {
-            let new_name = if counter == 1 { format!("{}_[{}]{}", stem, source_tag, ext) } else { format!("{}_[{}]_v{}{}", stem, source_tag, counter, ext) };
+            let new_name = nazwa_kandydata(stem, source_tag, &ext, counter);
             let new_rel_path = parent.join(&new_name);
             target_path = target_base.join(&new_rel_path);
-            
+
             if !target_path.exists() {
                 final_rel_path = new_rel_path.to_string_lossy().to_string();
                 break;
@@ -415,6 +443,69 @@ fn get_safe_target_path(target_base: &Path, rel_path: &str, winner: &str) -> (Pa
         }
     }
     (target_path, final_rel_path, renamed)
+}
+
+/// Atomowo "zatwierdza" gotowy plik tymczasowy `tmp_path` pod bezpieczną
+/// nazwą docelową, GWARANTUJĄC brak cichego nadpisania przy wyścigu wątków —
+/// domyka lukę TOCTOU pozostawioną celowo otwartą przez
+/// [`get_safe_target_path`] (patrz jej dokumentacja).
+///
+/// ## Dlaczego `fs::hard_link`, nie `fs::rename`
+///
+/// `fs::rename` na Uniksie ZAWSZE cicho nadpisuje istniejący cel — to
+/// dokładnie sedno luki: dwa wątki Rayon przetwarzające różne paczki mogą
+/// obliczyć TĘ SAMĄ nazwę bezpieczną (oba widziały ją jako wolną w chwili
+/// optymistycznego sprawdzenia `Path::exists()`), skopiować swoje pliki do
+/// osobnych plików tymczasowych, po czym oba zakończyć `rename` na ten sam
+/// cel — drugi cicho kasuje wynik pierwszego, bez żadnego sygnału błędu.
+/// `fs::hard_link` ma odwrotną semantykę z definicji POSIX: NIGDY nie
+/// nadpisuje, zawsze zawodzi z `AlreadyExists`, jeśli cel już istnieje. Więc
+/// przy realnej kolizji bezpiecznie próbujemy KOLEJNEJ nazwy (ten sam
+/// mechanizm `_v2`, `_v3` co przy pierwszej, optymistycznej próbie) — aż
+/// trafimy na nazwę, którą faktycznie uda się zarezerwować atomowo. Treść
+/// pliku jest już w pełni zapisana i zweryfikowana w `tmp_path` PRZED
+/// wywołaniem tej funkcji, więc retry nigdy nie kopiuje niczego ponownie —
+/// tylko próbuje innej nazwy dla tego samego, gotowego pliku. Po sukcesie
+/// oryginalny `tmp_path` jest usuwany (treść jest już dostępna pod nazwą
+/// docelową jako drugie dowiązanie do tego samego i-node).
+///
+/// Wymaga, żeby `tmp_path` i katalog docelowy leżały na TYM SAMYM systemie
+/// plików — dokładnie to samo założenie, które już obowiązywało dla
+/// `fs::rename` (`sciezka_tymczasowa` celowo tworzy plik tymczasowy w tym
+/// samym katalogu co cel).
+///
+/// Zwraca `(pełna_ścieżka_docelowa, ścieżka_względna_finalna,
+/// czy_zmieniono_nazwę)` — AUTORYTATYWNY wynik, który może różnić się od
+/// optymistycznej podpowiedzi [`get_safe_target_path`], jeśli w
+/// międzyczasie doszło do realnej kolizji wyścigu.
+fn commit_bez_nadpisania(tmp_path: &Path, target_base: &Path, rel_path: &str, winner: &str) -> std::io::Result<(PathBuf, String, bool)> {
+    let original_path = Path::new(rel_path);
+    let stem = original_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = original_path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+    let parent = original_path.parent().unwrap_or(Path::new(""));
+    let source_tag = etykieta_zwyciezcy(winner);
+
+    let mut counter: u32 = 0; // 0 = nazwa oryginalna (bez tagu), próbowana jako pierwsza
+    loop {
+        let (final_rel_path, final_path) = if counter == 0 {
+            (rel_path.to_string(), target_base.join(rel_path))
+        } else {
+            let new_rel_path = parent.join(nazwa_kandydata(stem, source_tag, &ext, counter));
+            (new_rel_path.to_string_lossy().to_string(), target_base.join(&new_rel_path))
+        };
+
+        match fs::hard_link(tmp_path, &final_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(tmp_path);
+                return Ok((final_path, final_rel_path, counter != 0));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                counter += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Rozwiązuje ścieżkę wersji naprawionej przez Fazę 17.
@@ -533,7 +624,7 @@ fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Pa
         (file.size_ufs, file.uid_ufs, file.gid_ufs, file.mode_ufs, file.mtime_ufs, file.is_symlink_ufs)
     };
 
-    let (target_path_full, final_rel_path, renamed) = get_safe_target_path(target_base, &file.rel_path, winner);
+    let (mut target_path_full, mut final_rel_path, mut renamed) = get_safe_target_path(target_base, &file.rel_path, winner);
 
     if let Some(parent) = target_path_full.parent() { let _ = fs::create_dir_all(parent); }
 
@@ -579,9 +670,16 @@ fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Pa
             }
         }
 
-        if fs::rename(&tmp_path, &target_path_full).is_err() {
-            let _ = fs::remove_file(&tmp_path);
-            stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
+        match commit_bez_nadpisania(&tmp_path, target_base, &file.rel_path, winner) {
+            Ok((path, rel, czy_zmieniono)) => {
+                target_path_full = path;
+                final_rel_path = rel;
+                renamed = czy_zmieniono;
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&tmp_path);
+                stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
+            }
         }
     }
 
@@ -1425,6 +1523,93 @@ mod tests {
         assert!(!renamed);
         assert_eq!(rel, "sub/dir/plik.txt");
         assert_eq!(path, dir.path().join("sub/dir/plik.txt"));
+    }
+
+    // ------------------------------------------------------------------
+    // commit_bez_nadpisania — regresja na TOCTOU między optymistycznym
+    // `get_safe_target_path` a faktycznym zapisem (dwa wątki Rayon widzą tę
+    // samą nazwę jako "wolną" i oba próbują ją "zatwierdzić").
+    // ------------------------------------------------------------------
+
+    /// Sedno naprawy: kiedy dwa "wątki" (symulowane tu sekwencyjnie — sam
+    /// mechanizm jest deterministyczny per wywołanie, więc kolejność
+    /// wywołań odpowiada dokładnie temu, co by się stało przy realnym
+    /// wyścigu) kończą kopiowanie do RÓŻNYCH plików tymczasowych, ale oba
+    /// celują w tę samą nazwę docelową — drugi NIE MOŻE nadpisać treści
+    /// pierwszego. Ze starym `fs::rename` ten test by nie przeszedł: drugi
+    /// `rename` cicho skasowałby zawartość pierwszego pliku.
+    #[test]
+    fn test_commit_bez_nadpisania_drugi_watek_nie_nadpisuje_pierwszego() {
+        let dir = tempdir().unwrap();
+
+        let tmp1 = dir.path().join(".tmp1");
+        let tmp2 = dir.path().join(".tmp2");
+        std::fs::write(&tmp1, b"TRESC_WATKU_A").unwrap();
+        std::fs::write(&tmp2, b"TRESC_WATKU_B").unwrap();
+
+        let (path1, rel1, renamed1) = commit_bez_nadpisania(&tmp1, dir.path(), "plik.txt", "script").unwrap();
+        let (path2, rel2, renamed2) = commit_bez_nadpisania(&tmp2, dir.path(), "plik.txt", "script").unwrap();
+
+        assert!(!renamed1, "Pierwszy 'wątek' nie miał kolizji — powinien dostać nazwę oryginalną");
+        assert!(renamed2, "Drugi 'wątek' musiał dostać INNĄ nazwę, bo oryginalna była już zajęta");
+        assert_ne!(path1, path2, "Obie kopie muszą wylądować pod różnymi ścieżkami");
+
+        assert_eq!(std::fs::read(&path1).unwrap(), b"TRESC_WATKU_A", "Treść pierwszego pliku nie może zostać nadpisana");
+        assert_eq!(std::fs::read(&path2).unwrap(), b"TRESC_WATKU_B", "Treść drugiego pliku musi być zachowana pod jego własną nazwą");
+
+        assert_eq!(rel1, "plik.txt");
+        assert_eq!(rel2, "plik_[SKRYPT].txt");
+
+        assert!(!tmp1.exists(), "Plik tymczasowy musi zniknąć po zatwierdzeniu");
+        assert!(!tmp2.exists(), "Plik tymczasowy musi zniknąć po zatwierdzeniu");
+    }
+
+    /// Trzeci "wątek" trafiający na tę samą nazwę po tym, jak i oryginał, i
+    /// pierwszy sufiks `_[TAG]` są już zajęte — musi dostać `_v2`, dokładnie
+    /// jak przy optymistycznej ścieżce w `get_safe_target_path`.
+    #[test]
+    fn test_commit_bez_nadpisania_trzecia_kolizja_dostaje_wersje_v2() {
+        let dir = tempdir().unwrap();
+
+        let tmp1 = dir.path().join(".tmp1");
+        let tmp2 = dir.path().join(".tmp2");
+        let tmp3 = dir.path().join(".tmp3");
+        std::fs::write(&tmp1, b"A").unwrap();
+        std::fs::write(&tmp2, b"B").unwrap();
+        std::fs::write(&tmp3, b"C").unwrap();
+
+        let (_, rel1, _) = commit_bez_nadpisania(&tmp1, dir.path(), "plik.txt", "ufs").unwrap();
+        let (_, rel2, _) = commit_bez_nadpisania(&tmp2, dir.path(), "plik.txt", "ufs").unwrap();
+        let (path3, rel3, renamed3) = commit_bez_nadpisania(&tmp3, dir.path(), "plik.txt", "ufs").unwrap();
+
+        assert_eq!(rel1, "plik.txt");
+        assert_eq!(rel2, "plik_[UFS].txt");
+        assert!(renamed3);
+        assert_eq!(rel3, "plik_[UFS]_v2.txt");
+        assert_eq!(std::fs::read(&path3).unwrap(), b"C");
+    }
+
+    /// Brak kolizji w ogóle: musi zachowywać się identycznie jak prosty
+    /// `fs::rename` w typowym, nieskonfliktowanym przypadku.
+    #[test]
+    fn test_commit_bez_nadpisania_bez_kolizji_zachowuje_oryginalna_nazwe() {
+        let dir = tempdir().unwrap();
+        // Katalog nadrzędny musi istnieć PRZED wywołaniem — dokładnie tak,
+        // jak w produkcji robi to `fs::create_dir_all` w `copy_file_and_meta`
+        // (na podstawie optymistycznej ścieżki z `get_safe_target_path`)
+        // ZANIM wywoła `commit_bez_nadpisania`. Sama funkcja nie tworzy
+        // katalogów — odpowiada wyłącznie za bezpieczną rezerwację nazwy.
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let tmp = dir.path().join(".tmp");
+        std::fs::write(&tmp, b"tresc").unwrap();
+
+        let (path, rel, renamed) = commit_bez_nadpisania(&tmp, dir.path(), "sub/plik.txt", "script").unwrap();
+
+        assert!(!renamed);
+        assert_eq!(rel, "sub/plik.txt");
+        assert_eq!(path, dir.path().join("sub/plik.txt"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"tresc");
+        assert!(!tmp.exists());
     }
 
     // ------------------------------------------------------------------
