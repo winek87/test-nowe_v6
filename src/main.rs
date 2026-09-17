@@ -29,6 +29,7 @@ mod db;
 mod diag;
 mod logging;
 mod menu;
+mod opisy_anomalii;
 mod phases;
 mod reset;
 mod workspace_cleanup;
