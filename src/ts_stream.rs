@@ -105,6 +105,23 @@ impl TsAnalysis {
     }
 }
 
+/// Szerokość okna wykrywania siatki pakietów TS — patrz dokumentacja
+/// [`detect_packet_layout`].
+///
+/// REGRESJA (todo.video_container_repair.md, Ustalenie 3.2): poprzednia
+/// wartość (`M2TS_PACKET_SIZE * 4` = 768 B) była zbyt wąska — plik ze
+/// śmieciami na początku dłuższymi niż to okno (fragment poprzedniego pliku
+/// z operacji carvingu, resztki dziennika systemu plików, nagłówek innego
+/// kontenera transportowego doczepiony przed właściwym strumieniem — realne
+/// scenariusze przy odzysku danych, nie tylko teoretyczne) był błędnie
+/// diagnozowany jako „nie jest strumieniem TS" (uszkodzony), mimo że dalej w
+/// pliku jest w pełni czytelny strumień. 1 MiB komfortowo pokrywa
+/// realistyczne ilości śmieci (rzędu pojedynczych/kilkudziesięciu KB), a
+/// koszt pozostaje pomijalny — pętla robi maks. kilkanaście prostych
+/// porównań bajtów na pozycję startu, więc nawet 1 MiB pozycji startowych to
+/// rzędu dziesiątek milionów operacji na bajtach, ułamek milisekundy.
+const OKNO_WYKRYWANIA_SIATKI_BAJTOW: usize = 1024 * 1024;
+
 /// Wykrywa rozmiar pakietu, sprawdzając, czy bajty synchronizacji układają
 /// się regularnie co 188 (zwykły TS) czy co 192 (M2TS z Blu-ray, gdzie
 /// każdy pakiet poprzedza 4-bajtowy znacznik czasu).
@@ -126,7 +143,7 @@ impl TsAnalysis {
 /// pod rząd) i wymagamy większości — dzięki temu pojedyncze uszkodzone
 /// pakiety nie blokują rozpoznania całego strumienia.
 pub fn detect_packet_layout(bytes: &[u8]) -> Option<(usize, usize)> {
-    let search_limit = bytes.len().min(M2TS_PACKET_SIZE * 4);
+    let search_limit = bytes.len().min(OKNO_WYKRYWANIA_SIATKI_BAJTOW);
     let mut best: Option<(usize, usize, usize)> = None; // (trafienia, rozmiar, start)
 
     for start in 0..=search_limit {
@@ -288,12 +305,23 @@ fn pakiet_pod(bytes: &[u8], offset: usize, packet_size: usize, sync_offset: usiz
 /// tego samego pliku, więc pakiet o danym numerze leży w obu pod tym samym
 /// offsetem. Wynik zachowuje siatkę co do bajtu.
 ///
-/// ## Kiedy odmawia
+/// ## Kiedy odmawia CAŁKOWICIE (`None`)
 ///
 /// - któraś strona nie jest rozpoznawalnym strumieniem TS,
 /// - kopie mają różny układ siatki (inny rozmiar pakietu lub inny offset
 ///   początku) — to nie są dwa odzyski tego samego pliku,
-/// - TEN SAM pakiet jest niesprawny po OBU stronach.
+/// - żaden pojedynczy pakiet nie dał się złożyć (nie ma czego zwrócić).
+///
+/// ## Kiedy OBCINA wynik zamiast odmawiać
+///
+/// Gdy TEN SAM pakiet jest niesprawny po OBU stronach (obie kopie
+/// uszkodzone/z błędem transportu, albo jedna strona w ogóle nie ma tylu
+/// pakietów) — ten sam wzorzec "obetnij i zachowaj" co `flv_stream::
+/// splice_flv`. Siatka obu kopii zgadzała się aż do tej pozycji, więc to,
+/// co już złożono, jest w pełni wiarygodne — utrata WSZYSTKICH wcześniej
+/// złożonych pakietów tylko dlatego, że jeden konkretny (często ostatni,
+/// gdzie oba odzyski bywają uszkodzone jednocześnie — ten sam fizyczny
+/// sektor) nie dał się dopasować, byłaby nieproporcjonalna.
 pub fn splice_ts(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
     let (rozmiar_a, start_a) = detect_packet_layout(bytes_a)?;
     let (rozmiar_b, start_b) = detect_packet_layout(bytes_b)?;
@@ -318,6 +346,7 @@ pub fn splice_ts(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
 
     let mut oczekiwany_cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     let mut wybrano_z_dawcy = 0usize;
+    let mut zlozonych = 0usize;
 
     for i in 0..liczba {
         let offset = start + i * packet_size;
@@ -330,12 +359,21 @@ pub fn splice_ts(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
         // Najpierw pakiet sprawny ZACHOWUJĄCY ciągłość, potem dowolny sprawny.
         // Bez tego pierwszeństwa kopia z przekłamanym licznikiem wygrywałaby
         // tylko dlatego, że stoi pierwsza.
-        let wybrany = kandydaci
+        //
+        // REGRESJA (todo.video_container_repair.md, Ustalenie 3.1): brak
+        // użytecznego kandydata na TEJ pozycji kiedyś porzucał CAŁY dotąd
+        // złożony strumień (`?`) — tracąc WSZYSTKIE poprawnie złożone
+        // wcześniej pakiety, nie tylko resztę od tego miejsca. Teraz `break`
+        // zachowuje to, co już złożono — ten sam wzorzec co `splice_flv`.
+        let Some(wybrany) = kandydaci
             .iter()
             .find(|(p, _, _)| p.is_some_and(|p| p.sprawny && zachowuje_ciaglosc(&p, &oczekiwany_cc)))
-            .or_else(|| kandydaci.iter().find(|(p, _, _)| p.is_some_and(|p| p.sprawny)))?;
+            .or_else(|| kandydaci.iter().find(|(p, _, _)| p.is_some_and(|p| p.sprawny)))
+        else {
+            break;
+        };
 
-        let (Some(pakiet), zrodlo, z_dawcy) = wybrany else { return None };
+        let (Some(pakiet), zrodlo, z_dawcy) = wybrany else { break };
         if *z_dawcy {
             wybrano_z_dawcy += 1;
         }
@@ -344,10 +382,16 @@ pub fn splice_ts(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
             oczekiwany_cc.insert(pakiet.pid, pakiet.cc);
         }
 
-        wynik.extend_from_slice(zrodlo.get(offset..offset + packet_size)?);
+        let Some(bajty) = zrodlo.get(offset..offset + packet_size) else { break };
+        wynik.extend_from_slice(bajty);
+        zlozonych += 1;
     }
 
-    tracing::debug!(pakietow = liczba, z_dawcy = wybrano_z_dawcy, "splice_ts: złożono strumień");
+    if zlozonych == 0 {
+        return None;
+    }
+
+    tracing::debug!(pakietow = zlozonych, z_dawcy = wybrano_z_dawcy, "splice_ts: złożono strumień");
     Some(wynik)
 }
 
@@ -459,6 +503,21 @@ mod tests {
         let (size, start) = detect_packet_layout(&stream).expect("powinien znaleźć strumień mimo śmieci");
         assert_eq!(size, TS_PACKET_SIZE);
         assert_eq!(start, 37);
+    }
+
+    /// REGRESJA (todo.video_container_repair.md, Ustalenie 3.2): poprzedni
+    /// próg (768 B = `M2TS_PACKET_SIZE * 4`) błędnie diagnozował jako
+    /// "nie jest strumieniem TS" każdy plik ze śmieciami na początku
+    /// dłuższymi niż to okno — mimo że dalej jest w pełni czytelny strumień.
+    /// 2000 B śmieci (znacznie powyżej starego progu, wciąż daleko poniżej
+    /// nowego) musi zostać poprawnie pominięte.
+    #[test]
+    fn test_detect_skips_leading_garbage_dluzszej_niz_stary_prog_768_bajtow() {
+        let mut stream = vec![0xFFu8; 2000];
+        stream.extend(build_stream(10, 256));
+        let (size, start) = detect_packet_layout(&stream).expect("powinien znaleźć strumień mimo śmieci dłuższych niż stary próg 768 B");
+        assert_eq!(size, TS_PACKET_SIZE);
+        assert_eq!(start, 2000);
     }
 
     #[test]
@@ -703,15 +762,35 @@ mod tests {
         assert_eq!(wynik[4], 0xAA, "pierwszy pakiet pochodzi z kopii A");
     }
 
+    /// REGRESJA (todo.video_container_repair.md, Ustalenie 3.1): pakiet
+    /// niezdatny po OBU stronach musi OBCIĄĆ wynik w tym miejscu i zachować
+    /// wszystko, co złożono wcześniej — nie skasować całego dotychczasowego
+    /// dorobku. Pierwszy pakiet jest sprawny po obu stronach (musi
+    /// przetrwać), drugi ma flagę błędu transportu po obu stronach (nie
+    /// może się złożyć).
     #[test]
-    fn test_pakiet_zepsuty_po_obu_stronach_blokuje_skladanie() {
+    fn test_pakiet_zepsuty_po_obu_stronach_obcina_wynik_zamiast_go_kasowac() {
         let a = strumien(&[pakiet(0x100, 0, false, 0xAA), pakiet(0x100, 1, true, 0xAA)]);
         let b = strumien(&[pakiet(0x100, 0, false, 0xBB), pakiet(0x100, 1, true, 0xBB)]);
 
-        assert!(
-            splice_ts(&a, &b).is_none(),
-            "nie ma z czego wybrać - składanie musi odmówić, a nie zapisać pakiet oznaczony jako błędny"
+        let wynik = splice_ts(&a, &b).expect(
+            "pakiet niezdatny po obu stronach nie może skasować już poprawnie złożonego wcześniejszego pakietu"
         );
+        assert_eq!(wynik.len(), TS_PACKET_SIZE, "wynik musi zawierać dokładnie jeden (pierwszy, sprawny) pakiet, nie zero");
+        assert_eq!(&wynik[..], &pakiet(0x100, 0, false, 0xAA)[..], "pierwszy pakiet musi przetrwać obcięcie, niezmieniony");
+    }
+
+    /// Kontrola pozytywna dla powyższego: gdy NIC nie da się złożyć (jedyny
+    /// pakiet jest niezdatny po obu stronach), wynik musi pozostać `None`,
+    /// nie pusty/samo-prefiksowy `Some`.
+    #[test]
+    fn test_wszystkie_pakiety_zepsute_po_obu_stronach_daje_none() {
+        // Dwa pakiety (nie jeden) - detect_packet_layout wymaga co najmniej
+        // dwóch dostępnych pakietów, żeby w ogóle rozpoznać siatkę TS.
+        let a = strumien(&[pakiet(0x100, 1, true, 0xAA), pakiet(0x100, 2, true, 0xAA)]);
+        let b = strumien(&[pakiet(0x100, 1, true, 0xBB), pakiet(0x100, 2, true, 0xBB)]);
+
+        assert!(splice_ts(&a, &b).is_none(), "gdy nic nie da się złożyć, wynik musi być None, nie pusty Some");
     }
 
     /// Gdy OBA pakiety są formalnie sprawne, decyduje licznik ciągłości.
