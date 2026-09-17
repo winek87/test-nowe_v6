@@ -316,11 +316,20 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, ta
     let wybrany = table_state.selected();
 
     // --- Dynamiczny podział szerokości ---
+    //
+    // REGRESJA: liczyło tylko etykiety `Para` ("Etykieta: Wartość"), więc
+    // nagłówki sekcji (`Naglowek`, np. "[Anomalie pierwszego klastra]" -
+    // 29 znaków, "[Kryptografia i sygnatury]" - 26) i luźne linie (`Luzna`)
+    // — które TAKŻE lądują w tej samej pierwszej kolumnie (patrz mapowanie
+    // niżej) — mogły dostać kolumnę węższą niż ich własny tekst i zostać
+    // po cichu ucięte przez silnik renderujący (Ratatui nie zawija treści
+    // komórek `Table`, tylko przycina nadmiar). Licznik musi znać
+    // NAJDŁUŻSZY tekst ze WSZYSTKICH trzech wariantów, nie tylko z `Para`.
     let najdluzsza_etykieta = wiersze
         .iter()
-        .filter_map(|w| match w {
-            WierszPanelu::Para(etykieta, _) => Some(etykieta.chars().count()),
-            _ => None,
+        .map(|w| match w {
+            WierszPanelu::Para(etykieta, _) => etykieta.chars().count(),
+            WierszPanelu::Naglowek(tekst) | WierszPanelu::Luzna(tekst) => tekst.chars().count(),
         })
         .max()
         .unwrap_or(0);
@@ -966,5 +975,26 @@ mod tests {
         for (szer, wys) in [(1u16, 1u16), (10, 3), (20, 5), (200, 60)] {
             let _ = wyrenderuj(szer, wys, |f| draw_opis_popup(f, f.area(), "X", "długi tekst wyjaśnienia ".repeat(20).as_str()));
         }
+    }
+
+    /// REGRESJA: szerokość kolumny etykiet liczyła się tylko z wierszy
+    /// `Para` ("Etykieta: Wartość") - nagłówki sekcji, dłuższe niż
+    /// jakakolwiek pojedyncza etykieta w tych dwóch blokach
+    /// ("[Anomalie pierwszego klastra]" = 29 znaków, "[Kryptografia i
+    /// sygnatury]" = 26), dostawały kolumnę zbyt wąską i były po cichu
+    /// ucinane przez silnik renderujący (np. do "[Anomalie pierwszego
+    /// kla"). Oba nagłówki muszą pojawić się w renderze W CAŁOŚCI.
+    #[test]
+    fn test_naglowki_sekcji_nie_sa_ucinane_gdy_sa_dluzsze_niz_etykiety() {
+        let mut st = PhaseUIState::new("x", "t", "k", "o");
+        st.side_texts.push("[Kryptografia i sygnatury]\nPrędkość: 12.5 MB/s\nBłędy I/O: 0".to_string());
+        st.side_texts.push("[Anomalie pierwszego klastra]\nPrzesunięty nagłówek: 2\nNull-padding: 0".to_string());
+
+        let widok = ekran(&wyrenderuj(100, 15, |f| {
+            draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), false)
+        }));
+
+        assert!(widok.contains("[Kryptografia i sygnatury]"), "nagłówek ucięty:\n{}", widok);
+        assert!(widok.contains("[Anomalie pierwszego klastra]"), "nagłówek ucięty:\n{}", widok);
     }
 }
