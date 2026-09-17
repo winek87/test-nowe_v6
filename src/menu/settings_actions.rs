@@ -1067,6 +1067,17 @@ mod tests {
 
     #[test]
     fn test_report_katalog_niedostepny_wolumin_odrzucony() {
+        // Test zakłada, że proces NIE MOŻE pisać bezpośrednio w "/" - prawda
+        // dla każdego zwykłego użytkownika, ale fałsz dla roota (który może
+        // zapisać wszędzie). `validate_report_katalog` wtedy POPRAWNIE
+        // akceptuje ścieżkę (root faktycznie może ją utworzyć) - to test, nie
+        // walidacja, ma tu błędne założenie, więc pomijamy go pod rootem
+        // zamiast osłabiać samą walidację.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("Pominięto: test zakłada brak uprawnień roota do zapisu w '/'.");
+            return;
+        }
+
         let mut u = Ustawienia::default();
         let phase = sorted_phase_keys(&u)[0].clone();
         let original = get_report_value(&u, &phase, 0);
