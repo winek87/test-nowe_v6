@@ -55,7 +55,7 @@ fn test_multi_producer_concurrent_emission() {
     barrier.wait();
 
     let mut received_count = 0;
-    let mut thread_event_counts = vec![0usize; NUM_PRODUCERS];
+    let mut thread_event_counts = [0usize; NUM_PRODUCERS];
 
     while let Ok(event) = rx.recv() {
         received_count += 1;
@@ -113,16 +113,16 @@ fn test_multi_producer_fifo_ordering_per_thread() {
     drop(tx);
     barrier.wait();
 
-    let mut per_thread_sequences: Vec<Vec<usize>> = vec![Vec::with_capacity(EVENTS_PER_THREAD); NUM_THREADS];
+    let mut per_thread_sequences: Vec<Vec<usize>> =
+        (0..NUM_THREADS).map(|_| Vec::with_capacity(EVENTS_PER_THREAD)).collect();
 
     while let Ok(event) = rx.recv() {
-        if let AppEvent::Log(log) = event {
-            if let Some(t_id_str) = log.module.strip_prefix('T') {
+        if let AppEvent::Log(log) = event
+            && let Some(t_id_str) = log.module.strip_prefix('T') {
                 let tid: usize = t_id_str.parse().unwrap();
                 let seq: usize = log.message.parse().unwrap();
                 per_thread_sequences[tid].push(seq);
             }
-        }
     }
 
     for handle in handles {
@@ -202,7 +202,7 @@ fn test_high_volume_stress_100k_events() {
     barrier.wait();
 
     let mut received = 0;
-    while let Ok(_) = rx.recv() {
+    while rx.recv().is_ok() {
         received += 1;
     }
 
@@ -291,12 +291,12 @@ fn test_simultaneous_clone_send_drop_chaos() {
     let reader = thread::spawn(move || {
         let mut total_drained = 0;
         while !reader_stop.load(Ordering::Relaxed) {
-            while let Ok(_) = rx.try_recv() {
+            while rx.try_recv().is_ok() {
                 total_drained += 1;
             }
             thread::yield_now();
         }
-        while let Ok(_) = rx.try_recv() {
+        while rx.try_recv().is_ok() {
             total_drained += 1;
         }
         total_drained
@@ -337,7 +337,7 @@ fn test_receiver_dropped_under_concurrent_load() {
                 sender.update_stats(StatUpdate::default());
                 sender.operation_started("dummy_op");
 
-                if let Err(_) = sender.send(AppEvent::OperationFinished("dummy".into())) {
+                if sender.send(AppEvent::OperationFinished("dummy".into())).is_err() {
                     sent_after.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -363,7 +363,7 @@ fn test_receiver_dropped_under_concurrent_load() {
 #[test]
 fn test_crate_root_shutdown_flag() {
     SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
-    assert_eq!(SHUTDOWN_FLAG.load(Ordering::SeqCst), false);
+    assert!(!SHUTDOWN_FLAG.load(Ordering::SeqCst));
 
     const NUM_THREADS: usize = 10;
     let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
@@ -384,7 +384,7 @@ fn test_crate_root_shutdown_flag() {
         handle.join().unwrap();
     }
 
-    assert_eq!(SHUTDOWN_FLAG.load(Ordering::SeqCst), true);
+    assert!(SHUTDOWN_FLAG.load(Ordering::SeqCst));
     SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
 }
 

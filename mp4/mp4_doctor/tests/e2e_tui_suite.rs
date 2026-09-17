@@ -269,7 +269,7 @@ pub mod common {
             let slave_name = unsafe { CStr::from_ptr(name_ptr) };
             let slave_path = slave_name
                 .to_str()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
 
             let slave_file = OpenOptions::new()
                 .read(true)
@@ -691,12 +691,11 @@ pub mod tier1_feature_coverage {
         let _ = autopilot::find_donor(&ws_guard.ws, "UNKNOWN_DNA_SIG", &cache, &tx, 0);
         let mut got_log = false;
         while let Ok(evt) = rx.recv_timeout(Duration::from_millis(50)) {
-            if let AppEvent::Log(l) = evt {
-                if l.module == "AUTOPILOT" {
+            if let AppEvent::Log(l) = evt
+                && l.module == "AUTOPILOT" {
                     got_log = true;
                     break;
                 }
-            }
         }
         assert!(got_log, "Autopilot should emit log during search");
     }
@@ -778,12 +777,11 @@ pub mod tier1_feature_coverage {
 
         let mut got_god_event = false;
         while let Ok(evt) = rx.recv_timeout(Duration::from_millis(100)) {
-            if let AppEvent::Log(l) = evt {
-                if l.module == "GOD_MODE" {
+            if let AppEvent::Log(l) = evt
+                && l.module == "GOD_MODE" {
                     got_god_event = true;
                     break;
                 }
-            }
         }
         assert!(got_god_event);
     }
@@ -1109,7 +1107,7 @@ pub mod tier1_feature_coverage {
         let bin = env!("CARGO_BIN_EXE_mp4_doctor");
         let ws_guard = TestWorkspaceGuard::new("cli_headless");
         let output = Command::new(bin)
-            .args(&[
+            .args([
                 "--workspace",
                 &ws_guard.ws.name,
                 "--scan",
@@ -1473,7 +1471,7 @@ pub mod tier2_boundary_corner {
         drop(tx);
 
         let mut count = 0;
-        while let Ok(_) = rx.recv() {
+        while rx.recv().is_ok() {
             count += 1;
         }
         assert_eq!(count, 10000);
@@ -1530,7 +1528,7 @@ pub mod tier2_boundary_corner {
         );
 
         let mut got_event = false;
-        while let Ok(_) = rx.recv_timeout(Duration::from_millis(50)) {
+        while rx.recv_timeout(Duration::from_millis(50)).is_ok() {
             got_event = true;
         }
         assert!(got_event);
@@ -1543,8 +1541,8 @@ pub mod tier2_boundary_corner {
         fs::create_dir_all(&test_dir).unwrap();
 
         fs::write(test_dir.join("notes.txt"), "hello").unwrap();
-        fs::write(test_dir.join("image.png"), &[0x89, b'P', b'N', b'G']).unwrap();
-        fs::write(test_dir.join("archive.zip"), &[0x50, 0x4b, 0x03, 0x04]).unwrap();
+        fs::write(test_dir.join("image.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        fs::write(test_dir.join("archive.zip"), [0x50, 0x4b, 0x03, 0x04]).unwrap();
 
         let (tx, rx) = channel();
         scanner::run_scanner(&ws_guard.ws, test_dir.to_str().unwrap(), scanner::ScanMode::FullAuto, &tx);
@@ -1579,7 +1577,7 @@ pub mod tier2_boundary_corner {
         let dest = ws_guard.ws.donors_dir.join("fuzzed.moov");
 
         let junk_path = ws_guard.ws.root_dir.join("junk.mp4");
-        fs::write(&junk_path, &[0xff; 1024]).unwrap();
+        fs::write(&junk_path, [0xff; 1024]).unwrap();
 
         let res = scanner::extract_and_save_moov(junk_path.to_str().unwrap(), dest.to_str().unwrap());
         assert!(res.is_err(), "Should safely reject junk header");
@@ -1635,7 +1633,7 @@ pub mod tier2_boundary_corner {
         let ws_guard = TestWorkspaceGuard::new("tg_tiny");
         let (tx, _) = channel();
         let tiny = ws_guard.ws.root_dir.join("tiny.mp4");
-        fs::write(&tiny, &[1, 2, 3, 4]).unwrap();
+        fs::write(&tiny, [1, 2, 3, 4]).unwrap();
 
         let _ = training_ground::run_sniper_test(&ws_guard.ws, tiny.to_str().unwrap(), &tx);
     }
@@ -1794,7 +1792,7 @@ pub mod tier2_boundary_corner {
         pty.attach_std();
 
         if let Ok(mut guard) = TerminalGuard::init() {
-            let res: Result<(), _> = guard.suspend(|| Err(io::Error::new(io::ErrorKind::Other, "Suspended failure")));
+            let res: Result<(), _> = guard.suspend(|| Err(io::Error::other("Suspended failure")));
             assert!(res.is_err());
         }
     }
@@ -1967,8 +1965,8 @@ pub mod tier2_boundary_corner {
 
     #[test]
     fn test_tier2_f9_03_stats_extreme_numbers() {
-        assert_eq!(format_bytes(u64::MAX).contains("TB"), true);
-        assert_eq!(format_bytes(1024 * 1024 * 1024 * 50).contains("50.00 GB"), true);
+        assert!(format_bytes(u64::MAX).contains("TB"));
+        assert!(format_bytes(1024 * 1024 * 1024 * 50).contains("50.00 GB"));
     }
 
     #[test]
@@ -2072,7 +2070,7 @@ pub mod tier2_boundary_corner {
     #[test]
     fn test_tier2_f11_03_cli_empty_string_flags() {
         let bin = env!("CARGO_BIN_EXE_mp4_doctor");
-        let output = Command::new(bin).args(&["--workspace", ""]).output().unwrap();
+        let output = Command::new(bin).args(["--workspace", ""]).output().unwrap();
         let _ = output;
     }
 
@@ -2080,7 +2078,7 @@ pub mod tier2_boundary_corner {
     fn test_tier2_f11_04_cli_special_characters_in_args() {
         let bin = env!("CARGO_BIN_EXE_mp4_doctor");
         let output = Command::new(bin)
-            .args(&["--workspace", "Projekt Testowy @#$ 2026", "--help"])
+            .args(["--workspace", "Projekt Testowy @#$ 2026", "--help"])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -2090,7 +2088,7 @@ pub mod tier2_boundary_corner {
     fn test_tier2_f11_05_cli_multiple_subcommand_combinations() {
         let bin = env!("CARGO_BIN_EXE_mp4_doctor");
         let output = Command::new(bin)
-            .args(&["--auto-test", "--threads", "2"])
+            .args(["--auto-test", "--threads", "2"])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -2468,7 +2466,7 @@ pub mod tier3_pairwise_combinations {
         app.event_sender.operation_failed("SCANNER", "I/O Error opening file");
         app.process_events();
 
-        assert_eq!(app.is_running, false);
+        assert!(!app.is_running);
         assert!(app.operation_status_text.as_ref().unwrap().contains("Błąd"));
     }
 
@@ -2719,7 +2717,7 @@ pub mod tier4_real_world_scenarios {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
 
-        assert!(app.logs.len() > 0);
+        assert!(!app.logs.is_empty());
         for log in &app.logs {
             let rows = estimate_log_rows(log, 85);
             assert!(rows >= 1);

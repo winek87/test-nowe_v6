@@ -81,7 +81,7 @@ impl PtyTestEnvironment {
             return Err(io::Error::last_os_error());
         }
         let pts_cstr = unsafe { CStr::from_ptr(pts_ptr) };
-        let pts_path = pts_cstr.to_str().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let pts_path = pts_cstr.to_str().map_err(io::Error::other)?;
 
         let slave_file = std::fs::OpenOptions::new()
             .read(true)

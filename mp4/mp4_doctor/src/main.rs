@@ -176,7 +176,7 @@ fn run_headless(cli: Cli) {
         };
         let _ = db::init_db(&ws);
 
-        process::exit(wykonaj_operacje_wsadowa(&ws, &workspace_name, &cli));
+        process::exit(wykonaj_operacje_wsadowa(&ws, workspace_name, &cli));
     }
 }
 
@@ -324,13 +324,11 @@ fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
         // 4. Poll keyboard events
-        if ct_event::poll(tick_rate)? {
-            if let Event::Key(key) = ct_event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if ct_event::poll(tick_rate)?
+            && let Event::Key(key) = ct_event::read()?
+                && key.kind == KeyEventKind::Press {
                     app.handle_key(key);
                 }
-            }
-        }
     }
 
     // Explicit restore (Drop also handles this idempotently)

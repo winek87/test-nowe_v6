@@ -25,8 +25,8 @@ pub fn find_donor(
     event_sender: &EventSender,
     thread_id: usize,
 ) -> Option<String> {
-    if let Some(donors) = cache.donors.get(dna_sig) {
-        if let Some(first_donor) = donors.first() {
+    if let Some(donors) = cache.donors.get(dna_sig)
+        && let Some(first_donor) = donors.first() {
             if std::path::Path::new(first_donor).exists() {
                 dlog!("🧠 [AUTOPILOT] Znalazłem dawcę w cache RAM: {}", first_donor);
                 return Some(first_donor.clone());
@@ -34,7 +34,6 @@ pub fn find_donor(
                 dlog!("⚠️ [AUTOPILOT] Dawca z cache RAM ({}) nie istnieje fizycznie na dysku!", first_donor);
             }
         }
-    }
     // Fallback do dowolnego pliku moov usunięty: teraz zmuszamy system do pobrania dokładnego dawcy z chmury.    
     // =========================================================================
     // NOWOŚĆ: POBIERANIE DAWCA Z CHMURY (ZASZYFROWANEGO)
@@ -167,12 +166,11 @@ pub fn run(
     }
 
     let file_size = fs::metadata(broken_file).map(|m| m.len()).unwrap_or(0);
-    if file_size > 4 * 1024 * 1024 * 1024 {
-        if let Some(pos) = algorithms.iter().position(|x| x == "Native") {
+    if file_size > 4 * 1024 * 1024 * 1024
+        && let Some(pos) = algorithms.iter().position(|x| x == "Native") {
             let native = algorithms.remove(pos);
             algorithms.insert(0, native);
         }
-    }
 
     // Patrz `sanitizer::run_deep_sanitization` — ten sam `unwrap()` panikował
     // na pustej ścieżce podanej z wiersza poleceń.
@@ -229,7 +227,7 @@ pub fn run(
     }
 
     if !successful_repairs.is_empty() {
-        successful_repairs.sort_by(|a, b| b.2.cmp(&a.2));
+        successful_repairs.sort_by_key(|a| std::cmp::Reverse(a.2));
         let (best_algo, _best_file, _best_size) = &successful_repairs[0];
         
         for (algo, file_path, _) in &successful_repairs {
@@ -248,8 +246,8 @@ pub fn run(
     
     // Pobierz wszystkie znane dawcy z bazy danych wraz z ich precyzyjnymi sygnaturami DNA
     let mut global_donors: Vec<(String, String)> = Vec::new();
-    if let Ok(conn) = crate::db::init_db(ws) {
-        if let Ok(mut stmt) = conn.prepare("SELECT donor_path, dna_signature FROM donors_cache") {
+    if let Ok(conn) = crate::db::init_db(ws)
+        && let Ok(mut stmt) = conn.prepare("SELECT donor_path, dna_signature FROM donors_cache") {
             let _ = stmt.query_map([], |row| {
                 let path: String = row.get(0)?;
                 let sig: String = row.get(1)?;
@@ -257,7 +255,6 @@ pub fn run(
                 Ok(())
             });
         }
-    }
     
     // Jeśli baza pusta (rzadki przypadek), weź z dysku z pustym DNA
     if global_donors.is_empty() {
@@ -302,8 +299,8 @@ pub fn run(
             let out_file = ws.output_dir.join(format!("Frankenstein_{}.mp4", file_name));
             let out_str = out_file.to_str().unwrap();
 
-            if engine_clone::repair(broken_file, foreign_donor, out_str).is_ok() {
-                if validator::is_healthy_video(out_str) {
+            if engine_clone::repair(broken_file, foreign_donor, out_str).is_ok()
+                && validator::is_healthy_video(out_str) {
                     event_sender.update_thread(thread_id, format!("🧟 SUKCES! Plik zmartwychwstał używając moov nr {}!", i + 1));
                     // CELOWO bez `event_sender.repair_success(..., "Bruteforce")`:
                     // to jedyne miejsce w tej kaskadzie, gdzie nazwa algorytmu
@@ -321,7 +318,6 @@ pub fn run(
                     event_sender.success("AUTOPILOT", format!("Bruteforce: Sukces z dawcą moov #{} dla {}!", i + 1, file_name));
                     return Ok(());
                 }
-            }
             
             event_sender.update_thread(thread_id, format!("❌ Bruteforce: moov nr {} FAIL.", i + 1));
             event_sender.debug("BRUTEFORCE", format!("Odrzucono kandydata nr {} (Plik wciąż uszkodzony).", i + 1));

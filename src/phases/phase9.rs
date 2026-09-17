@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn test_sciezka_tymczasowa_krotka_nazwa_pozostaje_nietknieta() {
         let docelowa = Path::new("/tmp/plik.jpg");
-        let tmp = sciezka_tymczasowa(&docelowa);
+        let tmp = sciezka_tymczasowa(docelowa);
         let tmp_nazwa = tmp.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(tmp_nazwa.contains("plik.jpg"), "krótka nazwa nie powinna być obcinana: {:?}", tmp_nazwa);
     }
@@ -1816,7 +1816,7 @@ mod tests {
     #[test]
     fn test_sciezka_tymczasowa_dwa_wywolania_daja_rozne_nazwy() {
         let docelowa = Path::new("/tmp/plik.jpg");
-        assert_ne!(sciezka_tymczasowa(&docelowa), sciezka_tymczasowa(&docelowa), "licznik musi zapewniać unikalność nazw tymczasowych");
+        assert_ne!(sciezka_tymczasowa(docelowa), sciezka_tymczasowa(docelowa), "licznik musi zapewniać unikalność nazw tymczasowych");
     }
 
     #[test]

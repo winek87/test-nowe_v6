@@ -400,7 +400,7 @@ fn test_db_operations_zero_stdout() {
     let cechy = FeatureVector { file_size_mb: 1.0, entropy: 1.0, h264_profile: 0.0, aac_freq: 0.0, video_audio_ratio: 0.0 };
     let _ = db::reward_algorithm(&ws, "TEST_DNA_123", "Native", &cechy);
     let _ = db::penalize_algorithm(&ws, "TEST_DNA_123", "Clone", &cechy);
-    let _ = db::mark_trained(&ws, "abc123hash");
+    db::mark_trained(&ws, "abc123hash");
     let _ = db::get_all_trained(&ws);
     let _ = db::build_brain_cache(&ws);
     let _ = db::get_db_stats(&ws);

@@ -828,13 +828,12 @@ pub fn repair(
                 // zwraca `None` zamiast panikować, gdy okno wychodzi poza
                 // bufor.
                 if config.sps.is_empty() && nal_type == 7 {
-                    if let Some(sps_data) = buffer.get(i+start_len..i+start_len+36) {
-                        if let Some((w, h)) = parse_sps_resolution(sps_data) {
+                    if let Some(sps_data) = buffer.get(i+start_len..i+start_len+36)
+                        && let Some((w, h)) = parse_sps_resolution(sps_data) {
                             let msg = format!("🎯 Native: Zdekodowano matrycę: {}x{}", w, h);
                             tracing::debug!("{}", msg); update_ui(msg);
                             config.width = w; config.height = h;
                         }
-                    }
                     if let Some(sps) = buffer.get(i+start_len..i+start_len+20) {
                         config.sps = sps.to_vec();
                     }

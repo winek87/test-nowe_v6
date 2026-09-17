@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn test_processed_bytes_liczy_wolumen_mimo_bledow_w_tej_samej_paczce() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("zwykly.bin"), &vec![0u8; 500]).unwrap();
+        std::fs::write(dir.path().join("zwykly.bin"), vec![0u8; 500]).unwrap();
 
         let zadania = vec![
             Task { id: 1, rel_path: "brak.bin".to_string() },

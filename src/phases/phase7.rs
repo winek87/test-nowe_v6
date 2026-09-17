@@ -234,7 +234,7 @@ fn klasyfikuj_entropie(ent: f64, is_compressed: bool) -> Option<KategoriaEntropi
         Some(KategoriaEntropii::Zaszyfrowany)
     } else if ent < 6.0 && is_compressed {
         Some(KategoriaEntropii::ZepsutaKompresja)
-    } else if ent >= 0.0 && ent < 1.0 {
+    } else if (0.0..1.0).contains(&ent) {
         Some(KategoriaEntropii::Wydmuszka)
     } else {
         None

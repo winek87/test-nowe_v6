@@ -29,6 +29,12 @@ pub struct KnnClassifier {
     knowledge_base: Vec<(FeatureVector, String)>, // Wektor cech -> Nazwa najlepszego algorytmu
 }
 
+impl Default for KnnClassifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KnnClassifier {
     pub fn new() -> Self {
         Self { knowledge_base: Vec::new() }

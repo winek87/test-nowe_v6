@@ -296,6 +296,11 @@ fn klasyfikuj_rozszerzenie(ext: &str) -> (bool, bool) {
     (is_image, is_archive)
 }
 
+// 8 parametrów odzwierciedla 8 niezależnych sygnałów jakości (UFS/skrypt ×
+// media/piksele/struktura), które trzeba przekazać osobno — pakowanie ich w
+// strukturę byłoby czystą kosmetyką bez zmiany logiki, więc pomijam tu regułę
+// zamiast robić refaktor niosący ryzyko przy zerowej korzyści.
+#[allow(clippy::too_many_arguments)]
 fn qualifies_for_splice(
     is_image: bool,
     is_archive: bool,

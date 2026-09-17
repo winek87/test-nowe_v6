@@ -1509,8 +1509,8 @@ mod tests {
     /// pierwsze 2000. Przed poprawką pętla sumująca była ograniczona do
     /// `0..min(archive.len(), 2000)`, więc duży wpis umieszczony na indeksie
     /// >= 2000 (a limit LICZBY wpisów dopuszcza aż `MASS_FILES_THRESHOLD` =
-    /// 50 000) całkowicie omijał sumowanie i zip bomba przechodziła jako
-    /// poprawna.
+    /// > 50 000) całkowicie omijał sumowanie i zip bomba przechodziła jako
+    /// > poprawna.
     ///
     /// Budujemy ZIP z >2000 malutkimi wpisami + jednym wpisem o indeksie
     /// 2050 (a więc poza starym limitem 2000) zawierającym ponad 1 GB
@@ -1578,14 +1578,14 @@ mod tests {
 
     /// Dowodzi kształtu ochrony zastosowanego w `analyze_archive` (`catch_unwind`
     /// + `unwrap_or_else` na `ArchiveAnalysis` sygnalizującą porażkę), na
-    /// syntetycznej panice — uczciwie udokumentowane ograniczenie: crate `zip`
-    /// (wersja użyta w tym projekcie) nie ma znanego, stabilnego pliku
-    /// wejściowego wywołującego panikę deterministycznie (wszystkie
-    /// udokumentowane w jego CHANGELOGu panikujące przypadki są już
-    /// naprawione w tej wersji) — w przeciwieństwie do `rawloader`, gdzie
-    /// panika jest EMPIRYCZNIE zaobserwowana na realnym pliku DNG (patrz
-    /// `raw_image.rs`). Ten sam uczciwy wzorzec testu mechanizmu co
-    /// `phase13::test_analyze_image_generic_branch_is_panic_guarded`.
+    ///   syntetycznej panice — uczciwie udokumentowane ograniczenie: crate `zip`
+    ///   (wersja użyta w tym projekcie) nie ma znanego, stabilnego pliku
+    ///   wejściowego wywołującego panikę deterministycznie (wszystkie
+    ///   udokumentowane w jego CHANGELOGu panikujące przypadki są już
+    ///   naprawione w tej wersji) — w przeciwieństwie do `rawloader`, gdzie
+    ///   panika jest EMPIRYCZNIE zaobserwowana na realnym pliku DNG (patrz
+    ///   `raw_image.rs`). Ten sam uczciwy wzorzec testu mechanizmu co
+    ///   `phase13::test_analyze_image_generic_branch_is_panic_guarded`.
     #[test]
     fn test_panika_w_silniku_zip_jest_bezpiecznie_przechwycona() {
         let wynik: std::thread::Result<ArchiveAnalysis> =

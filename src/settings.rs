@@ -275,8 +275,8 @@ impl Ustawienia {
         // (Faza 18, Faza 19, Duplikaty — i każda przyszła).
         let domyslne = default_raporty_faz();
         for (klucz, wartosc) in domyslne {
-            if !self.raporty_faz.contains_key(&klucz) {
-                self.raporty_faz.insert(klucz, wartosc);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.raporty_faz.entry(klucz) {
+                e.insert(wartosc);
                 zmieniono = true;
             }
         }

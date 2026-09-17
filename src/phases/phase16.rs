@@ -83,12 +83,12 @@
 //! wzorcem (`catch_unwind(AssertUnwindSafe(...))`) co `phase17_repair`. Ten
 //! plik CELOWO NIE dodaje thread-local flagi `is_expected_panic_in_progress`
 //! + rejestracji w globalnym panic hooku (`logging.rs`) jak `raw_image` —
-//! ten mechanizm wymagałby edycji `logging.rs`, poza dozwolonym zakresem tej
-//! naprawy — i zamiast tego świadomie stosuje prostszy, już obecny w
-//! projekcie wzorzec `phase17_repair` (goły `catch_unwind` bez rejestracji w
-//! hooku): panika nadal NIE ubija wątku/procesu, kosztem tego, że globalny
-//! hook potraktuje ją jako "niespodziewaną" (zaloguje `BŁĄD KRYTYCZNY` i
-//! przywróci terminal), zamiast po cichu przełknąć jak przy `raw_image`.
+//!   ten mechanizm wymagałby edycji `logging.rs`, poza dozwolonym zakresem tej
+//!   naprawy — i zamiast tego świadomie stosuje prostszy, już obecny w
+//!   projekcie wzorzec `phase17_repair` (goły `catch_unwind` bez rejestracji w
+//!   hooku): panika nadal NIE ubija wątku/procesu, kosztem tego, że globalny
+//!   hook potraktuje ją jako "niespodziewaną" (zaloguje `BŁĄD KRYTYCZNY` i
+//!   przywróci terminal), zamiast po cichu przełknąć jak przy `raw_image`.
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;

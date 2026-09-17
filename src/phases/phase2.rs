@@ -934,7 +934,7 @@ mod tests {
     fn test_stat_watchdog_normalny_plik_daje_taki_sam_wynik_co_bezposrednie_wywolanie() {
         let dir = tempfile::tempdir().unwrap();
         let plik = dir.path().join("a.bin");
-        utworz(&plik, &vec![0u8; 123]);
+        utworz(&plik, &[0u8; 123]);
 
         let watchdog = StatWatchdog::new();
         let wynik = watchdog.stat_z_limitem(plik.clone()).expect("brak anulowania - musi zwrócić Some");
@@ -958,8 +958,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.bin");
         let b = dir.path().join("b.bin");
-        utworz(&a, &vec![0u8; 10]);
-        utworz(&b, &vec![0u8; 20]);
+        utworz(&a, &[0u8; 10]);
+        utworz(&b, &[0u8; 20]);
 
         let watchdog = StatWatchdog::new();
         assert_eq!(watchdog.stat_z_limitem(a).unwrap().unwrap().size, 10);

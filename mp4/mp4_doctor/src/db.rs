@@ -57,11 +57,10 @@ impl BrainCache {
         // 2. Machine Learning: K-Nearest Neighbors (KNN) na wektorze cech
         let mut knn = KnnClassifier::new();
         for (dna, algos) in &self.algorithms {
-            if let Some(feat) = self.feature_store.get(dna) {
-                if let Some(best_algo) = algos.first() {
+            if let Some(feat) = self.feature_store.get(dna)
+                && let Some(best_algo) = algos.first() {
                     knn.train(feat.clone(), best_algo.clone());
                 }
-            }
         }
 
         if let Some(predicted_algo) = knn.predict(target_features, 3) {
@@ -210,14 +209,13 @@ pub fn save_donor(ws: &Workspace, dna: &str, donor_path: &str) -> SqlResult<()> 
 }
 
 pub fn get_db_stats(ws: &Workspace) -> usize {
-    if let Ok(conn) = Connection::open(&ws.db_path) {
-        if let Ok(mut stmt) = conn.prepare("SELECT COUNT(*) FROM knowledge_base") {
+    if let Ok(conn) = Connection::open(&ws.db_path)
+        && let Ok(mut stmt) = conn.prepare("SELECT COUNT(*) FROM knowledge_base") {
             // POPRAWKA BŁĘDU (E0277): Odczyt jako i64 z bazy SQLite, po czym rzutowanie do usize
             if let Ok(count) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
                 return count as usize;
             }
         }
-    }
     0
 }
 
@@ -296,7 +294,6 @@ pub fn export_brain_to_json(ws: &Workspace, json_path: &str) -> Result<(), Box<d
 }
 
 /// Wstrzykuje obcą wiedzę z pliku JSON bezpośrednio do naszego SQLite.
-
 pub fn download_missing_donors(ws: &Workspace, event_sender: Option<&crate::event::EventSender>) -> Result<usize, Box<dyn std::error::Error>> {
     let conn = init_db(ws)?;
     // Get all unique DNA signatures from knowledge base
@@ -353,11 +350,10 @@ pub fn download_missing_donors(ws: &Workspace, event_sender: Option<&crate::even
         }
     }
     
-    if downloaded == 0 {
-        if let Some(tx) = event_sender {
+    if downloaded == 0
+        && let Some(tx) = event_sender {
             tx.info("SWARM", "Wszystkie zidentyfikowane wzorce są już kompletne na dysku lokalnym.");
         }
-    }
     
     Ok(downloaded)
 }
@@ -418,11 +414,10 @@ pub fn sync_with_cloud(
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?.filter_map(Result::ok).collect();
     
-    if donor_rows.is_empty() {
-        if let Some(tx) = event_sender {
+    if donor_rows.is_empty()
+        && let Some(tx) = event_sender {
             tx.info("SWARM", "Brak lokalnych wzorców do synchronizacji.");
         }
-    }
     
     for row in donor_rows {
         let dna = row.0;
@@ -524,8 +519,8 @@ pub fn sync_with_cloud(
         .arg("http://127.0.0.1:3000/v1/swarm/sync") // Publiczny endpoint testowy, zwraca wysłane dane
         .output();
         
-    if let Ok(res) = curl_status {
-        if res.status.success() {
+    if let Ok(res) = curl_status
+        && res.status.success() {
             dlog!("✅ [FEDERATED LEARNING] Serwer przyjął wiedzę! Pobieranie bazy globalnej...");
             
             // W prawdziwym środowisku zapisalibyśmy odpowiedź z serwera.
@@ -544,7 +539,6 @@ pub fn sync_with_cloud(
             }
             return Ok(imported_count);
         }
-    }
     
     dlog!("❌ [FEDERATED LEARNING] Błąd komunikacji z chmurą.");
     if let Some(tx) = event_sender {
@@ -560,11 +554,10 @@ pub fn sync_with_cloud_standalone(ws: &Workspace) -> Result<usize, Box<dyn std::
 
 
 pub fn is_trained(ws: &Workspace, file_hash: &str) -> bool {
-    if let Ok(conn) = init_db(ws) {
-        if let Ok(mut stmt) = conn.prepare("SELECT 1 FROM trained_files WHERE file_hash = ?") {
+    if let Ok(conn) = init_db(ws)
+        && let Ok(mut stmt) = conn.prepare("SELECT 1 FROM trained_files WHERE file_hash = ?") {
             return stmt.exists(params![file_hash]).unwrap_or(false);
         }
-    }
     false
 }
 
@@ -572,6 +565,19 @@ pub fn mark_trained(ws: &Workspace, file_hash: &str) {
     if let Ok(conn) = init_db(ws) {
         let _ = conn.execute("INSERT OR IGNORE INTO trained_files (file_hash) VALUES (?)", params![file_hash]);
     }
+}
+
+pub fn get_all_trained(ws: &Workspace) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(conn) = init_db(ws)
+        && let Ok(mut stmt) = conn.prepare("SELECT file_hash FROM trained_files")
+            && let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let hash: String = row.get(0).unwrap_or_default();
+                    set.insert(hash);
+                }
+            }
+    set
 }
 
 #[cfg(test)]
@@ -710,19 +716,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws.root_dir);
     }
-}
-
-pub fn get_all_trained(ws: &Workspace) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    if let Ok(conn) = init_db(ws) {
-        if let Ok(mut stmt) = conn.prepare("SELECT file_hash FROM trained_files") {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    let hash: String = row.get(0).unwrap_or_default();
-                    set.insert(hash);
-                }
-            }
-        }
-    }
-    set
 }

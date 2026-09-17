@@ -11,11 +11,10 @@ lazy_static! {
 
 /// Inicjuje logowanie do pliku dla danego projektu (Przestrzeni Roboczej)
 pub fn init(log_path: &Path) {
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        if let Ok(mut lock) = GLOBAL_LOGGER.lock() {
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(log_path)
+        && let Ok(mut lock) = GLOBAL_LOGGER.lock() {
             *lock = Some(file);
         }
-    }
 }
 
 /// Makro zastępujące `println!`. Zapisuje tekst do pliku bez niszczenia interfejsu (HUD).

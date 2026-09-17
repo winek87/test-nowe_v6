@@ -164,13 +164,11 @@ fn gather_files(dir: &Path, files: &mut Vec<String>) {
             let path = entry.path();
             if path.is_dir() {
                 gather_files(&path, files);
-            } else if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mov") {
+            } else if path.is_file()
+                && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && (ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mov")) {
                         files.push(path.to_str().unwrap().to_string());
                     }
-                }
-            }
         }
     }
 }
@@ -270,8 +268,8 @@ pub fn run_scanner(
 
             if is_healthy(&file) {
                 healthy_count.fetch_add(1, Ordering::Relaxed);
-                if mode != ScanMode::SingleRepair {
-                    if let Some((dna, _)) = dna::extract_dna(&file) {
+                if mode != ScanMode::SingleRepair
+                    && let Some((dna, _)) = dna::extract_dna(&file) {
                         // Nazwa dawcy to sama sygnatura DNA — tak indeksuje ich
                         // Kolektywny Rój (`/v1/swarm/donor/{dna}`), więc jeden
                         // dawca na DNA jest zamierzony.
@@ -287,7 +285,6 @@ pub fn run_scanner(
                             event_sender.donor_found(&dna, donor_path.to_str().unwrap());
                         }
                     }
-                }
             } else {
                 broken_count.fetch_add(1, Ordering::Relaxed);
                 if mode != ScanMode::ExtractOnly {

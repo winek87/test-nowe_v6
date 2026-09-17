@@ -288,7 +288,7 @@ fn analyze_text_file(path: &Path, file_size: u64) -> std::result::Result<TextAna
         encoding = "UTF-16";
         let payload = &slice[2..];
         let units: Vec<u16> = payload
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| if utf16_le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
             .collect();
 

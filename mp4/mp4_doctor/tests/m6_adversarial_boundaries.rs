@@ -163,21 +163,21 @@ fn test_payload_truncated_atoms() {
 
     // 2. 1-byte file
     let byte1_file = test_dir.join("one_byte.mp4");
-    fs::write(&byte1_file, &[0x00]).unwrap();
+    fs::write(&byte1_file, [0x00]).unwrap();
 
     // 3. 4-byte file (declares size 8 but lacks 4-byte atom type)
     let byte4_file = test_dir.join("four_byte.mp4");
-    fs::write(&byte4_file, &[0x00, 0x00, 0x00, 0x08]).unwrap();
+    fs::write(&byte4_file, [0x00, 0x00, 0x00, 0x08]).unwrap();
 
     // 4. 7-byte file (3 bytes of type: 'moo')
     let byte7_file = test_dir.join("seven_byte.mp4");
-    fs::write(&byte7_file, &[0x00, 0x00, 0x00, 0x08, b'm', b'o', b'o']).unwrap();
+    fs::write(&byte7_file, [0x00, 0x00, 0x00, 0x08, b'm', b'o', b'o']).unwrap();
 
     // 5. 12-byte file: size 16, type 'moov', but truncated before actual content
     let trunc_moov = test_dir.join("trunc_moov.mp4");
     fs::write(
         &trunc_moov,
-        &[0x00, 0x00, 0x00, 0x10, b'm', b'o', b'o', b'v', 0x01, 0x02, 0x03, 0x04],
+        [0x00, 0x00, 0x00, 0x10, b'm', b'o', b'o', b'v', 0x01, 0x02, 0x03, 0x04],
     )
     .unwrap();
 
@@ -185,7 +185,7 @@ fn test_payload_truncated_atoms() {
     let trunc_ext = test_dir.join("trunc_ext.mp4");
     fs::write(
         &trunc_ext,
-        &[0x00, 0x00, 0x00, 0x01, b'f', b'r', b'e', b'e', 0x00, 0x01],
+        [0x00, 0x00, 0x00, 0x01, b'f', b'r', b'e', b'e', 0x00, 0x01],
     )
     .unwrap();
 
@@ -227,15 +227,15 @@ fn test_payload_zero_byte_headers() {
 
     // 8-byte zero header: size 0, type 0000
     let zero8 = test_dir.join("zero8.mp4");
-    fs::write(&zero8, &[0u8; 8]).unwrap();
+    fs::write(&zero8, [0u8; 8]).unwrap();
 
     // 16-byte zero header
     let zero16 = test_dir.join("zero16.mp4");
-    fs::write(&zero16, &[0u8; 16]).unwrap();
+    fs::write(&zero16, [0u8; 16]).unwrap();
 
     // 1024-byte zero block
     let zero1024 = test_dir.join("zero1024.mp4");
-    fs::write(&zero1024, &[0u8; 1024]).unwrap();
+    fs::write(&zero1024, [0u8; 1024]).unwrap();
 
     for f in [&zero8, &zero16, &zero1024] {
         let f_str = f.to_str().unwrap();
@@ -363,10 +363,10 @@ fn test_scanner_pipeline_with_adversarial_payloads_zero_stdout() {
     let test_dir = ws_guard.ws.root_dir.join("adversarial_input_dir");
     fs::create_dir_all(&test_dir).unwrap();
 
-    fs::write(test_dir.join("trunc1.mp4"), &[0x00, 0x00, 0x00, 0x04]).unwrap();
-    fs::write(test_dir.join("zero.mp4"), &[0u8; 128]).unwrap();
-    fs::write(test_dir.join("oversize.mp4"), &[0xFF, 0xFF, 0xFF, 0xFF, b'f', b'r', b'e', b'e']).unwrap();
-    fs::write(test_dir.join("noise.mp4"), &[0x55; 2048]).unwrap();
+    fs::write(test_dir.join("trunc1.mp4"), [0x00, 0x00, 0x00, 0x04]).unwrap();
+    fs::write(test_dir.join("zero.mp4"), [0u8; 128]).unwrap();
+    fs::write(test_dir.join("oversize.mp4"), [0xFF, 0xFF, 0xFF, 0xFF, b'f', b'r', b'e', b'e']).unwrap();
+    fs::write(test_dir.join("noise.mp4"), [0x55; 2048]).unwrap();
 
     let (tx, rx) = channel();
 
@@ -654,7 +654,7 @@ fn test_extreme_geometry_all_views_and_modals() {
         let mut terminal = Terminal::new(backend).unwrap();
 
         for view in &views {
-            app.current_view = view.clone();
+            app.current_view = *view;
 
             for modal in &modals {
                 app.active_modal = modal.clone();
@@ -706,7 +706,7 @@ fn test_headless_workspace_and_scan_clean_exit() {
 
     let bin = env!("CARGO_BIN_EXE_mp4_doctor");
     let output = Command::new(bin)
-        .args(&[
+        .args([
             "--workspace",
             &ws_guard.ws.name,
             "--scan",
@@ -760,7 +760,7 @@ fn test_engine_native_stderr_isolation_diagnostic() {
 
     // Create a corrupted file
     let broken_file = ws_guard.ws.broken_dir.join("corrupted_sample.mp4");
-    fs::write(&broken_file, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]).unwrap();
+    fs::write(&broken_file, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]).unwrap();
 
     let out_file = ws_guard.ws.output_dir.join("native_out.mp4");
 

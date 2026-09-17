@@ -99,7 +99,7 @@ impl PtyTestEnvironment {
         let pts_cstr = unsafe { CStr::from_ptr(pts_ptr) };
         let pts_path = pts_cstr
             .to_str()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let slave_file = std::fs::OpenOptions::new()
             .read(true)
@@ -237,7 +237,7 @@ fn make_heterogeneous_event(thread_id: usize, seq: usize) -> AppEvent {
             message: Some(format!("Postęp potoku wątku {}", thread_id)),
         },
         _ => {
-            if seq % 3 == 0 {
+            if seq.is_multiple_of(3) {
                 AppEvent::OperationStarted(format!("Op_{}_{}", thread_id, seq))
             } else if seq % 3 == 1 {
                 AppEvent::DonorFound {

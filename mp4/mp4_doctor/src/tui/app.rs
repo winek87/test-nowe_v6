@@ -217,15 +217,14 @@ impl App {
 
     pub fn refresh_preview_files(&mut self) {
         self.preview_files.clear();
-        if let Some(ref ws) = self.active_workspace {
-            if let Ok(entries) = std::fs::read_dir(&ws.output_dir) {
+        if let Some(ref ws) = self.active_workspace
+            && let Ok(entries) = std::fs::read_dir(&ws.output_dir) {
                 for entry in entries.flatten() {
                     if entry.path().is_file() {
                         self.preview_files.push(entry.path());
                     }
                 }
             }
-        }
         self.preview_list_state.select(Some(0));
     }
 
@@ -651,11 +650,10 @@ impl App {
                         self.operation_status_text = Some("Zatrzymywanie operacji... Czekam na wątki.".to_string());
                     }
                 }
-                KeyCode::Enter | KeyCode::Esc => {
-                    if !self.is_running {
+                KeyCode::Enter | KeyCode::Esc
+                    if !self.is_running => {
                         self.pop_view();
                     }
-                }
                 _ => {}
             },
         }
@@ -978,7 +976,7 @@ impl App {
                         sender.operation_finished(format!("Synchronizacja z Rój zakończona pomyślnie. Nowe wzorce: {}", count));
                     }
                     Err(e) => {
-                        sender.operation_failed("Synchronizacja chmury", &e.to_string());
+                        sender.operation_failed("Synchronizacja chmury", e.to_string());
                     }
                 }
             });
@@ -1003,7 +1001,7 @@ impl App {
                         sender.operation_finished(format!("Pobieranie zakończone. Pomyślnie zrekonstruowano {} plików moov.", count));
                     }
                     Err(e) => {
-                        sender.operation_failed("Pobieranie chmury", &e.to_string());
+                        sender.operation_failed("Pobieranie chmury", e.to_string());
                     }
                 }
             });

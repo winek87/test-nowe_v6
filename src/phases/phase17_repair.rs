@@ -812,12 +812,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                 for ScanMsg::Chunk(chunk) in rx_db {
                     for res in chunk {
-                        match (res.repaired_path.as_deref(), res.repair_log.as_deref()) {
-                            (Some(sciezka), Some(log)) => {
-                                let stmt = if res.side == "ufs" { &mut stmt_u } else { &mut stmt_s };
-                                stmt.execute(params![sciezka, log, res.id])?;
-                            }
-                            _ => {}
+                        if let (Some(sciezka), Some(log)) = (res.repaired_path.as_deref(), res.repair_log.as_deref()) {
+                            let stmt = if res.side == "ufs" { &mut stmt_u } else { &mut stmt_s };
+                            stmt.execute(params![sciezka, log, res.id])?;
                         }
 
                         if sledzenie.zarejestruj_wynik(res.id) {

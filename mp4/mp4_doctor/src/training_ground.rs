@@ -136,8 +136,8 @@ pub fn run_training(ws: &Workspace, healthy_dir: &str, tx: &EventSender) -> io::
                     gather_recursive(&path, files_to_train, trained_hashes, total_found);
                 } else if path.is_file() {
                     *total_found += 1;
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mov") {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                        && (ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mov")) {
                             let file_name = path.file_name().unwrap().to_string_lossy().to_string();
                             use std::hash::{Hash, Hasher};
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -148,7 +148,6 @@ pub fn run_training(ws: &Workspace, healthy_dir: &str, tx: &EventSender) -> io::
                                 files_to_train.push((path, file_name, short_hash));
                             }
                         }
-                    }
                 }
             }
         }
@@ -223,11 +222,10 @@ pub fn run_training(ws: &Workspace, healthy_dir: &str, tx: &EventSender) -> io::
                 let _ = fs::remove_file(&broken_path);
                 if let Ok(out_entries) = fs::read_dir(&ws.output_dir) {
                     for e in out_entries.flatten() {
-                        if let Some(name) = e.file_name().to_str() {
-                            if name.contains(&file_name) {
+                        if let Some(name) = e.file_name().to_str()
+                            && name.contains(&file_name) {
                                 let _ = fs::remove_file(e.path());
                             }
-                        }
                     }
                 }
             }

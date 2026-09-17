@@ -181,8 +181,8 @@ pub fn extract_dna(file_path: &str) -> Option<(String, FeatureVector)> {
 pub fn get_human_readable_diagnosis(sig: &str, features: &FeatureVector) -> String {
     let mut parts = Vec::new();
     
-    if sig.contains("H264_") {
-        if let Some(start) = sig.find("H264_") {
+    if sig.contains("H264_")
+        && let Some(start) = sig.find("H264_") {
             let hex_str = &sig[start+5..start+11];
             if hex_str.len() == 6 {
                 let profile = &hex_str[0..2];
@@ -202,7 +202,6 @@ pub fn get_human_readable_diagnosis(sig: &str, features: &FeatureVector) -> Stri
                 parts.push(format!("Wideo: {} @ Level {}", prof_name, level_str));
             }
         }
-    }
     
     if sig.contains("AAC_") {
         if let Some(start) = sig.find("AAC_") {
