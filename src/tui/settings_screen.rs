@@ -369,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_ekran_glowny_pokazuje_wartosci_z_konfiguracji() {
         let mut u = Ustawienia::default();
         u.target_path = "/moj/wlasny/cel".to_string();

@@ -301,6 +301,7 @@ mod tests {
     /// w tym panelu (operator widział ją tylko w ekranie Ustawień), naprawione
     /// na wyraźną prośbę.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_panel_sciezek_pokazuje_zrodla_cel_i_parametry() {
         let mut u = Ustawienia::default();
         u.ufs_path = "/moje/zrodlo/ufs".to_string();

@@ -1438,6 +1438,7 @@ mod tests {
     /// także na tej gałęzi, więc wiersz zostaje domknięty już przy tym
     /// (pierwszym po przerwaniu) uruchomieniu.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_run_finalizuje_macierz_mimo_braku_nowych_zadan_io() {
         let mut conn = crate::db::init_db(":memory:").unwrap();
         conn.execute(
@@ -1478,6 +1479,7 @@ mod tests {
     /// Końcowego, bo ten raport liczy CAŁĄ bazę (`WHERE phase2_done = 1`),
     /// nie tylko bieżącą sesję.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_dziennik_koncowy_liczy_puste_pliki_i_bledy_z_calej_bazy_nie_tylko_biezacej_sesji() {
         let mut conn = crate::db::init_db(":memory:").unwrap();
         // Dwa wiersze UDAJĄCE stan z POPRZEDNIEJ sesji: już zmierzone/oznaczone
@@ -1536,6 +1538,7 @@ mod tests {
     /// przeciwieństwie do sekcji [1]). Dziennik musi teraz wprost podawać
     /// wolumen osobno dla plików unikalnych UFS i osobno dla Skryptu.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_dziennik_koncowy_pokazuje_wolumen_plikow_unikalnych() {
         let mut conn = crate::db::init_db(":memory:").unwrap();
         conn.execute(

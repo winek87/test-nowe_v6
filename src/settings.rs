@@ -417,6 +417,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_pelny_obieg_zapisz_wczytaj_zachowuje_wartosci() {
         let dir = tempdir().unwrap();
         let sciezka = dir.path().join("obieg.json").to_string_lossy().into_owned();
@@ -568,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_naprawa_nie_rusza_pozostalych_ustawien() {
         let mut u = Ustawienia::default();
         u.target_path = "/nie/dotykaj".to_string();

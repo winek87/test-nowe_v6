@@ -1241,6 +1241,7 @@ mod tests {
     // bazie ponownie nie skanuje już oznaczonego czystego pliku.
     // ------------------------------------------------------------------
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn audit_verify_clean_file_gets_scanned_flag_and_is_not_rescanned() {
         use crate::settings::Ustawienia;
 
