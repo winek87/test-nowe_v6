@@ -331,9 +331,24 @@ fn create_analysis_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // REGRESJA (todo.faza15.md, Znalezisko 1 — WYSOKIE): stary schemat miał
+    // `file_id INTEGER PRIMARY KEY` — jeden wiersz NA PLIK, nie na stronę.
+    // Dla plików WSPÓLNYCH (obecnych po obu stronach) `phases::phase15`
+    // buduje dwa niezależne zadania o tym samym `file_id`, oba piszące przez
+    // `INSERT OR REPLACE` — drugi zapis bezpowrotnie kasował pierwszy,
+    // tracąc UID/GID/klucze xattr/sygnały URL jednej z dwóch fizycznych
+    // kopii. Klucz złożony (file_id, side) eliminuje kolizję u źródła. TA
+    // definicja (tworzona JUŻ PRZY INICJALIZACJI bazy, patrz dokumentacja
+    // funkcji) MUSI zostać zsynchronizowana z definicją w
+    // `phases::phase15::run` — inaczej ta, kanoniczna, tworzona jako
+    // pierwsza, zawsze "wygrywałaby" nad własnym, spóźnionym
+    // `CREATE TABLE IF NOT EXISTS` Fazy 15 (który wtedy staje się no-opem),
+    // a mechanizm migracji Fazy 15 uruchamiałby się niepotrzebnie przy
+    // KAŻDYM pierwszym uruchomieniu na świeżej bazie.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS phase15_analysis (
-            file_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('ufs','script')),
             has_xattr BOOLEAN,
             xattr_count INTEGER,
             xattr_size INTEGER,
@@ -345,6 +360,7 @@ fn create_analysis_tables(conn: &Connection) -> Result<()> {
             has_quarantine BOOLEAN,
             has_wherefroms BOOLEAN,
             has_large_xattr BOOLEAN,
+            PRIMARY KEY(file_id, side),
             FOREIGN KEY(file_id) REFERENCES files(id)
         )",
         [],

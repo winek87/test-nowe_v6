@@ -102,6 +102,38 @@ fn is_large_xattr(total_bytes: u64) -> bool {
     total_bytes > LARGE_XATTR_THRESHOLD_BYTES
 }
 
+/// Formatuje sekcję `[4] ROZKŁAD PRZESTRZENI NAZW XATTR` Dziennika
+/// Końcowego z połączonego (obie strony) rozkładu przestrzeni nazw. `None`,
+/// gdy żadna strona nie znalazła ani jednego klucza xattr — wtedy sekcja
+/// jest pomijana w raporcie, tak samo jak sekcja `[3]` przy braku anomalii
+/// rozmiaru.
+///
+/// Wydzielona jako czysta funkcja z tego samego powodu co
+/// `classify_url_marker`/`xattr_namespace`/`is_large_xattr` (patrz uwaga
+/// architektoniczna na początku modułu) — testowalna na syntetycznych
+/// mapach zliczeń, bez potrzeby prawdziwych xattr na dysku.
+fn format_namespace_section(ufs: &HashMap<String, usize>, script: &HashMap<String, usize>) -> Option<String> {
+    let mut merged: HashMap<String, usize> = HashMap::new();
+    for (ns, count) in ufs.iter().chain(script.iter()) {
+        *merged.entry(ns.clone()).or_insert(0) += count;
+    }
+    if merged.is_empty() {
+        return None;
+    }
+
+    let mut sorted: Vec<_> = merged.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(a.1));
+
+    let mut out = String::new();
+    use std::fmt::Write as FmtWrite;
+    let _ = writeln!(&mut out, "[ 4 ] ROZKŁAD PRZESTRZENI NAZW XATTR:");
+    for (ns, count) in &sorted {
+        let _ = writeln!(&mut out, "   -> {:<11} {} kluczy", format!("{}:", ns), count);
+    }
+    let _ = writeln!(&mut out, "      [ ZNACZENIE ]: Przestrzenie 'trusted'/'system' zwykle wymagają podwyższonych uprawnień do odczytu/zapisu - ich obecność jest sama w sobie sygnałem wartym odnotowania.\n");
+    Some(out)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Task {
     id: i32,
@@ -252,7 +284,11 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     )
 }
 
-type ExtMap = HashMap<String, Vec<(String, u32, u32, String)>>; 
+// `side` (5. pole krotki) - patrz naprawa Znaleziska 1 (todo.faza15.md):
+// plik wspólny może teraz dać DWA wpisy pod tym samym rozszerzeniem, po
+// jednym na fizyczną kopię - bez tego pola raport nie mógłby odróżnić,
+// z której strony pochodzi który przykładowy dowód.
+type ExtMap = HashMap<String, Vec<(String, u32, u32, String, String)>>;
 
 /// Agreguje statystyki jednej puli (wspólne/tylko-UFS/tylko-Skrypt) do
 /// Dziennika Końcowego: liczba plików z xattr, liczba ze śladami URL,
@@ -266,11 +302,11 @@ struct CategoryStats {
 impl CategoryStats {
     fn new() -> Self { Self { count: 0, url_count: 0, total_xattr_bytes: 0, extensions: HashMap::new() } }
     #[allow(clippy::too_many_arguments)]
-    fn add(&mut self, ext: &str, path: String, uid: u32, gid: u32, keys: String, bytes: u64, has_url: bool) {
+    fn add(&mut self, ext: &str, path: String, uid: u32, gid: u32, keys: String, bytes: u64, has_url: bool, side: String) {
         self.count += 1;
         self.total_xattr_bytes += bytes;
         if has_url { self.url_count += 1; }
-        self.extensions.entry(ext.to_string()).or_default().push((path, uid, gid, keys));
+        self.extensions.entry(ext.to_string()).or_default().push((path, uid, gid, keys, side));
     }
 }
 
@@ -349,11 +385,15 @@ fn write_category_block(out: &mut String, stats: &CategoryStats) {
     
     for (ext, paths) in sorted.into_iter().take(5) {
         let cat = get_file_category(ext);
-        let _ = writeln!(out, "     - Typ Pliku: {:<12} [ {:<4} ]: {} plików", cat, ext, paths.len());
-        
-        let (sample_path, s_uid, s_gid, s_keys) = &paths[0];
-        
-        let _ = writeln!(out, "       [ 🔍 ] Przykładowy dowód z tej grupy:");
+        // REGRESJA (todo.faza15.md, Znalezisko 1): plik WSPÓLNY z xattr po
+        // OBU stronach daje teraz DWA wpisy (po naprawie wyścigu zapisu -
+        // każda fizyczna kopia ma swój własny wiersz) - stąd "wpisów", nie
+        // "plików": liczba odzwierciedla POMIARY, nie unikalne ścieżki.
+        let _ = writeln!(out, "     - Typ Pliku: {:<12} [ {:<4} ]: {} wpisów", cat, ext, paths.len());
+
+        let (sample_path, s_uid, s_gid, s_keys, s_side) = &paths[0];
+
+        let _ = writeln!(out, "       [ 🔍 ] Przykładowy dowód z tej grupy ({}):", s_side);
         let _ = writeln!(out, "         - Ścieżka:       \"{}\"", sample_path);
         let _ = writeln!(out, "         - Właściciel:    UID: {}, GID: {}", s_uid, s_gid);
         let _ = writeln!(out, "         - Ukryte klucze: {}", s_keys);
@@ -543,9 +583,27 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
     // --- TWORZENIE NOWEJ TABELI BAZODANOWEJ ---
+    //
+    // REGRESJA (todo.faza15.md, Znalezisko 1 — WYSOKIE): stary schemat miał
+    // `file_id INTEGER PRIMARY KEY` — jeden wiersz NA PLIK, nie na stronę.
+    // Dla plików WSPÓLNYCH (obecnych po obu stronach — typowy przypadek w
+    // tym narzędziu: dwa niezależnie pozyskane korpusy tego samego
+    // materiału) budowane są DWA niezależne zadania o tym samym `file_id`
+    // (patrz pętla budująca `ufs_tasks`/`script_tasks` niżej), oba piszące
+    // przez `INSERT OR REPLACE` do TEGO SAMEGO wiersza z dwóch niezależnych
+    // pul Rayon przez wspólny kanał — kolejność nadejścia jest z definicji
+    // niedeterministyczna, więc drugi zapis bezpowrotnie kasował pierwszy.
+    // Dla plików, gdzie tylko jedna strona miała realne xattr, oznaczało to
+    // CAŁKOWITY zanik dowodu z raportu (WHERE a.has_xattr = 1 odrzucał cały
+    // wiersz). Klucz złożony (file_id, side) eliminuje kolizję u źródła —
+    // obie strony dostają WŁASNY wiersz, więc UID/GID/klucze xattr/sygnały
+    // URL obu fizycznych kopii przetrwają, w tym rozbieżności między nimi
+    // (np. inny właściciel pliku), które same w sobie są wartym odnotowania
+    // sygnałem kryminalistycznym, nie tylko szumem do scalenia.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS phase15_analysis (
-            file_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('ufs','script')),
             has_xattr BOOLEAN,
             xattr_count INTEGER,
             xattr_size INTEGER,
@@ -553,16 +611,63 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             uid INTEGER,
             gid INTEGER,
             has_url BOOLEAN,
+            has_zone_identifier BOOLEAN,
+            has_quarantine BOOLEAN,
+            has_wherefroms BOOLEAN,
+            has_large_xattr BOOLEAN,
+            PRIMARY KEY(file_id, side),
             FOREIGN KEY(file_id) REFERENCES files(id)
         )", []
     )?;
-    // Kolumny dla nowych, bardziej szczegółowych sygnałów (ALTER dla zgodności
-    // wstecznej z bazami utworzonymi przed tą rewizją, gdzie CREATE TABLE IF
-    // NOT EXISTS powyżej jest no-opem).
-    let _ = conn.execute("ALTER TABLE phase15_analysis ADD COLUMN has_zone_identifier BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE phase15_analysis ADD COLUMN has_quarantine BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE phase15_analysis ADD COLUMN has_wherefroms BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE phase15_analysis ADD COLUMN has_large_xattr BOOLEAN", []);
+
+    // Migracja jednorazowa ze STAREGO kształtu tabeli (sprzed tej naprawy,
+    // bez kolumny `side`) — `CREATE TABLE IF NOT EXISTS` wyżej jest wtedy
+    // no-opem, bo tabela o tej nazwie już istnieje. Wykrywamy przez
+    // `PRAGMA table_info` (niezawodne niezależnie od tego, czy tabela ma
+    // jakiekolwiek wiersze — w przeciwieństwie do próby SELECT, która dla
+    // pustej tabeli zwróciłaby "brak wierszy", nie "brak kolumny"). Starych
+    // (potencjalnie już zafałszowanych przez wyścig) danych NIE kasujemy po
+    // cichu — zmieniamy nazwę do ręcznej inspekcji śledczej, budujemy nowy,
+    // bezkolizyjny schemat, i resetujemy znaczniki ukończenia w `files`, żeby
+    // najbliższe uruchomienie Fazy 15 przetworzyło WSZYSTKIE pliki ponownie
+    // pod nowym schematem (xattr to szybki odczyt metadanych, nie
+    // re-hashowanie zawartości — koszt niewielki wobec poprawności dowodu).
+    let ma_kolumne_side: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(phase15_analysis)")?;
+        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+        cols.iter().any(|c| c == "side")
+    };
+
+    if !ma_kolumne_side {
+        conn.execute("ALTER TABLE phase15_analysis RENAME TO phase15_analysis_legacy_wyscig_zapisu", [])?;
+        conn.execute(
+            "CREATE TABLE phase15_analysis (
+                file_id INTEGER NOT NULL,
+                side TEXT NOT NULL CHECK(side IN ('ufs','script')),
+                has_xattr BOOLEAN,
+                xattr_count INTEGER,
+                xattr_size INTEGER,
+                xattr_keys TEXT,
+                uid INTEGER,
+                gid INTEGER,
+                has_url BOOLEAN,
+                has_zone_identifier BOOLEAN,
+                has_quarantine BOOLEAN,
+                has_wherefroms BOOLEAN,
+                has_large_xattr BOOLEAN,
+                PRIMARY KEY(file_id, side),
+                FOREIGN KEY(file_id) REFERENCES files(id)
+            )", []
+        )?;
+        conn.execute(
+            "UPDATE files SET has_xattr_ufs = NULL, has_xattr_script = NULL, phase15_done = 0
+             WHERE has_xattr_ufs IS NOT NULL OR has_xattr_script IS NOT NULL OR phase15_done = 1", []
+        )?;
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "⚠️ Wykryto starszy schemat bazy Fazy 15 (znany wyścig zapisu UFS/Skrypt) - migruję do bezkolizyjnego schematu. \
+             Stare dane zachowane w tabeli 'phase15_analysis_legacy_wyscig_zapisu', wszystkie pliki zostaną ponownie przeskanowane pod xattr.".to_string()
+        ));
+    }
 
     // INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
     let raport_cfg = config.raporty_faz.get("Faza 15").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
@@ -669,10 +774,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let update_sql = |c: &mut Connection, chunk: &[SideXattrResult], is_ufs: bool| -> Result<()> {
                 let tx_db = c.transaction()?;
                 {
+                    // `side` jest teraz częścią klucza głównego (patrz
+                    // naprawa Znaleziska 1, todo.faza15.md) - UFS i Skrypt
+                    // dla tego samego `file_id` piszą do WŁASNYCH wierszy,
+                    // nie kolidują.
+                    let side = if is_ufs { "ufs" } else { "script" };
+
                     // OPTYMALIZACJA CPU: prepare_cached
                     let mut stmt_insert = tx_db.prepare_cached(
-                        "INSERT OR REPLACE INTO phase15_analysis (file_id, has_xattr, xattr_count, xattr_size, xattr_keys, uid, gid, has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                        "INSERT OR REPLACE INTO phase15_analysis (file_id, side, has_xattr, xattr_count, xattr_size, xattr_keys, uid, gid, has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
                     )?;
 
                     let mut stmt_update = match is_ufs {
@@ -686,6 +797,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                             has_x = Some(meta.xattr_count > 0);
                             stmt_insert.execute(params![
                                 res.id,
+                                side,
                                 has_x,
                                 meta.xattr_count as i64,
                                 meta.xattr_size_bytes as i64,
@@ -820,36 +932,44 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stats_unique_ufs = CategoryStats::new();
     let mut stats_unique_scr = CategoryStats::new();
 
+    // REGRESJA (todo.faza15.md, Znalezisko 1): `a.side` dodane do SELECT —
+    // plik wspólny może teraz mieć DWA wiersze w `phase15_analysis` (jeden
+    // na fizyczną kopię, patrz naprawa wyścigu zapisu wyżej), więc pętla
+    // niżej może zobaczyć ten sam `relative_path` dwukrotnie, z osobnymi
+    // wartościami UID/GID/kluczy dla każdej strony — obie muszą trafić do
+    // raportu, żadna nie może cicho przepaść.
     let mut stmt = conn.prepare(
-        "SELECT f.relative_path, f.found_in_ufs, f.found_in_script, 
-                a.has_xattr, a.xattr_size, a.uid, a.gid, a.xattr_keys, a.has_url 
-         FROM files f 
-         JOIN phase15_analysis a ON f.id = a.file_id 
+        "SELECT f.relative_path, f.found_in_ufs, f.found_in_script,
+                a.has_xattr, a.xattr_size, a.uid, a.gid, a.xattr_keys, a.has_url, a.side
+         FROM files f
+         JOIN phase15_analysis a ON f.id = a.file_id
          WHERE f.phase15_done = 1 AND a.has_xattr = 1"
     )?;
-    
+
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, 
-            row.get::<_, bool>(1)?, 
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
             row.get::<_, bool>(2)?,
-            row.get::<_, bool>(3)?, 
+            row.get::<_, bool>(3)?,
             row.get::<_, i64>(4)? as u64,
-            row.get::<_, u32>(5)?, 
-            row.get::<_, u32>(6)?, 
-            row.get::<_, String>(7)?, 
-            row.get::<_, bool>(8)?
+            row.get::<_, u32>(5)?,
+            row.get::<_, u32>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, bool>(8)?,
+            row.get::<_, String>(9)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (path, in_ufs, in_scr, _, size, uid, gid, keys, has_url) = r;
+        let (path, in_ufs, in_scr, _, size, uid, gid, keys, has_url, side) = r;
         let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
         let is_common = in_ufs && in_scr;
+        let side_label = if side == "ufs" { "UFS Explorer".to_string() } else { "Skrypt Autorski".to_string() };
 
-        if is_common { stats_common.add(&ext, path, uid, gid, keys, size, has_url); }
-        else if in_ufs { stats_unique_ufs.add(&ext, path, uid, gid, keys, size, has_url); }
-        else { stats_unique_scr.add(&ext, path, uid, gid, keys, size, has_url); }
+        if is_common { stats_common.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
+        else if in_ufs { stats_unique_ufs.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
+        else { stats_unique_scr.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
     }
     drop(stmt);
 
@@ -888,6 +1008,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let _ = writeln!(&mut log_out, "[ 3 ] ANOMALIA ROZMIARU XATTR (>64KB):");
         let _ = writeln!(&mut log_out, "   -> Pliki z nietypowo dużym blobem xattr: {}", sum_large);
         let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Normalne metadane systemowe to zwykle pojedyncze bajty/kilobajty. Znacznie większy blob może wskazywać na przemycone dane w rozszerzonym atrybucie.\n");
+    }
+
+    // REGRESJA (todo.faza15.md, Znalezisko 2): rozkład przestrzeni nazw
+    // xattr był liczony i agregowany globalnie (ufs_stats/script_stats.
+    // namespace_counts) przez cały czas trwania fazy — dane były już w
+    // pełni policzone i poprawne — ale nigdy nie trafiał do Dziennika
+    // Końcowego, wyłącznie migał w panelu UI na żywo i znikał bezpowrotnie
+    // po zakończeniu skanu, mimo że dokumentacja modułu reklamuje go jako
+    // jedną z headline'owych funkcji tej rewizji.
+    if let Some(sekcja) = format_namespace_section(
+        &ufs_stats.namespace_counts.lock().unwrap(),
+        &script_stats.namespace_counts.lock().unwrap(),
+    ) {
+        log_out.push_str(&sekcja);
     }
 
     let write_section_txt = |out: &mut String, title: &str, stats: &CategoryStats| {
@@ -1042,14 +1176,55 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // format_namespace_section (Znalezisko 2, todo.faza15.md)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_format_namespace_section_puste_obie_strony_daje_none() {
+        assert_eq!(format_namespace_section(&HashMap::new(), &HashMap::new()), None);
+    }
+
+    #[test]
+    fn test_format_namespace_section_laczy_obie_strony_i_sortuje_malejaco() {
+        let mut ufs = HashMap::new();
+        ufs.insert("user".to_string(), 10);
+        ufs.insert("trusted".to_string(), 1);
+
+        let mut script = HashMap::new();
+        script.insert("user".to_string(), 5); // musi się zsumować z UFS: 10+5=15
+        script.insert("security".to_string(), 3);
+
+        let sekcja = format_namespace_section(&ufs, &script).expect("niepuste mapy muszą dać Some");
+
+        assert!(sekcja.contains("[ 4 ] ROZKŁAD PRZESTRZENI NAZW XATTR"));
+        assert!(sekcja.contains("user:       15 kluczy"), "user musi być sumą obu stron (10+5):\n{}", sekcja);
+
+        let pos_user = sekcja.find("user:").expect("brak user");
+        let pos_security = sekcja.find("security:").expect("brak security");
+        let pos_trusted = sekcja.find("trusted:").expect("brak trusted");
+        assert!(pos_user < pos_security, "user (15) musi być przed security (3)");
+        assert!(pos_security < pos_trusted, "security (3) musi być przed trusted (1)");
+    }
+
+    #[test]
+    fn test_format_namespace_section_dziala_gdy_tylko_jedna_strona_ma_dane() {
+        let mut ufs = HashMap::new();
+        ufs.insert("system".to_string(), 2);
+        let script = HashMap::new();
+
+        let sekcja = format_namespace_section(&ufs, &script).expect("jedna niepusta strona wystarczy do Some");
+        assert!(sekcja.contains("system:     2 kluczy"));
+    }
+
+    // ------------------------------------------------------------------
     // CategoryStats
     // ------------------------------------------------------------------
 
     #[test]
     fn test_category_stats_accumulates() {
         let mut stats = CategoryStats::new();
-        stats.add("jpg", "a.jpg".to_string(), 1000, 1000, "user.comment".to_string(), 128, false);
-        stats.add("jpg", "b.jpg".to_string(), 0, 0, "com.apple.quarantine".to_string(), 256, true);
+        stats.add("jpg", "a.jpg".to_string(), 1000, 1000, "user.comment".to_string(), 128, false, "UFS Explorer".to_string());
+        stats.add("jpg", "b.jpg".to_string(), 0, 0, "com.apple.quarantine".to_string(), 256, true, "Skrypt Autorski".to_string());
 
         assert_eq!(stats.count, 2);
         assert_eq!(stats.url_count, 1);
@@ -1116,5 +1291,153 @@ mod tests {
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Przestrzenie nazw xattr: -"));
         assert!(block.contains("Top rozszerzenia (xattr): -"));
+    }
+
+    // ------------------------------------------------------------------
+    // run() end-to-end — Znalezisko 1 (todo.faza15.md): wyścig zapisu
+    // UFS×Skrypt do wspólnego wiersza phase15_analysis
+    //
+    // Celowo NIE polegamy tu na prawdziwych xattr na dysku (patrz uwaga
+    // architektoniczna na początku modułu — mogą nie być wspierane w
+    // środowisku testowym/CI). `stmt_insert` w `update_sql` jest wołane dla
+    // KAŻDEGO przetworzonego pliku niezależnie od tego, czy faktycznie ma
+    // jakiekolwiek xattr (`has_xattr` może być `false`) — sedno tego testu
+    // to sama KOLIZJA WIERSZA w bazie, nie treść xattr.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_run_plik_wspolny_dostaje_dwa_niekolidujace_wiersze_ufs_i_skrypt() {
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ufs_dir.path().join("wspolny.txt"), b"tresc ufs").unwrap();
+        std::fs::write(script_dir.path().join("wspolny.txt"), b"tresc skrypt").unwrap();
+
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('wspolny.txt', 1, 1)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'wspolny.txt'", [], |r| r.get(0)).unwrap();
+
+        let mut config = Ustawienia {
+            ufs_path: ufs_dir.path().to_string_lossy().to_string(),
+            script_path: script_dir.path().to_string_lossy().to_string(),
+            log_path: log_dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
+
+        let liczba_wierszy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(
+            liczba_wierszy, 2,
+            "plik wspólny musi dać DWA niekolidujące wiersze (jeden na fizyczną kopię) - \
+             przed naprawą Znaleziska 1 drugi zapis (INSERT OR REPLACE na file_id PRIMARY KEY \
+             bez rozróżnienia strony) bezpowrotnie nadpisywał pierwszy, zostawiając tylko 1 wiersz"
+        );
+
+        let mut stmt = conn.prepare("SELECT side FROM phase15_analysis WHERE file_id = ?1 ORDER BY side").unwrap();
+        let sides: Vec<String> = stmt.query_map(params![file_id], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(sides, vec!["script".to_string(), "ufs".to_string()], "obie strony muszą być obecne, każda pod własnym wierszem");
+    }
+
+    /// Plik UNIKALNY (tylko jedna strona) musi dać dokładnie JEDEN wiersz —
+    /// kontrola pozytywna, żeby naprawa Znaleziska 1 nie zaczęła tworzyć
+    /// nadmiarowych wierszy tam, gdzie druga strona w ogóle nie istnieje.
+    #[test]
+    fn test_run_plik_unikalny_dostaje_dokladnie_jeden_wiersz() {
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ufs_dir.path().join("tylko_ufs.txt"), b"tresc").unwrap();
+
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('tylko_ufs.txt', 1, 0)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'tylko_ufs.txt'", [], |r| r.get(0)).unwrap();
+
+        let mut config = Ustawienia {
+            ufs_path: ufs_dir.path().to_string_lossy().to_string(),
+            script_path: script_dir.path().to_string_lossy().to_string(),
+            log_path: log_dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
+
+        let liczba_wierszy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(liczba_wierszy, 1);
+
+        let side: String = conn.query_row("SELECT side FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)).unwrap();
+        assert_eq!(side, "ufs");
+    }
+
+    /// Migracja ze starego kształtu tabeli (sprzed naprawy Znaleziska 1, bez
+    /// kolumny `side`) — stare dane muszą przetrwać pod inną nazwą (nie
+    /// zostać po cichu skasowane), a nowa tabela musi dostać kolumnę `side`.
+    #[test]
+    fn test_run_migruje_stary_ksztalt_tabeli_bez_utraty_danych() {
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+
+        // `init_db` tworzy `phase15_analysis` już przy inicjalizacji, w
+        // NOWYM (naprawionym) kształcie - patrz `db.rs::create_analysis_tables`.
+        // Żeby wiarygodnie zasymulować bazę SPRZED tej naprawy, musimy
+        // najpierw usunąć tę już-poprawną tabelę i odtworzyć ją w STARYM
+        // kształcie - `file_id INTEGER PRIMARY KEY`, bez `side`.
+        conn.execute("DROP TABLE phase15_analysis", []).unwrap();
+        conn.execute(
+            "CREATE TABLE phase15_analysis (
+                file_id INTEGER PRIMARY KEY,
+                has_xattr BOOLEAN, xattr_count INTEGER, xattr_size INTEGER, xattr_keys TEXT,
+                uid INTEGER, gid INTEGER, has_url BOOLEAN,
+                FOREIGN KEY(file_id) REFERENCES files(id)
+            )", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script, has_xattr_ufs, phase15_done) VALUES ('stary.txt', 1, 0, 1, 1)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'stary.txt'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO phase15_analysis (file_id, has_xattr, uid, gid) VALUES (?1, 1, 999, 999)",
+            params![file_id],
+        ).unwrap();
+
+        let mut config = Ustawienia {
+            ufs_path: ufs_dir.path().to_string_lossy().to_string(),
+            script_path: script_dir.path().to_string_lossy().to_string(),
+            log_path: log_dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok mimo migracji w trakcie");
+
+        // Stara tabela musi przetrwać pod inną nazwą - z oryginalnym wierszem nietkniętym.
+        let stary_uid: u32 = conn.query_row(
+            "SELECT uid FROM phase15_analysis_legacy_wyscig_zapisu WHERE file_id = ?1", params![file_id], |r| r.get(0)
+        ).expect("stare dane muszą przetrwać migrację pod inną nazwą, nie zniknąć");
+        assert_eq!(stary_uid, 999, "stary wiersz musi zostać zachowany bez zmian");
+
+        // Nowa tabela musi mieć kolumnę `side`.
+        let mut stmt = conn.prepare("PRAGMA table_info(phase15_analysis)").unwrap();
+        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().filter_map(|r| r.ok()).collect();
+        assert!(cols.contains(&"side".to_string()), "nowa tabela musi mieć kolumnę side: {:?}", cols);
     }
 }
