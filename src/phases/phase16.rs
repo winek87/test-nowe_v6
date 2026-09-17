@@ -168,6 +168,19 @@ impl LiveStats {
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
+
+    /// REGRESJA (todo.faza16.md): pozostałe trzy miejsca w tym pliku
+    /// wołały `top_rules.lock().unwrap()` wprost, niespójnie z odpornym na
+    /// zatruty mutex wzorcem ustalonym już gdzie indziej w projekcie
+    /// (`phase2::LiveStats::wagi_rozszerzen`, `phase17_repair`) — panika
+    /// wewnątrz KTOREGOKOLWIEK wątku trzymającego tę blokadę (np. w
+    /// przyszłości dodany kod) zatrułaby mutex i sprowadziła kaskadową
+    /// panikę na WSZYSTKIE pozostałe wątki próbujące zaktualizować "Top
+    /// reguły" w panelu live, zamiast po prostu kontynuować z ostatnim
+    /// spójnym stanem.
+    fn top_rules(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.top_rules.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
@@ -185,7 +198,7 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_rules_str = {
-        let map = stats.top_rules.lock().unwrap();
+        let map = stats.top_rules();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         sorted.into_iter().take(3).map(|(r, c)| format!("{} ({})", r, c)).collect::<Vec<_>>().join(", ")
@@ -357,7 +370,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
 
                     if !local_rules.is_empty() {
-                        let mut g_rules = stats.top_rules.lock().unwrap();
+                        let mut g_rules = stats.top_rules();
                         for (k, v) in local_rules.drain() { *g_rules.entry(k).or_insert(0) += v; }
                     }
 
@@ -383,7 +396,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_rules.is_empty() {
-            let mut g_rules = stats.top_rules.lock().unwrap();
+            let mut g_rules = stats.top_rules();
             for (k, v) in local_rules.drain() { *g_rules.entry(k).or_insert(0) += v; }
         }
 
@@ -528,7 +541,20 @@ pub fn select_and_compile_rules() -> Option<Rules> {
     println!("\n{}", "[ ⚙ ] Kompilacja wybranych reguł do pamięci RAM...".cyan());
     let selected_files: Vec<PathBuf> = selected_indices.iter().map(|&idx| available_rules[idx].clone()).collect();
 
-    let mut compiler = Compiler::new().unwrap();
+    // REGRESJA (todo.faza16.md): `.unwrap()` tutaj panikował na całym
+    // procesie (jesteśmy PRZED wejściem w tryb Raw Ratatui, więc żaden
+    // `catch_unwind` w łańcuchu wyżej tego nie łapie — patrz `main.rs`) w
+    // sytuacji, w której siostrzana funkcja `compile_rule_files` (ścieżka
+    // Autopilota, identyczne wywołanie) od zawsze obsługiwała ten sam błąd
+    // łagodnie. Ten sam wzorzec graceful co już niżej dla `add_rules_file`.
+    let mut compiler = match Compiler::new() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{} Nie udało się zainicjalizować kompilatora YARA: {}", "[ ✖ ]".red().bold(), e);
+            error!("Nie udało się zainicjalizować kompilatora YARA: {}", e);
+            return None;
+        }
+    };
     for rule_path in &selected_files {
         compiler = match compiler.add_rules_file(rule_path) {
             Ok(c) => c,
@@ -540,7 +566,14 @@ pub fn select_and_compile_rules() -> Option<Rules> {
         };
     }
 
-    let rules = compiler.compile_rules().unwrap();
+    let rules = match compiler.compile_rules() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{} Błąd kompilacji reguł YARA: {}", "[ ✖ ]".red().bold(), e);
+            error!("Błąd kompilacji reguł YARA (compile_rules): {}", e);
+            return None;
+        }
+    };
     println!("{}\n", "[ ✔ ] Reguły załadowane pomyślnie.".green());
     Some(rules)
 }
@@ -1046,6 +1079,28 @@ mod tests {
     // build_source_block
     // ------------------------------------------------------------------
 
+    /// REGRESJA (todo.faza16.md): `top_rules()` musi przetrwać zatrucie
+    /// muteksu (panika w innym wątku trzymającym blokadę) tak samo jak
+    /// analogiczny akcesor `phase2::LiveStats::wagi_rozszerzen` — inaczej
+    /// jedna panika w dowolnym miejscu aktualizującym "Top reguły"
+    /// zablokowałaby WSZYSTKIE pozostałe wątki próbujące zrobić to samo.
+    #[test]
+    fn test_top_rules_odporne_na_zatruty_muteks() {
+        let stats = Arc::new(LiveStats::new(1));
+
+        let stats_w_watku = Arc::clone(&stats);
+        let _ = std::thread::spawn(move || {
+            let _guard = stats_w_watku.top_rules.lock().unwrap();
+            panic!("celowa panika testowa trzymając blokadę");
+        })
+        .join();
+
+        assert!(stats.top_rules.is_poisoned(), "Setup testu: muteks MUSI być zatruty");
+
+        stats.top_rules().insert("EICAR_Test".to_string(), 1);
+        assert_eq!(stats.top_rules().get("EICAR_Test"), Some(&1), "akcesor musi działać mimo zatrutego muteksu");
+    }
+
     #[test]
     fn test_build_source_block_reports_top_rules_and_multi_rule_count() {
         use std::time::Duration;
@@ -1053,8 +1108,8 @@ mod tests {
         stats.clean.store(100, Ordering::Relaxed);
         stats.infected.store(5, Ordering::Relaxed);
         stats.multi_rule_files.store(2, Ordering::Relaxed);
-        stats.top_rules.lock().unwrap().insert("EICAR_Test".to_string(), 3);
-        stats.top_rules.lock().unwrap().insert("Trojan.Generic".to_string(), 8);
+        stats.top_rules().insert("EICAR_Test".to_string(), 3);
+        stats.top_rules().insert("Trojan.Generic".to_string(), 8);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
