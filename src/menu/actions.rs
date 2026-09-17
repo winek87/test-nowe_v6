@@ -173,7 +173,7 @@ pub fn execute_action(
 ) -> io::Result<()> {
     info!("Orkiestrator odbiera zadanie. Wykonywanie akcji przypisanej do indeksu: {}", idx);
     debug!("Wywołanie systemowe (Match) dla akcji: {}", idx);
-    
+
     match idx {
         // [ 0 ] TRYB AUTO-PILOT
         0 => run_autopilot(terminal, conn, app)?,
@@ -235,7 +235,7 @@ pub fn execute_action(
             warn!("Nieznany indeks akcji ({}). Opcja nieistniejąca.", idx);
         }
     }
-        
+
     info!("Akcja o indeksie {} zakończyła działanie. Powrót do menu głównego.", idx);
     Ok(())
 }
@@ -316,6 +316,15 @@ fn run_phase_z_opcjami(
     let mut sciezki_io_ts = TableState::default();
     sciezki_io_ts.select(Some(0));
 
+    // Nakładka z wyjaśnieniem etykiety zaznaczonego wiersza "Aktywny Skaner
+    // Live" (Enter, patrz `crate::opisy_anomalii`). Gdy `Some`, przejmuje
+    // Enter/Esc CAŁKOWICIE (patrz obsługa klawiatury niżej, wzorzec 1:1 z
+    // `EditMode::None` w `menu::settings_actions::handle_key`) — na ekranie
+    // końcowym Enter/Esc normalnie wychodzą z ekranu, więc otwarta nakładka
+    // musi je przechwycić PIERWSZA, inaczej pierwsze Enter zamykające
+    // wyjaśnienie zamknęłoby też cały ekran fazy.
+    let mut opis_otwarty: Option<(String, &'static str)> = None;
+
     let (tx, rx) = mpsc::channel();
     let start_time = Instant::now();
 
@@ -372,6 +381,15 @@ fn run_phase_z_opcjami(
                                 cancel_requested_at = Some(Instant::now());
                                 ui_state.process_event(PhaseEvent::Log("⚠️ WYKRYTO PRZERWANIE UŻYTKOWNIKA (Ctrl+C). Oczekiwanie na bezpieczne zamknięcie szyny I/O...".to_string()));
                             }
+                        } else if opis_otwarty.is_some() {
+                            // Nakładka wyjaśnienia PRZEJMUJE Enter/Esc całkowicie —
+                            // wzorzec 1:1 z `EditMode::None` w `settings_actions.rs`.
+                            // Inne klawisze (Tab, strzałki...) są tu celowo ignorowane:
+                            // podczas gdy nakładka zasłania ekran, nawigacja pod spodem
+                            // myliłaby operatora niewidocznym skutkiem.
+                            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                                opis_otwarty = None;
+                            }
                         } else {
                             let pokaz_skaner_live = !ui_state.side_texts.is_empty();
                             match key.code {
@@ -427,6 +445,18 @@ fn run_phase_z_opcjami(
                                     PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
                                     PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                                 },
+                                // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
+                                // `opis_otwarty` wyżej i `crate::opisy_anomalii`).
+                                // Bez efektu na wierszach bez znanego opisu
+                                // (nagłówki sekcji, luźne linie, nieopisane
+                                // jeszcze etykiety) — `etykieta_wiersza`/`znajdz_opis`
+                                // zwracają wtedy `None`, nic się nie dzieje.
+                                KeyCode::Enter if fokus == PanelWFokusie::SkanerLive => {
+                                    if let Some(etykieta) = crate::tui::scanner_panel::etykieta_wiersza(&ui_state, skaner_live_ts.selected().unwrap_or(0))
+                                        && let Some(wyjasnienie) = crate::opisy_anomalii::znajdz_opis(&etykieta) {
+                                            opis_otwarty = Some((etykieta, wyjasnienie));
+                                        }
+                                }
                                 _ => {}
                             }
                         }
@@ -449,7 +479,7 @@ fn run_phase_z_opcjami(
             // 4. GŁÓWNY PODZIAŁ EKRANU RATATUI
             let _ = terminal.draw(|f| {
                 let full_screen = f.area();
-                
+
                 // Krok A: Tniemy ekran w poziomie (Góra: 100%, Dół: 5 linijek na ścieżki)
                 let main_vertical = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Vertical)
@@ -494,7 +524,7 @@ fn run_phase_z_opcjami(
                 crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
                 crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
                 crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
-                
+
                 if !ui_state.side_texts.is_empty() {
                     crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
                 }
@@ -504,6 +534,11 @@ fn run_phase_z_opcjami(
 
                 // Rysujemy Dół Ekranu (Szeroki panel na ekstremalnie długie ścieżki I/O)
                 crate::tui::scanner_panel::draw_bottom_paths_panel(f, &ui_state, main_vertical[1], &mut sciezki_io_ts, fokus == PanelWFokusie::SciezkiIO);
+
+                // Nakładka wyjaśnienia RYSOWANA NA KOŃCU, na wierzchu wszystkiego.
+                if let Some((etykieta, wyjasnienie)) = &opis_otwarty {
+                    crate::tui::scanner_panel::draw_opis_popup(f, full_screen, etykieta, wyjasnienie);
+                }
             });
         }
     });
@@ -525,7 +560,7 @@ fn run_phase_z_opcjami(
     loop {
         let _ = terminal.draw(|f| {
             let full_screen = f.area();
-            
+
             let main_vertical = ratatui::layout::Layout::default()
                 .direction(ratatui::layout::Direction::Vertical)
                 .constraints([ratatui::layout::Constraint::Min(10), ratatui::layout::Constraint::Length(9)])
@@ -566,13 +601,18 @@ fn run_phase_z_opcjami(
             crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
             crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
             crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
-            
+
             if !ui_state.side_texts.is_empty() {
                 crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
             }
 
             crate::tui::phase_screen::draw_phase_screen(f, &ui_state, top_horizontal[1], fokus == PanelWFokusie::Logi);
             crate::tui::scanner_panel::draw_bottom_paths_panel(f, &ui_state, main_vertical[1], &mut sciezki_io_ts, fokus == PanelWFokusie::SciezkiIO);
+
+            // Nakładka wyjaśnienia RYSOWANA NA KOŃCU, na wierzchu wszystkiego.
+            if let Some((etykieta, wyjasnienie)) = &opis_otwarty {
+                crate::tui::scanner_panel::draw_opis_popup(f, full_screen, etykieta, wyjasnienie);
+            }
         });
 
         if !czekaj_na_potwierdzenie {
@@ -582,59 +622,83 @@ fn run_phase_z_opcjami(
         if event::poll(Duration::from_millis(50)).unwrap_or(false)
             && let Ok(event::Event::Key(key)) = event::read()
                 && key.kind == KeyEventKind::Press {
-                    // Przewijanie/nawigacja NA EKRANIE KOŃCOWYM — operator
-                    // dostaje szansę przejrzeć cały przebieg fazy (logi,
-                    // dyski, statystyki, ścieżki) przed powrotem do menu, nie
-                    // tylko ich ogon. `fokus`/stany tabel PRZEŻYŁY przejście
-                    // z live-pętli (utworzone raz, przed `std::thread::scope`).
-                    let pokaz_skaner_live = !ui_state.side_texts.is_empty();
-                    match key.code {
-                        KeyCode::Enter | KeyCode::Esc => break,
-                        KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
-                        KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
-                        KeyCode::Up => match fokus {
-                            PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
-                            PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
-                            PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
-                            PanelWFokusie::SkanerLive => table_select_prev(&mut skaner_live_ts, usize::MAX),
-                            PanelWFokusie::SciezkiIO => table_select_prev(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                        },
-                        KeyCode::Down => match fokus {
-                            PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
-                            PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
-                            PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
-                            PanelWFokusie::SkanerLive => table_select_next(&mut skaner_live_ts, usize::MAX),
-                            PanelWFokusie::SciezkiIO => table_select_next(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                        },
-                        KeyCode::PageUp => match fokus {
-                            PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
-                            PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                            PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                            PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                            PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                        },
-                        KeyCode::PageDown => match fokus {
-                            PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
-                            PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                            PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                            PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                            PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                        },
-                        KeyCode::Home => match fokus {
-                            PanelWFokusie::Logi => {}
-                            PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
-                            PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
-                            PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
-                            PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                        },
-                        KeyCode::End => match fokus {
-                            PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
-                            PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
-                            PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
-                            PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
-                            PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                        },
-                        _ => {}
+                    if opis_otwarty.is_some() {
+                        // Patrz identyczna gałąź w live-pętli wyżej: nakładka
+                        // przejmuje Enter/Esc całkowicie, PIERWSZE Enter/Esc ją
+                        // zamyka zamiast wyjść z ekranu fazy — wyjście wymaga
+                        // osobnego, kolejnego naciśnięcia.
+                        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                            opis_otwarty = None;
+                        }
+                    } else {
+                        // Przewijanie/nawigacja NA EKRANIE KOŃCOWYM — operator
+                        // dostaje szansę przejrzeć cały przebieg fazy (logi,
+                        // dyski, statystyki, ścieżki) przed powrotem do menu, nie
+                        // tylko ich ogon. `fokus`/stany tabel PRZEŻYŁY przejście
+                        // z live-pętli (utworzone raz, przed `std::thread::scope`).
+                        let pokaz_skaner_live = !ui_state.side_texts.is_empty();
+
+                        // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
+                        // `opis_otwarty` i `crate::opisy_anomalii`) - policzone PRZED
+                        // `match`, żeby Enter mógł albo otworzyć nakładkę (gdy coś
+                        // faktycznie da się wyjaśnić), albo zachować dotychczasowe
+                        // znaczenie "wyjdź z ekranu" (gdy nie ma czego wyjaśnić).
+                        let opis_do_otwarcia = if fokus == PanelWFokusie::SkanerLive {
+                            crate::tui::scanner_panel::etykieta_wiersza(&ui_state, skaner_live_ts.selected().unwrap_or(0))
+                                .and_then(|etykieta| crate::opisy_anomalii::znajdz_opis(&etykieta).map(|w| (etykieta, w)))
+                        } else {
+                            None
+                        };
+
+                        match key.code {
+                            KeyCode::Enter if opis_do_otwarcia.is_some() => { opis_otwarty = opis_do_otwarcia; }
+                            KeyCode::Enter | KeyCode::Esc => break,
+                            KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
+                            KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
+                            KeyCode::Up => match fokus {
+                                PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
+                                PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
+                                PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
+                                PanelWFokusie::SkanerLive => table_select_prev(&mut skaner_live_ts, usize::MAX),
+                                PanelWFokusie::SciezkiIO => table_select_prev(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
+                            },
+                            KeyCode::Down => match fokus {
+                                PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
+                                PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
+                                PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
+                                PanelWFokusie::SkanerLive => table_select_next(&mut skaner_live_ts, usize::MAX),
+                                PanelWFokusie::SciezkiIO => table_select_next(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
+                            },
+                            KeyCode::PageUp => match fokus {
+                                PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
+                                PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                                PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
+                                PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
+                                PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
+                            },
+                            KeyCode::PageDown => match fokus {
+                                PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
+                                PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                                PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
+                                PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
+                                PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
+                            },
+                            KeyCode::Home => match fokus {
+                                PanelWFokusie::Logi => {}
+                                PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
+                                PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
+                                PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
+                                PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
+                            },
+                            KeyCode::End => match fokus {
+                                PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
+                                PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
+                                PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
+                                PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
+                                PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
+                            },
+                            _ => {}
+                        }
                     }
                 }
     }
@@ -749,7 +813,7 @@ fn run_autopilot(
     let start_total = Instant::now();
     let mut completed_phases = Vec::new();
     let mut aborted = false;
-    
+
     // Fazy 16/17 wymagają dodatkowych danych (reguły YARA / lista modułów).
     // W trybie Autopilota NIE MA promptu interaktywnego (bezobsługowy przebieg) -
     // domyślnie używamy WSZYSTKICH dostępnych reguł/modułów. `compile_all_available_rules`
@@ -830,7 +894,7 @@ fn run_autopilot(
 
     for (icon, title, category, desc, phase_fn) in phases_to_run {
         let dur_res = run_phase_bez_czekania(terminal, conn, app, icon, title, category, desc, phase_fn);
-        
+
         let duration = dur_res.unwrap_or(Duration::from_secs(0));
 
         if crate::utils::CANCEL_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
@@ -844,7 +908,7 @@ fn run_autopilot(
 
     let status_final = if aborted { "PRZERWANY" } else { "SUKCES" };
     let total_dur = start_total.elapsed();
-    
+
     // Zrzut danych dla celów audytu do bazy
     let _ = conn.execute(
         "INSERT INTO autopilot_runs (duration_sec, status, phases_run) VALUES (?1, ?2, ?3)",
