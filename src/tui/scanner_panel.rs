@@ -10,10 +10,11 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Row, Table},
+    widgets::{Block, Borders, Cell, Row, Table, TableState},
     Frame,
 };
 
+use crate::tui::hardware_panel::KOLOR_FOKUSU;
 use crate::tui::state::PhaseUIState;
 
 // ============================================================================
@@ -193,7 +194,10 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// [`MAKS_SZEROKOSC_ETYKIETY`]), a cała reszta idzie na wartości, które są
 /// ZAWIJANE przez [`wrap_line`], a nie przycinane. Dzięki temu treść rośnie w
 /// dół, zamiast znikać za prawą krawędzią wąskiego terminala.
-pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) {
+/// Rysuje panel statystyk "Aktywny Skaner (Live)". Fokusowalny klawiszem Tab
+/// na ekranie fazy na żywo — patrz dokumentacja `hardware_panel::draw_disks_panel`
+/// dla wyjaśnienia `table_state`/`focused` (ten sam wzorzec).
+pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, table_state: &mut TableState, focused: bool) {
     let mut wiersze: Vec<WierszPanelu> = Vec::new();
 
     for block in &state.side_texts {
@@ -244,6 +248,20 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) {
         wiersze.push(WierszPanelu::Luzna("Oczekiwanie na dane telemetryczne...".to_string()));
     }
 
+    // Zatrzask WEWNĄTRZ funkcji, nie w wywołującym: liczba wierszy tego
+    // panelu wynika z parsowania `state.side_texts` WYŻEJ (nagłówki, pary
+    // etykieta/wartość, luźne linie) — jedyne miejsce, które faktycznie zna
+    // aktualną liczbę wierszy w danej klatce. Klawiatura (`menu/actions.rs`)
+    // przesuwa `table_state.selected()` bez znajomości tej liczby (rośnie/maleje
+    // swobodnie); ten zatrzask samoleczy się na KAŻDEJ klatce, więc np.
+    // skurczenie się `side_texts` między naciśnięciami klawiszy nigdy nie
+    // zostawia zaznaczenia poza zakresem.
+    if let Some(i) = table_state.selected()
+        && i >= wiersze.len() {
+            table_state.select(if wiersze.is_empty() { None } else { Some(wiersze.len() - 1) });
+        }
+    let wybrany = table_state.selected();
+
     // --- Dynamiczny podział szerokości ---
     let najdluzsza_etykieta = wiersze
         .iter()
@@ -266,30 +284,43 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) {
 
     let rows: Vec<Row> = wiersze
         .into_iter()
-        .map(|w| match w {
-            WierszPanelu::Naglowek(tekst) => Row::new(vec![
-                Cell::from(tekst).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Cell::from(""),
-            ]),
-            WierszPanelu::Luzna(tekst) => Row::new(vec![
-                Cell::from(tekst).style(Style::default().fg(Color::White)),
-                Cell::from(""),
-            ]),
-            WierszPanelu::Para(etykieta, wartosci) => {
-                let mut wszystkie_zawiniete = Vec::new();
-                for w in wartosci {
-                    wszystkie_zawiniete.extend(wrap_line(&w, szerokosc_wartosci));
+        .enumerate()
+        .map(|(i, w)| {
+            let zaznaczony = wybrany == Some(i);
+            let prefix = if zaznaczony { "❯ " } else { "" };
+            match w {
+                WierszPanelu::Naglowek(tekst) => Row::new(vec![
+                    Cell::from(format!("{}{}", prefix, tekst)).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Cell::from(""),
+                ]),
+                WierszPanelu::Luzna(tekst) => Row::new(vec![
+                    Cell::from(format!("{}{}", prefix, tekst)).style(Style::default().fg(Color::White)),
+                    Cell::from(""),
+                ]),
+                WierszPanelu::Para(etykieta, wartosci) => {
+                    let mut wszystkie_zawiniete = Vec::new();
+                    for w in wartosci {
+                        wszystkie_zawiniete.extend(wrap_line(&w, szerokosc_wartosci));
+                    }
+
+                    let wysokosc = wszystkie_zawiniete.len().max(1) as u16;
+                    let etykieta_styl = if zaznaczony {
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Row::new(vec![
+                        Cell::from(format!("{}{}", prefix, etykieta)).style(etykieta_styl),
+                        Cell::from(Text::from(wszystkie_zawiniete)),
+                    ])
+                    .height(wysokosc)
                 }
-                
-                let wysokosc = wszystkie_zawiniete.len().max(1) as u16;
-                Row::new(vec![
-                    Cell::from(etykieta).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(Text::from(wszystkie_zawiniete)),
-                ])
-                .height(wysokosc)
             }
         })
         .collect();
+
+    let tytul = if focused { " ▶ Aktywny Skaner — Statystyki (Live) (aktywny — ↑↓ PgUp/PgDn) " } else { " Aktywny Skaner — Statystyki (Live) [Tab] " };
+    let border_styl = if focused { Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Yellow) };
 
     let table = Table::new(
         rows,
@@ -305,11 +336,11 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Aktywny Skaner — Statystyki (Live) ")
-                .border_style(Style::default().fg(Color::Yellow))
+                .title(tytul)
+                .border_style(border_styl)
         );
 
-    f.render_widget(table, area);
+    f.render_stateful_widget(table, area, table_state);
 }
 
 // ============================================================================
@@ -356,9 +387,23 @@ fn wrap_path(text: &str, width: usize) -> Vec<String> {
 ///
 /// Długie ścieżki są ZAWIJANE na wiele linii (patrz [`wrap_path`]), nie przycinane —
 /// wysokość każdego wiersza dopasowuje się do liczby linii, jakich wymaga JEGO ścieżka.
-pub fn draw_bottom_paths_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) {
-    // Etykiety źródeł - zachowane 1:1 z poprzednią wersją dla spójności wizualnej
-    let known_labels = ["UFS Explorer", "Skrypt Autorski"];
+/// Fokusowalny klawiszem Tab na ekranie fazy na żywo — patrz dokumentacja
+/// `hardware_panel::draw_disks_panel` dla wyjaśnienia `table_state`/`focused`.
+/// Etykiety źródeł wbudowane na stałe. Jedyne miejsce prawdy o tym, ILE
+/// wierszy ma [`draw_bottom_paths_panel`] przy braku danych — dzieli je z
+/// [`liczba_wierszy_sciezek`], którego używa klawiatura ekranu fazy
+/// (`menu/actions.rs`) do Home/End/PageUp/PageDown, żeby nigdy nie rozjechać
+/// się z tym, co panel faktycznie rysuje.
+const ZNANE_ZRODLA: [&str; 2] = ["UFS Explorer", "Skrypt Autorski"];
+
+/// Liczba wierszy, jaką [`draw_bottom_paths_panel`] narysuje dla danego
+/// stanu — patrz [`ZNANE_ZRODLA`].
+pub fn liczba_wierszy_sciezek(state: &PhaseUIState) -> usize {
+    ZNANE_ZRODLA.len().max(state.bottom_paths.len())
+}
+
+pub fn draw_bottom_paths_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, table_state: &mut TableState, focused: bool) {
+    let known_labels = ZNANE_ZRODLA;
 
     const SOURCE_COL_WIDTH: u16 = 20;
     // Odejmujemy: kolumnę źródła, obramowanie bloku (1+1) i odstęp między
@@ -372,7 +417,15 @@ pub fn draw_bottom_paths_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) 
     // milczało, tabela miała jeden wiersz i layout „podskakiwał" przy każdym
     // napływie danych z wątku logującego. Teraz wysokość panelu jest stabilna
     // od pierwszej klatki.
-    let liczba_zrodel = known_labels.len().max(state.bottom_paths.len());
+    let liczba_zrodel = liczba_wierszy_sciezek(state);
+
+    // Samoleczący zatrzask — patrz identyczny wzorzec i uzasadnienie w
+    // `draw_side_stats_panel`/`hardware_panel::draw_disks_panel`.
+    if let Some(i) = table_state.selected()
+        && i >= liczba_zrodel {
+            table_state.select(if liczba_zrodel == 0 { None } else { Some(liczba_zrodel - 1) });
+        }
+    let wybrany = table_state.selected();
 
     let rows: Vec<Row> = (0..liczba_zrodel)
         .map(|i| {
@@ -401,14 +454,20 @@ pub fn draw_bottom_paths_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) 
                 )
             };
 
+            let zaznaczony = wybrany == Some(i);
+            let prefix = if zaznaczony { "❯ " } else { "" };
+
             Row::new(vec![
-                Cell::from(source_label).style(
+                Cell::from(format!("{}{}", prefix, source_label)).style(
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 ),
                 Cell::from(path_text).style(styl),
             ]).height(row_height)
         })
         .collect();
+
+    let tytul = if focused { " ▶ Aktualnie skanowane ścieżki (I/O) (aktywny — ↑↓ PgUp/PgDn) " } else { " Aktualnie skanowane ścieżki (I/O) [Tab] " };
+    let border_styl = if focused { Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Cyan) };
 
     let table = Table::new(rows, &[Constraint::Length(SOURCE_COL_WIDTH), Constraint::Min(20)])
         .header(
@@ -418,11 +477,11 @@ pub fn draw_bottom_paths_panel(f: &mut Frame, state: &PhaseUIState, area: Rect) 
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Aktualnie skanowane ścieżki (I/O) ")
-                .border_style(Style::default().fg(Color::Cyan))
+                .title(tytul)
+                .border_style(border_styl)
         );
 
-    f.render_widget(table, area);
+    f.render_stateful_widget(table, area, table_state);
 }
 
 // ============================================================================
@@ -666,7 +725,7 @@ mod tests {
     fn test_dluga_wartosc_nie_jest_przycinana_na_waskim_terminalu() {
         let st = stan_z_tekstem("Top format: .mp4 (300GB), .jpg (100GB), .dng (55GB), .heic (12GB)");
 
-        let bufor = wyrenderuj(46, 12, |f| draw_side_stats_panel(f, &st, f.area()));
+        let bufor = wyrenderuj(46, 12, |f| draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), false));
         let widok = ekran(&bufor);
 
         assert!(widok.contains("Top format"), "etykieta musi być widoczna:\n{}", widok);
@@ -683,7 +742,7 @@ mod tests {
         // sztywne procenty - wartość musi dostać resztę miejsca.
         let st = stan_z_tekstem("Cel: /bardzo/dluga/sciezka/ktora/potrzebuje/miejsca/zeby/sie/zmiescic");
 
-        let bufor = wyrenderuj(60, 10, |f| draw_side_stats_panel(f, &st, f.area()));
+        let bufor = wyrenderuj(60, 10, |f| draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), false));
         let widok = ekran(&bufor);
 
         assert!(widok.contains("/bardzo/dluga/sciezka"), "widok:\n{}", widok);
@@ -695,7 +754,7 @@ mod tests {
         let st = stan_z_tekstem("[UFS Explorer]\nPrędkość: 12.5 MB/s\nTop format: .mp4 (300GB), .jpg (100GB)");
 
         for (szer, wys) in [(10u16, 3u16), (5, 5), (20, 1), (1, 1), (80, 2)] {
-            let _ = wyrenderuj(szer, wys, |f| draw_side_stats_panel(f, &st, f.area()));
+            let _ = wyrenderuj(szer, wys, |f| draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), false));
         }
     }
 
@@ -707,7 +766,7 @@ mod tests {
         let mut st = PhaseUIState::new("x", "t", "k", "o");
         st.bottom_paths = vec!["/mnt/ufs/zdjecia/DSC_0001.dng".to_string()]; // Źródło B jeszcze milczy
 
-        let bufor = wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area()));
+        let bufor = wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut TableState::default(), false));
         let widok = ekran(&bufor);
 
         assert!(widok.contains("UFS Explorer"), "widok:\n{}", widok);
@@ -723,7 +782,7 @@ mod tests {
         let mut st = PhaseUIState::new("x", "t", "k", "o");
         st.bottom_paths = vec!["/a/1".to_string(), "/b/2".to_string(), "/c/3".to_string()];
 
-        let widok = ekran(&wyrenderuj(90, 12, |f| draw_bottom_paths_panel(f, &st, f.area())));
+        let widok = ekran(&wyrenderuj(90, 12, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut TableState::default(), false)));
 
         assert!(widok.contains("UFS Explorer") && widok.contains("Skrypt Autorski"));
         assert!(widok.contains("Źródło 3"), "nadmiarowe źródła dostają etykietę generyczną:\n{}", widok);
@@ -735,7 +794,73 @@ mod tests {
         st.bottom_paths = vec!["/bardzo/dluga/sciezka/do/pliku.dng".to_string(), String::new()];
 
         for (szer, wys) in [(12u16, 3u16), (30, 1), (1, 1), (200, 4)] {
-            let _ = wyrenderuj(szer, wys, |f| draw_bottom_paths_panel(f, &st, f.area()));
+            let _ = wyrenderuj(szer, wys, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut TableState::default(), false));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FOKUS I ZAZNACZENIE (Tab między panelami na ekranie fazy na żywo)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_tytul_panelu_statystyk_odzwierciedla_fokus() {
+        let st = stan_z_tekstem("Prędkość: 12.5 MB/s");
+
+        let bez_fokusu = ekran(&wyrenderuj(70, 10, |f| draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), false)));
+        assert!(bez_fokusu.contains("Tab"), "widok:\n{}", bez_fokusu);
+
+        let z_fokusem = ekran(&wyrenderuj(70, 10, |f| draw_side_stats_panel(f, &st, f.area(), &mut TableState::default(), true)));
+        assert!(z_fokusem.contains("aktywny"), "widok:\n{}", z_fokusem);
+    }
+
+    #[test]
+    fn test_zaznaczony_wiersz_statystyk_ma_widoczny_prefiks() {
+        let st = stan_z_tekstem("Prędkość: 12.5 MB/s");
+        let mut ts = TableState::default();
+        ts.select(Some(0));
+
+        let widok = ekran(&wyrenderuj(70, 10, |f| draw_side_stats_panel(f, &st, f.area(), &mut ts, false)));
+        assert!(widok.contains("❯"), "zaznaczenie musi być widoczne niezależnie od fokusu:\n{}", widok);
+    }
+
+    /// `selected()` poza aktualną liczbą wierszy (np. `side_texts` się
+    /// skurczyło między klatkami) nie może panikować.
+    #[test]
+    fn test_zaznaczenie_statystyk_poza_zakresem_nie_panikuje() {
+        let st = stan_z_tekstem("Prędkość: 12.5 MB/s");
+        let mut ts = TableState::default();
+        ts.select(Some(999));
+
+        let _ = wyrenderuj(70, 10, |f| draw_side_stats_panel(f, &st, f.area(), &mut ts, true));
+    }
+
+    #[test]
+    fn test_tytul_panelu_sciezek_odzwierciedla_fokus() {
+        let st = PhaseUIState::new("x", "t", "k", "o");
+
+        let bez_fokusu = ekran(&wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut TableState::default(), false)));
+        assert!(bez_fokusu.contains("Tab"), "widok:\n{}", bez_fokusu);
+
+        let z_fokusem = ekran(&wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut TableState::default(), true)));
+        assert!(z_fokusem.contains("aktywny"), "widok:\n{}", z_fokusem);
+    }
+
+    #[test]
+    fn test_zaznaczone_zrodlo_ma_widoczny_prefiks() {
+        let st = PhaseUIState::new("x", "t", "k", "o");
+        let mut ts = TableState::default();
+        ts.select(Some(1));
+
+        let widok = ekran(&wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut ts, false)));
+        assert!(widok.contains("❯"), "zaznaczenie musi być widoczne niezależnie od fokusu:\n{}", widok);
+    }
+
+    #[test]
+    fn test_zaznaczenie_sciezek_poza_zakresem_nie_panikuje() {
+        let st = PhaseUIState::new("x", "t", "k", "o");
+        let mut ts = TableState::default();
+        ts.select(Some(999));
+
+        let _ = wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut ts, true));
     }
 }
