@@ -190,8 +190,10 @@ fn draw_reports_edit(f: &mut Frame, u: &Ustawienia, phase: &str, selected: usize
 // ============================================================================
 
 /// Wylicza wyśrodkowany prostokąt o zadanym procencie szerokości/wysokości
-/// ekranu — standardowy idiom popupów w Ratatui.
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+/// ekranu — standardowy idiom popupów w Ratatui. `pub(crate)`, żeby inne
+/// nakładki (np. `scanner_panel::draw_opis_popup`) mogły użyć tej samej
+/// geometrii zamiast duplikować ją u siebie.
+pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

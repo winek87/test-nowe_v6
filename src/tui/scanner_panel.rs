@@ -10,11 +10,12 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
 use crate::tui::hardware_panel::KOLOR_FOKUSU;
+use crate::tui::settings_screen::centered_rect;
 use crate::tui::state::PhaseUIState;
 
 // ============================================================================
@@ -194,10 +195,12 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// [`MAKS_SZEROKOSC_ETYKIETY`]), a cała reszta idzie na wartości, które są
 /// ZAWIJANE przez [`wrap_line`], a nie przycinane. Dzięki temu treść rośnie w
 /// dół, zamiast znikać za prawą krawędzią wąskiego terminala.
-/// Rysuje panel statystyk "Aktywny Skaner (Live)". Fokusowalny klawiszem Tab
-/// na ekranie fazy na żywo — patrz dokumentacja `hardware_panel::draw_disks_panel`
-/// dla wyjaśnienia `table_state`/`focused` (ten sam wzorzec).
-pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, table_state: &mut TableState, focused: bool) {
+/// Paruje `state.side_texts` na wiersze gotowe do renderowania. Wydzielona
+/// z [`draw_side_stats_panel`], żeby [`etykieta_wiersza`] mogła znać etykietę
+/// zaznaczonego wiersza (np. do wyjaśnienia po Enter, patrz
+/// `crate::opisy_anomalii`) BEZ duplikowania tej samej logiki parsowania —
+/// jedno źródło prawdy dla „co panel pokazuje" i „co panel ma na wierszu N".
+fn buduj_wiersze(state: &PhaseUIState) -> Vec<WierszPanelu> {
     let mut wiersze: Vec<WierszPanelu> = Vec::new();
 
     for block in &state.side_texts {
@@ -217,7 +220,7 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, ta
             if let Some((label, value)) = line.split_once(": ") {
                 let trimmed_label = label.trim().to_string();
                 let mut lines = Vec::new();
-                
+
                 if trimmed_label.starts_with("Top ") {
                     let parts: Vec<&str> = value.trim().split(", ").collect();
                     for (i, part) in parts.iter().enumerate() {
@@ -236,7 +239,7 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, ta
                 } else {
                     lines.push(parse_colored_value(value.trim()));
                 }
-                
+
                 wiersze.push(WierszPanelu::Para(trimmed_label, lines));
             } else {
                 wiersze.push(WierszPanelu::Luzna(line.to_string()));
@@ -247,6 +250,56 @@ pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, ta
     if wiersze.is_empty() {
         wiersze.push(WierszPanelu::Luzna("Oczekiwanie na dane telemetryczne...".to_string()));
     }
+
+    wiersze
+}
+
+/// Etykieta wiersza pod danym indeksem (jak by go zobaczył operator w
+/// panelu), do użytku poza renderem — np. wyszukanie wyjaśnienia po
+/// naciśnięciu Enter na zaznaczonym wierszu. `None` dla nagłówków sekcji,
+/// luźnych linii (bez dwukropka) i indeksu poza zakresem — te przypadki nie
+/// mają etykiety w sensie "Etykieta: Wartość", więc bezpiecznie nic się nie
+/// dzieje, zamiast szukać wyjaśnienia dla czegoś, co go nie ma.
+pub fn etykieta_wiersza(state: &PhaseUIState, indeks: usize) -> Option<String> {
+    match buduj_wiersze(state).into_iter().nth(indeks) {
+        Some(WierszPanelu::Para(etykieta, _)) => Some(etykieta),
+        _ => None,
+    }
+}
+
+/// Rysuje nakładkę z wyjaśnieniem etykiety wiersza (Enter na zaznaczonym
+/// wierszu "Aktywny Skaner Live", patrz `crate::opisy_anomalii` i
+/// `menu::actions::run_phase_z_opcjami`). Ten sam idiom co popupy
+/// `settings_screen.rs` (`centered_rect` + `Clear` + `Paragraph` w `Block`),
+/// z jedną różnicą: treść wyjaśnienia bywa dłuższa niż jedna linia, więc
+/// dostaje `Wrap` zamiast pozostać nieprzycięta.
+pub fn draw_opis_popup(f: &mut Frame, area: Rect, etykieta: &str, wyjasnienie: &str) {
+    let popup_area = centered_rect(60, 40, area);
+    f.render_widget(Clear, popup_area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(wyjasnienie.to_string(), Style::default().fg(Color::White))),
+        Line::from(""),
+        Line::from(Span::styled("[ENTER]/[ESC] Zamknij", Style::default().fg(Color::DarkGray))),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", etykieta))
+                .border_style(Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD)),
+        );
+    f.render_widget(paragraph, popup_area);
+}
+
+/// Rysuje panel statystyk "Aktywny Skaner (Live)". Fokusowalny klawiszem Tab
+/// na ekranie fazy na żywo — patrz dokumentacja `hardware_panel::draw_disks_panel`
+/// dla wyjaśnienia `table_state`/`focused` (ten sam wzorzec).
+pub fn draw_side_stats_panel(f: &mut Frame, state: &PhaseUIState, area: Rect, table_state: &mut TableState, focused: bool) {
+    let wiersze = buduj_wiersze(state);
 
     // Zatrzask WEWNĄTRZ funkcji, nie w wywołującym: liczba wierszy tego
     // panelu wynika z parsowania `state.side_texts` WYŻEJ (nagłówki, pary
@@ -862,5 +915,56 @@ mod tests {
         ts.select(Some(999));
 
         let _ = wyrenderuj(90, 10, |f| draw_bottom_paths_panel(f, &st, f.area(), &mut ts, true));
+    }
+
+    // ------------------------------------------------------------------
+    // ETYKIETA WIERSZA I NAKŁADKA WYJAŚNIENIA (Enter na "Aktywny Skaner Live")
+    // ------------------------------------------------------------------
+
+    fn stan_anomalii() -> PhaseUIState {
+        stan_z_tekstem("[Anomalie pierwszego klastra]\nPrzesunięty nagłówek: 2\nNull-padding: 0")
+    }
+
+    #[test]
+    fn test_etykieta_wiersza_zwraca_etykiete_pary() {
+        let st = stan_anomalii();
+        // indeks 0 = nagłówek "[Anomalie pierwszego klastra]", 1 = pierwsza para
+        assert_eq!(etykieta_wiersza(&st, 1).as_deref(), Some("Przesunięty nagłówek"));
+        assert_eq!(etykieta_wiersza(&st, 2).as_deref(), Some("Null-padding"));
+    }
+
+    #[test]
+    fn test_etykieta_wiersza_nagłówka_sekcji_to_none() {
+        let st = stan_anomalii();
+        assert_eq!(etykieta_wiersza(&st, 0), None, "wiersz [Anomalie pierwszego klastra] to nagłówek, nie para etykieta:wartość");
+    }
+
+    #[test]
+    fn test_etykieta_wiersza_poza_zakresem_to_none() {
+        let st = stan_anomalii();
+        assert_eq!(etykieta_wiersza(&st, 999), None);
+    }
+
+    #[test]
+    fn test_etykieta_wiersza_luznej_linii_to_none() {
+        let st = stan_z_tekstem("linia bez dwukropka");
+        assert_eq!(etykieta_wiersza(&st, 0), None);
+    }
+
+    #[test]
+    fn test_nakladka_opisu_pokazuje_tytul_i_tresc() {
+        let widok = ekran(&wyrenderuj(80, 24, |f| {
+            draw_opis_popup(f, f.area(), "Przesunięty nagłówek", "Sygnatura pliku znaleziona nie na początku klastra.")
+        }));
+        assert!(widok.contains("Przesunięty nagłówek"), "widok:\n{}", widok);
+        assert!(widok.contains("Sygnatura pliku"), "widok:\n{}", widok);
+        assert!(widok.contains("Zamknij"), "widok:\n{}", widok);
+    }
+
+    #[test]
+    fn test_nakladka_opisu_nie_panikuje_na_skrajnych_rozmiarach() {
+        for (szer, wys) in [(1u16, 1u16), (10, 3), (20, 5), (200, 60)] {
+            let _ = wyrenderuj(szer, wys, |f| draw_opis_popup(f, f.area(), "X", "długi tekst wyjaśnienia ".repeat(20).as_str()));
+        }
     }
 }
