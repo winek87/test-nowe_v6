@@ -287,9 +287,14 @@ fn sprawdz_crc_elementu(dane: &[u8], tresc_od: usize, koniec: usize) -> Option<b
 /// Rozbiera plik na elementy najwyższego poziomu wewnątrz `Segment`.
 ///
 /// Zwraca `(offset_treści_segmentu, deklarowany_rozmiar_segmentu, elementy)`.
-/// Przejście kończy się na pierwszym elemencie, który nie mieści się w danych —
-/// taki element trafia na listę oznaczony `spojny = false`, żeby indeksy obu
-/// kopii dało się zestawić ze sobą.
+/// Przejście kończy się na pierwszym elemencie, który nie mieści się w danych,
+/// którego nagłówek (VINT identyfikatora/rozmiaru) nie daje się odczytać, albo
+/// który ma jawnie zadeklarowany "nieznany" rozmiar wg EBML — KAŻDA z tych
+/// ścieżek dopisuje na listę SENTINEL oznaczony `spojny = false` przed
+/// przerwaniem. Dzięki temu konsumenci (`wszystkie_crc_zgodne`, `splice_mkv`)
+/// zawsze widzą jawny sygnał "dalsza treść Segmentu jest niepewna", zamiast
+/// listy, która milcząco wygląda jak kompletna, naturalnie zakończona
+/// enumeracja — patrz todo.video_container_repair.md, Ustalenie 4.1.
 pub fn dzieci_segmentu(dane: &[u8]) -> Option<(usize, u64, Vec<ElementSegmentu>)> {
     let (id, dl_id, _) = czytaj_vint(dane, 0, false)?;
     if id != ID_NAGLOWKA_EBML {
@@ -316,15 +321,54 @@ pub fn dzieci_segmentu(dane: &[u8]) -> Option<(usize, u64, Vec<ElementSegmentu>)
     let mut elementy = Vec::new();
     let mut p = tresc_od;
 
+    // REGRESJA (todo.video_container_repair.md, Ustalenie 4.1): każda z
+    // czterech ścieżek `break` w pętli niżej (VINT identyfikatora
+    // nieparsowalny, VINT rozmiaru nieparsowalny, rozmiar jawnie "nieznany"
+    // wg EBML, przepełnienie arytmetyczne przy liczeniu końca) kończyła
+    // enumerację BEZ ŻADNEGO ŚLADU na liście `elementy` — lista wyglądała
+    // identycznie jak przy naturalnym, kompletnym zakończeniu Segmentu.
+    // `wszystkie_crc_zgodne`/`splice_mkv` sprawdzają WYŁĄCZNIE to, co
+    // faktycznie trafiło na listę, więc mogły przyznać "gwarancję MOCNĄ"
+    // (albo poprawnie złożyć wynik), nigdy nie sprawdzając/nie kopiując
+    // treści leżącej DALEJ niż to miejsce — w tym `Cluster`, czyli faktyczny
+    // materiał audio/wideo. Każda z tych czterech ścieżek teraz dopisuje
+    // sentinel (`spojny: false`) przed przerwaniem, dokładnie tak jak już
+    // robiła piąta, jedyna dotąd oznaczana ścieżka ("element zadeklarowany,
+    // ale nie mieści się w buforze", kilka linii niżej).
+    let sentinel_niekompletny = |id: u64, p: usize| ElementSegmentu {
+        id,
+        offset: p,
+        dlugosc_calkowita: dane.len().saturating_sub(p),
+        spojny: false,
+        crc_ok: None,
+    };
+
     while p < deklarowany_koniec {
-        let Some((eid, dle, _)) = czytaj_vint(dane, p, false) else { break };
-        let Some((rozm, dlr, niezn)) = czytaj_vint(dane, p + dle, true) else { break };
+        let Some((eid, dle, _)) = czytaj_vint(dane, p, false) else {
+            elementy.push(sentinel_niekompletny(0, p));
+            break;
+        };
+        let Some((rozm, dlr, niezn)) = czytaj_vint(dane, p + dle, true) else {
+            elementy.push(sentinel_niekompletny(eid, p));
+            break;
+        };
         if niezn {
+            // Element o LEGALNIE zadeklarowanym nieznanym rozmiarze (EBML
+            // unknown-size, np. `Cluster` pisany "na żywo") — częsta,
+            // prawidłowa cecha formatu, nie uszkodzenie. Mimo to nie umiemy
+            // tu wyliczyć jego prawdziwego końca (wymagałoby przeszukania w
+            // poszukiwaniu kolejnego rodzeństwa na tym poziomie) — sentinel
+            // poprawnie sygnalizuje "reszta Segmentu jest niepewna", zamiast
+            // milcząco kończyć listę tak, jakby to był naturalny koniec.
+            elementy.push(sentinel_niekompletny(eid, p));
             break;
         }
 
         let tresc = p + dle + dlr;
-        let Some(koniec) = tresc.checked_add(rozm as usize) else { break };
+        let Some(koniec) = tresc.checked_add(rozm as usize) else {
+            elementy.push(sentinel_niekompletny(eid, p));
+            break;
+        };
         let spojny = koniec <= dane.len();
 
         elementy.push(ElementSegmentu {
@@ -368,14 +412,25 @@ fn uzyteczny(e: &ElementSegmentu) -> bool {
 /// żaden offset się nie przesuwa. To ta sama zasada, na której stoi przeszczep
 /// HEIC (`heic_clone`).
 ///
-/// ## Kiedy odmawia
+/// ## Kiedy odmawia CAŁKOWICIE (`None`)
 ///
 /// - któraś strona nie ma czytelnego nagłówka EBML albo `Segment`,
 /// - kopie deklarują różny rozmiar `Segment` lub różny układ nagłówka (to nie
 ///   są dwa odzyski tego samego pliku),
 /// - na tej samej pozycji stoją elementy o różnych identyfikatorach lub
 ///   długościach (struktury się rozjechały — nie realignujemy),
-/// - TEN SAM element jest niezdatny po OBU stronach.
+/// - żaden pojedynczy element nie dał się złożyć (patrz niżej — nie ma czego
+///   zwrócić).
+///
+/// ## Kiedy OBCINA wynik zamiast odmawiać
+///
+/// Gdy TEN SAM element jest niezdatny po OBU stronach (obie kopie
+/// niespójne/zła suma CRC, albo jedna strona w ogóle nie ma tylu elementów) —
+/// dokładnie ten sam wzorzec "obetnij i zachowaj" co `splice_flv`. Struktura
+/// obu kopii zgadzała się aż do tej pozycji, więc to, co już złożono, jest w
+/// pełni wiarygodne — utrata WSZYSTKICH wcześniej złożonych elementów tylko
+/// dlatego, że jeden konkretny (często ostatni, gdzie oba odzyski bywają
+/// uszkodzone jednocześnie) nie dał się dopasować, byłaby nieproporcjonalna.
 pub fn splice_mkv(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
     let (tresc_a, rozmiar_a, dzieci_a) = dzieci_segmentu(bytes_a)?;
     let (tresc_b, rozmiar_b, dzieci_b) = dzieci_segmentu(bytes_b)?;
@@ -390,6 +445,7 @@ pub fn splice_mkv(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
     // Nagłówek bierzemy ze strony A - obie sparsowały się identycznie, co
     // właśnie sprawdziliśmy porównaniem offsetu treści i rozmiaru `Segment`.
     let mut wynik = bytes_a.get(..tresc_a)?.to_vec();
+    let mut elementow = 0usize;
 
     let ile = dzieci_a.len().max(dzieci_b.len());
     for i in 0..ile {
@@ -402,14 +458,28 @@ pub fn splice_mkv(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
 
+        // REGRESJA (todo.video_container_repair.md, Ustalenie 4.2): brak
+        // użytecznego kandydata na TEJ pozycji (obie strony niespójne albo
+        // zła suma CRC, albo jedna strona w ogóle nie ma tylu elementów)
+        // kiedyś porzucał CAŁY dotąd złożony wynik przez `return None` —
+        // tracąc WSZYSTKIE poprawnie złożone wcześniej elementy, nie tylko
+        // resztę od tego miejsca. Ten sam wzorzec "obetnij i zachowaj" co
+        // `splice_flv` (`(None, None) => break`) — struktura obu kopii
+        // zgadzała się aż do tej pozycji (sprawdzone wyżej), więc to, co już
+        // złożono, jest w pełni wiarygodne.
         let wybrany = match (a, b) {
             (Some(ea), _) if uzyteczny(ea) => (ea, bytes_a),
             (_, Some(eb)) if uzyteczny(eb) => (eb, bytes_b),
-            _ => return None,
+            _ => break,
         };
 
         let (e, zrodlo) = wybrany;
         wynik.extend_from_slice(zrodlo.get(e.offset..e.offset + e.dlugosc_calkowita)?);
+        elementow += 1;
+    }
+
+    if elementow == 0 {
+        return None;
     }
 
     Some(wynik)
@@ -856,6 +926,35 @@ mod tests {
         assert!(dzieci.iter().all(|e| e.spojny));
     }
 
+    /// REGRESJA (todo.video_container_repair.md, Ustalenie 4.1): element o
+    /// LEGALNIE zadeklarowanym nieznanym rozmiarze EBML (`Cluster` pisany "na
+    /// żywo" to typowy, prawdziwy przykład) w ŚRODKU Segmentu musi zostawić
+    /// jawny sentinel (`spojny: false`) na liście — nie kończyć enumeracji po
+    /// cichu, tak jakby to był naturalny, kompletny koniec Segmentu.
+    #[test]
+    fn test_dzieci_segmentu_element_o_nieznanym_rozmiarze_zostawia_sentinel() {
+        let mut zawartosc = element(ID_INFO, &tresc_z_crc(b"informacje", true)); // pierwszy element - poprawna suma CRC
+        zawartosc.extend_from_slice(ID_TRACKS); // drugi element: ID + rozmiar NIEZNANY (0xFF)
+        zawartosc.push(0xFF);
+        zawartosc.extend_from_slice(b"tresc ktora nigdy nie zostanie zobaczona");
+
+        let mut plik = element(&[0x1A, 0x45, 0xDF, 0xA3], &[0u8; 4]);
+        plik.extend(element(&[0x18, 0x53, 0x80, 0x67], &zawartosc));
+
+        let (_, _, dzieci) = dzieci_segmentu(&plik).expect("plik musi się rozebrać");
+
+        assert_eq!(dzieci.len(), 2, "sentinel elementu o nieznanym rozmiarze musi trafić na listę, nie ucinać ją po cichu");
+        assert!(dzieci[0].spojny, "pierwszy element jest w pełni poprawny i spójny");
+        assert!(!dzieci[1].spojny, "element o nieznanym rozmiarze musi być oznaczony jako niespójny (sentinel)");
+
+        // To bezpośrednio zamyka Ustalenie 4.1: bez sentinela ta funkcja
+        // wróciłaby `Some(true)`, patrząc TYLKO na pierwszy element.
+        assert_eq!(
+            wszystkie_crc_zgodne(&plik), Some(false),
+            "sentinel musi obniżyć werdykt \"gwarancja MOCNA\" na false, nie pozwolić mu przejść na podstawie samych wcześniejszych elementów"
+        );
+    }
+
     /// Sedno mechanizmu: o wyborze decyduje SUMA, nie kolejność stron.
     #[test]
     fn test_suma_crc_decyduje_z_ktorej_kopii_wziac_element() {
@@ -873,15 +972,34 @@ mod tests {
         assert_eq!(wynik2, b, "zdrowa wersja wygrywa niezależnie od tego, po której stronie leży");
     }
 
+    /// REGRESJA (todo.video_container_repair.md, Ustalenie 4.2): element
+    /// niezdatny po OBU stronach musi OBCIĄĆ wynik w tym miejscu i zachować
+    /// wszystko, co złożono wcześniej — nie skasować całego dotychczasowego
+    /// dorobku. Struktura obu kopii zgadzała się aż do tej pozycji (INFO na
+    /// obu jest identyczne i poprawne), więc INFO musi przetrwać, mimo że
+    /// TRACKS (niezdatny po obu stronach) się nie złoży.
     #[test]
-    fn test_element_zepsuty_po_obu_stronach_blokuje_skladanie() {
+    fn test_element_zepsuty_po_obu_stronach_obcina_wynik_zamiast_go_kasowac() {
         let a = zbuduj_mkv(&[(ID_INFO, b"informacje", true), (ID_TRACKS, b"sciezki", false)]);
         let b = zbuduj_mkv(&[(ID_INFO, b"informacje", true), (ID_TRACKS, b"sciezki", false)]);
 
-        assert!(
-            splice_mkv(&a, &b).is_none(),
-            "nie ma z czego wybrać - składanie musi odmówić, a nie zapisać uszkodzony element"
+        let wynik = splice_mkv(&a, &b).expect(
+            "element niezdatny po obu stronach nie może skasować już poprawnie złożonych wcześniejszych elementów"
         );
+        let zawiera = |dane: &[u8], wzorzec: &[u8]| dane.windows(wzorzec.len()).any(|w| w == wzorzec);
+        assert!(zawiera(&wynik, b"informacje"), "poprawnie złożony wcześniejszy element (INFO) musi przetrwać obcięcie");
+        assert!(!zawiera(&wynik, b"sciezki"), "element niezdatny po obu stronach (TRACKS) nie może trafić do wyniku");
+    }
+
+    /// Kontrola pozytywna dla powyższego: gdy NIC nie da się złożyć (jedyny
+    /// element jest niezdatny po obu stronach), wynik musi pozostać `None`,
+    /// nie pusty/samo-nagłówkowy `Some`.
+    #[test]
+    fn test_wszystkie_elementy_zepsute_po_obu_stronach_daje_none() {
+        let a = zbuduj_mkv(&[(ID_TRACKS, b"sciezki", false)]);
+        let b = zbuduj_mkv(&[(ID_TRACKS, b"sciezki", false)]);
+
+        assert!(splice_mkv(&a, &b).is_none(), "gdy nic nie da się złożyć, wynik musi być None, nie pusty Some");
     }
 
     /// Rozjazd układu: na tej samej pozycji stoją elementy o różnej długości.
