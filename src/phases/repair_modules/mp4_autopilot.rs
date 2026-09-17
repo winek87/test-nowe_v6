@@ -248,7 +248,7 @@ mod tests {
             eof_ok: None,
             match_type: None,
             video_ok,
-            structure_ok: None,
+            structure_ok: None, media_decoded: None,
         }
     }
 

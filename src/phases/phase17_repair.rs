@@ -148,6 +148,9 @@ pub(crate) struct RepairTask {
     /// Wynik walidacji struktury archiwum z Fazy 11 dla TEJ strony — sygnał
     /// dla modułów naprawy ZIP i TAR (patrz `repair_modules::zip` i `::tar`).
     structure_ok: Option<bool>,
+    /// Wynik PEŁNEGO dekodowania z Fazy 13 dla TEJ strony — patrz
+    /// dokumentacja `RepairContext::media_decoded`.
+    media_decoded: Option<bool>,
 }
 
 impl RepairTask {
@@ -161,6 +164,7 @@ impl RepairTask {
             match_type: self.match_type.as_deref(),
             video_ok: self.video_ok,
             structure_ok: self.structure_ok,
+            media_decoded: self.media_decoded,
         }
     }
 }
@@ -690,8 +694,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 f.eof_ok_ufs, f.eof_ok_script,
                 f.video_ok_ufs, f.video_ok_script,
                 f.structure_ok_ufs, f.structure_ok_script,
+                f.media_decoded_ufs, f.media_decoded_script,
                 a.match_type, a.twin_file_path
-         FROM files f 
+         FROM files f
          LEFT JOIN phase14_analysis a ON f.id = a.file_id
          WHERE f.phase17_done = 0 OR f.phase17_done IS NULL"
     )?;
@@ -708,34 +713,35 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             row.get::<_, Option<bool>>(10)?, row.get::<_, Option<bool>>(11)?,
             row.get::<_, Option<bool>>(12)?, row.get::<_, Option<bool>>(13)?,
             row.get::<_, Option<bool>>(14)?, row.get::<_, Option<bool>>(15)?,
-            row.get::<_, Option<String>>(16)?, row.get::<_, Option<String>>(17)?
+            row.get::<_, Option<bool>>(16)?, row.get::<_, Option<bool>>(17)?,
+            row.get::<_, Option<String>>(18)?, row.get::<_, Option<String>>(19)?
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel, in_ufs, in_scr, m_rs_u, m_rs_s, utf_u, utf_s, one_u, one_s, eof_u, eof_s, vid_u, vid_s, str_u, str_s, match_type, twin) = r;
+        let (id, rel, in_ufs, in_scr, m_rs_u, m_rs_s, utf_u, utf_s, one_u, one_s, eof_u, eof_s, vid_u, vid_s, str_u, str_s, dec_u, dec_s, match_type, twin) = r;
         let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
         if in_ufs {
-            let ctx = RepairContext { ext: &ext, media_reason: m_rs_u.as_deref(), utf8_ok: utf_u, is_oneliner: one_u, eof_ok: eof_u, match_type: match_type.as_deref(), video_ok: vid_u, structure_ok: str_u };
+            let ctx = RepairContext { ext: &ext, media_reason: m_rs_u.as_deref(), utf8_ok: utf_u, is_oneliner: one_u, eof_ok: eof_u, match_type: match_type.as_deref(), video_ok: vid_u, structure_ok: str_u, media_decoded: dec_u };
             if active_modules.iter().any(|m| m.applies_to(&ctx)) {
                 repair_tasks.push(RepairTask {
                     id, rel_path: rel.clone(), side: "ufs", ext: ext.clone(),
                     media_reason: m_rs_u, utf8_ok: utf_u, is_oneliner: one_u, eof_ok: eof_u,
                     match_type: match_type.clone(), twin_path: twin.clone(),
-                    video_ok: vid_u, structure_ok: str_u,
+                    video_ok: vid_u, structure_ok: str_u, media_decoded: dec_u,
                 });
             }
         }
 
         if in_scr {
-            let ctx = RepairContext { ext: &ext, media_reason: m_rs_s.as_deref(), utf8_ok: utf_s, is_oneliner: one_s, eof_ok: eof_s, match_type: match_type.as_deref(), video_ok: vid_s, structure_ok: str_s };
+            let ctx = RepairContext { ext: &ext, media_reason: m_rs_s.as_deref(), utf8_ok: utf_s, is_oneliner: one_s, eof_ok: eof_s, match_type: match_type.as_deref(), video_ok: vid_s, structure_ok: str_s, media_decoded: dec_s };
             if active_modules.iter().any(|m| m.applies_to(&ctx)) {
                 repair_tasks.push(RepairTask {
                     id, rel_path: rel.clone(), side: "script", ext,
                     media_reason: m_rs_s, utf8_ok: utf_s, is_oneliner: one_s, eof_ok: eof_s,
                     match_type, twin_path: twin,
-                    video_ok: vid_s, structure_ok: str_s,
+                    video_ok: vid_s, structure_ok: str_s, media_decoded: dec_s,
                 });
             }
         }
@@ -1132,6 +1138,7 @@ mod tests {
             id: 1, rel_path: "a.bin".to_string(), side: "ufs", ext: "bin".to_string(),
             media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None,
             match_type: None, twin_path: None, video_ok: None, structure_ok: None,
+            media_decoded: None,
         };
         let tasks = vec![task];
 

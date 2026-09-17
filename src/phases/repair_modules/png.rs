@@ -38,11 +38,15 @@ use std::path::{Path, PathBuf};
 /// Rozstrzyga, czy plik jest uszkodzonym PNG-iem.
 ///
 /// Przesłanki uszkodzenia: powód z Fazy 12 zawierający `"Nagłówek"` albo brak
-/// znacznika końca z Fazy 6. Druga jest dla PNG szczególnie trafna — `IEND`
-/// jest właśnie takim znacznikiem, a jego brak to jeden z przypadków, które
-/// [`PngSanitizeModule`] naprawia wprost.
+/// znacznika końca z Fazy 6, albo nieudane pełne dekodowanie z Fazy 13
+/// (`media_decoded == Some(false)`). Druga jest dla PNG szczególnie trafna —
+/// `IEND` jest właśnie takim znacznikiem, a jego brak to jeden z przypadków,
+/// które [`PngSanitizeModule`] naprawia wprost.
 fn jest_uszkodzonym_png(ctx: &RepairContext) -> bool {
-    ctx.ext == "png" && (ctx.eof_ok == Some(false) || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek")))
+    ctx.ext == "png"
+        && (ctx.eof_ok == Some(false)
+            || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+            || ctx.media_decoded == Some(false))
 }
 
 /// Weryfikacja przez realne dekodowanie pikseli — gwarancja MOCNA.
@@ -162,7 +166,7 @@ mod tests {
     fn ctx(ext: &'static str, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
             ext, media_reason, utf8_ok: None, is_oneliner: None,
-            eof_ok, match_type: None, video_ok: None, structure_ok: None
+            eof_ok, match_type: None, video_ok: None, structure_ok: None, media_decoded: None
         }
     }
 
@@ -180,6 +184,19 @@ mod tests {
     #[test]
     fn test_reaguja_na_powod_z_fazy12() {
         let kontekst = ctx("png", None, Some("Zniszczony Nagłówek obrazu"));
+        assert!(PngCloneModule.applies_to(&kontekst));
+        assert!(PngSanitizeModule.applies_to(&kontekst));
+    }
+
+    /// Nagłówek formalnie poprawny, ale Faza 13 nie zdołała zdekodować —
+    /// oba moduły muszą zareagować na ten sygnał samodzielnie.
+    #[test]
+    fn test_reaguja_na_nieudane_dekodowanie_z_fazy13() {
+        let kontekst = RepairContext {
+            ext: "png", media_reason: None, utf8_ok: None, is_oneliner: None,
+            eof_ok: None, match_type: None, video_ok: None, structure_ok: None,
+            media_decoded: Some(false),
+        };
         assert!(PngCloneModule.applies_to(&kontekst));
         assert!(PngSanitizeModule.applies_to(&kontekst));
     }

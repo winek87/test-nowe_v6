@@ -495,6 +495,16 @@ pub struct RepairContext<'a> {
     /// Powód anomalii z Fazy 12 (`media_reason_ufs`/`_script`), np. zawiera
     /// `"Fałszywe"` lub `"Nagłówek"`.
     pub media_reason: Option<&'a str>,
+    /// Wynik PEŁNEGO dekodowania z Fazy 13 (`media_decoded_ufs`/`_script`) —
+    /// SILNIEJSZY sygnał niż `media_reason`: ten ostatni to tylko diagnoza
+    /// nagłówka/metadanych (Faza 12), podczas gdy to pole mówi, czy plik
+    /// FAKTYCZNIE dał się wyrenderować (dekoder `image`/`rawloader`/`libheif`
+    /// rzeczywiście przetworzył piksele). `Some(false)` łapie przypadki, w
+    /// których nagłówek jest formalnie poprawny, ale zawartość i tak jest
+    /// nie do odzyskania (Gray Banding, ucięty strumień danych po poprawnym
+    /// nagłówku) — coś, czego sam `media_reason` nie wykrywa, bo nie sprawdza
+    /// samej treści, tylko strukturę.
+    pub media_decoded: Option<bool>,
     /// Wynik walidacji UTF-8 z Fazy 10 (`utf8_ok_ufs`/`_script`).
     pub utf8_ok: Option<bool>,
     /// Flaga one-linera z Fazy 10 (`is_oneliner_ufs`/`_script`).
@@ -993,7 +1003,7 @@ mod tests {
         let p = zapisz(dir.path(), "smieci.png", b"to nie png");
         let ctx = RepairContext {
             ext: "png", media_reason: None, utf8_ok: None,
-            is_oneliner: None, eof_ok: None, match_type: None, video_ok: None, structure_ok: None
+            is_oneliner: None, eof_ok: None, match_type: None, video_ok: None, structure_ok: None, media_decoded: None
         };
 
         for modul in all_modules() {

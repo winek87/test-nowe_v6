@@ -36,8 +36,9 @@ pub struct HeicCloneModule;
 /// diagnostyka Fazy 13 i weryfikacja wyniku.
 ///
 /// Sygnał uszkodzenia: powód z Fazy 12 zawierający `"Nagłówek"` albo brak
-/// znacznika końca z Fazy 6. Faza 19 nie dotyczy HEIC (to nie jest wideo),
-/// więc `video_ok` tu nie pomaga.
+/// znacznika końca z Fazy 6, albo nieudane pełne dekodowanie z Fazy 13
+/// (`media_decoded == Some(false)`). Faza 19 nie dotyczy HEIC (to nie jest
+/// wideo), więc `video_ok` tu nie pomaga.
 fn jest_uszkodzonym_heic(ctx: &RepairContext) -> bool {
     // `is_heic_extension` oczekuje nazwy pliku, a `ctx.ext` to samo
     // rozszerzenie bez kropki — doklejamy ją, żeby dopasowanie działało.
@@ -45,7 +46,9 @@ fn jest_uszkodzonym_heic(ctx: &RepairContext) -> bool {
         return false;
     }
 
-    ctx.eof_ok == Some(false) || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+    ctx.eof_ok == Some(false)
+        || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+        || ctx.media_decoded == Some(false)
 }
 
 impl RepairModule for HeicCloneModule {
@@ -157,7 +160,7 @@ mod tests {
     fn ctx(ext: &'static str, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
             ext, media_reason, utf8_ok: None, is_oneliner: None,
-            eof_ok, match_type: None, video_ok: None, structure_ok: None
+            eof_ok, match_type: None, video_ok: None, structure_ok: None, media_decoded: None
         }
     }
 
@@ -178,6 +181,18 @@ mod tests {
     #[test]
     fn test_reaguje_na_powod_z_fazy12() {
         assert!(HeicCloneModule.applies_to(&ctx("heic", None, Some("Zniszczony Nagłówek obrazu"))));
+    }
+
+    /// Nagłówek formalnie poprawny, ale Faza 13 (libheif) nie zdołała
+    /// zdekodować — musi zareagować samodzielnie.
+    #[test]
+    fn test_reaguje_na_nieudane_dekodowanie_z_fazy13() {
+        let kontekst = RepairContext {
+            ext: "heic", media_reason: None, utf8_ok: None, is_oneliner: None,
+            eof_ok: None, match_type: None, video_ok: None, structure_ok: None,
+            media_decoded: Some(false),
+        };
+        assert!(HeicCloneModule.applies_to(&kontekst));
     }
 
     #[test]

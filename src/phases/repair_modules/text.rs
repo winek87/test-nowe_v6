@@ -51,34 +51,34 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_ctx() -> RepairContext<'static> {
-        RepairContext { ext: "txt", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None }
+        RepairContext { ext: "txt", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None }
     }
 
     #[test]
     fn test_applies_to_bad_utf8_txt() {
         let m = TextModule;
-        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: Some(false), is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: Some(false), is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.applies_to(&ctx));
     }
 
     #[test]
     fn test_applies_to_oneliner_py() {
         let m = TextModule;
-        let ctx = RepairContext { ext: "py", media_reason: None, utf8_ok: Some(true), is_oneliner: Some(true), eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "py", media_reason: None, utf8_ok: Some(true), is_oneliner: Some(true), eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_to_healthy_text() {
         let m = TextModule;
-        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: Some(true), is_oneliner: Some(false), eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: Some(true), is_oneliner: Some(false), eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_to_unrelated_extension() {
         let m = TextModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: None, utf8_ok: Some(false), is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: None, utf8_ok: Some(false), is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
     }
 

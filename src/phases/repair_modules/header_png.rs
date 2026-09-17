@@ -21,9 +21,12 @@ impl RepairModule for HeaderPngModule {
     fn display_name(&self) -> &'static str { "Nagłówek PNG (wstrzyknięcie sygnatury)" }
 
     /// Stosuje się do plików `.png`, dla których Faza 12 zgłosiła powód
-    /// zawierający `"Nagłówek"`.
+    /// zawierający `"Nagłówek"`, ALBO Faza 13 nie zdołała ich zdekodować
+    /// (`media_decoded == Some(false)`) — patrz `header_jpg` dla pełnego
+    /// uzasadnienia tego drugiego warunku.
     fn applies_to(&self, ctx: &RepairContext) -> bool {
-        ctx.ext == "png" && ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+        ctx.ext == "png"
+            && (ctx.media_reason.is_some_and(|r| r.contains("Nagłówek")) || ctx.media_decoded == Some(false))
     }
 
     /// Jeśli plik nie zaczyna się od standardowej sygnatury PNG, doklejana
@@ -57,21 +60,30 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_ctx() -> RepairContext<'static> {
-        RepairContext { ext: "png", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None }
+        RepairContext { ext: "png", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None }
     }
 
     #[test]
     fn test_applies_to_png_with_header_reason() {
         let m = HeaderPngModule;
-        let ctx = RepairContext { ext: "png", media_reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "png", media_reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_to_jpg() {
         let m = HeaderPngModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
+    }
+
+    /// Patrz analogiczny test w `header_jpg.rs` — ten sam silniejszy sygnał
+    /// z Fazy 13, niezależny od powodu z Fazy 12.
+    #[test]
+    fn test_applies_to_png_gdy_faza13_nie_zdekodowala() {
+        let m = HeaderPngModule;
+        let ctx = RepairContext { ext: "png", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None, video_ok: None, structure_ok: None, media_decoded: Some(false) };
+        assert!(m.applies_to(&ctx));
     }
 
     #[test]

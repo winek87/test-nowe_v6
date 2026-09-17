@@ -135,7 +135,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_ctx(match_type: Option<&'static str>) -> RepairContext<'static> {
-        RepairContext { ext: "bin", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type, video_ok: None, structure_ok: None }
+        RepairContext { ext: "bin", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type, video_ok: None, structure_ok: None, media_decoded: None }
     }
 
     #[test]

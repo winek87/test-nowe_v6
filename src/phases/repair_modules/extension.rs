@@ -86,14 +86,14 @@ mod tests {
     #[test]
     fn test_applies_to_fake_extension_reason_with_parseable_mime() {
         let m = ExtensionModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: video/mp4)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: video/mp4)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_without_fake_reason() {
         let m = ExtensionModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
     }
 
@@ -104,7 +104,7 @@ mod tests {
         std::fs::write(&path, b"tak naprawde to png").unwrap();
 
         let m = ExtensionModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: image/png)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: image/png)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         let (target, log) = m.repair(&path, &ctx, None, dir.path()).expect("naprawa powinna się powieść");
         assert!(target.to_string_lossy().ends_with("_repaired.png"));
         assert!(log.contains(".png"));
@@ -117,7 +117,7 @@ mod tests {
         std::fs::write(&path, b"cokolwiek").unwrap();
 
         let m = ExtensionModule;
-        let ctx = RepairContext { ext: "dat", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: application/octet-stream)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "dat", media_reason: Some("Fałszywe rozszerzenie (Wewnątrz to: application/octet-stream)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.repair(&path, &ctx, None, dir.path()).is_none());
     }
 
@@ -128,7 +128,7 @@ mod tests {
         std::fs::write(&path, b"cokolwiek").unwrap();
 
         let m = ExtensionModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.repair(&path, &ctx, None, dir.path()).is_none());
     }
 }

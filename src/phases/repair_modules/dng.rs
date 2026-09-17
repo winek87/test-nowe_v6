@@ -92,9 +92,13 @@ fn jest_nieodczytanym_dng(ctx: &RepairContext) -> bool {
         return false;
     }
 
-    // Faza 13 zapisuje przy nieudanym dekodowaniu powód zawierający
-    // "RAW/DNG"; brak znacznika końca z Fazy 6 to druga przesłanka.
-    ctx.eof_ok == Some(false) || ctx.media_reason.is_some_and(|r| r.contains("RAW"))
+    // Faza 12 zapisuje przy nieudanym dekodowaniu powód zawierający "RAW/DNG";
+    // brak znacznika końca z Fazy 6 to druga przesłanka; `media_decoded ==
+    // Some(false)` (Faza 13, silniejszy sygnał — realne, nieudane
+    // dekodowanie przez `rawloader`, nie tylko diagnoza nagłówka) to trzecia.
+    ctx.eof_ok == Some(false)
+        || ctx.media_reason.is_some_and(|r| r.contains("RAW"))
+        || ctx.media_decoded == Some(false)
 }
 
 impl RepairModule for DngStructuralModule {
@@ -182,7 +186,7 @@ mod tests {
     fn ctx(ext: &'static str, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
             ext, media_reason, utf8_ok: None, is_oneliner: None,
-            eof_ok, match_type: None, video_ok: None, structure_ok: None
+            eof_ok, match_type: None, video_ok: None, structure_ok: None, media_decoded: None
         }
     }
 
@@ -204,6 +208,20 @@ mod tests {
     #[test]
     fn test_kwalifikuje_po_braku_znacznika_konca() {
         assert!(DngStructuralModule.applies_to(&ctx("dng", Some(false), None)));
+    }
+
+    /// `media_decoded == Some(false)` (Faza 13, `rawloader` faktycznie nie
+    /// zdołał zdekodować) to TRZECIA, niezależna przesłanka — silniejsza niż
+    /// sam tekstowy powód z Fazy 12, bo potwierdza realne niepowodzenie
+    /// dekodera, nie tylko diagnozę nagłówka.
+    #[test]
+    fn test_kwalifikuje_po_nieudanym_dekodowaniu_z_fazy13() {
+        let kontekst = RepairContext {
+            ext: "dng", media_reason: None, utf8_ok: None, is_oneliner: None,
+            eof_ok: None, match_type: None, video_ok: None, structure_ok: None,
+            media_decoded: Some(false),
+        };
+        assert!(DngStructuralModule.applies_to(&kontekst));
     }
 
     #[test]
@@ -486,7 +504,7 @@ mod tests {
         for ext in ["dng", "nef", "cr2", "arw", "orf", "pef", "srw", "rw2"] {
             let k = RepairContext {
                 ext, media_reason: None, utf8_ok: None, is_oneliner: None,
-                eof_ok: Some(false), match_type: None, video_ok: None, structure_ok: None,
+                eof_ok: Some(false), match_type: None, video_ok: None, structure_ok: None, media_decoded: None,
             };
             assert!(
                 DngStructuralModule.applies_to(&k),
@@ -503,7 +521,7 @@ mod tests {
         for ext in ["cr3", "raf", "jpg", "mp4"] {
             let k = RepairContext {
                 ext, media_reason: None, utf8_ok: None, is_oneliner: None,
-                eof_ok: Some(false), match_type: None, video_ok: None, structure_ok: None,
+                eof_ok: Some(false), match_type: None, video_ok: None, structure_ok: None, media_decoded: None,
             };
             assert!(!DngStructuralModule.applies_to(&k), ".{} nie powinien być obsługiwany", ext);
         }

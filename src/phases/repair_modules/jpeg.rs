@@ -34,15 +34,20 @@ const ROZSZERZENIA: [&str; 2] = ["jpg", "jpeg"];
 /// Rozstrzyga, czy plik jest uszkodzonym JPEG-iem.
 ///
 /// Przesłanki uszkodzenia: powód z Fazy 12 zawierający `"Nagłówek"` albo brak
-/// znacznika końca z Fazy 6. Pierwsza łapie zniszczone tablice, druga plik
-/// ucięty — przeszczep pomaga w obu, bo w obu nagłówek bliźniaka jest
-/// wiarygodniejszy od tego, co zostało.
+/// znacznika końca z Fazy 6, albo nieudane pełne dekodowanie z Fazy 13
+/// (`media_decoded == Some(false)`) — łapie np. Gray Banding, gdzie nagłówek
+/// jest formalnie poprawny, ale dane skanu i tak nie do odzyskania. Pierwsze
+/// dwie łapią zniszczone tablice/plik ucięty — przeszczep pomaga we
+/// wszystkich trzech, bo nagłówek bliźniaka jest wiarygodniejszy od tego, co
+/// zostało.
 fn jest_uszkodzonym_jpeg(ctx: &RepairContext) -> bool {
     if !ROZSZERZENIA.contains(&ctx.ext) {
         return false;
     }
 
-    ctx.eof_ok == Some(false) || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+    ctx.eof_ok == Some(false)
+        || ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+        || ctx.media_decoded == Some(false)
 }
 
 impl RepairModule for JpegCloneModule {
@@ -110,7 +115,7 @@ mod tests {
     fn ctx(ext: &'static str, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
             ext, media_reason, utf8_ok: None, is_oneliner: None,
-            eof_ok, match_type: None, video_ok: None, structure_ok: None
+            eof_ok, match_type: None, video_ok: None, structure_ok: None, media_decoded: None
         }
     }
 
@@ -131,6 +136,19 @@ mod tests {
                 "rozszerzenie .{} musi być rozpoznane", ext
             );
         }
+    }
+
+    /// Nagłówek formalnie poprawny (`eof_ok`/`media_reason` czyste), ale
+    /// Faza 13 nie zdołała zdekodować (np. Gray Banding) — musi zadziałać
+    /// samodzielnie, niezależnie od pozostałych dwóch przesłanek.
+    #[test]
+    fn test_stosuje_sie_gdy_faza13_nie_zdekodowala() {
+        let kontekst = RepairContext {
+            ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None,
+            eof_ok: None, match_type: None, video_ok: None, structure_ok: None,
+            media_decoded: Some(false),
+        };
+        assert!(JpegCloneModule.applies_to(&kontekst));
     }
 
     #[test]

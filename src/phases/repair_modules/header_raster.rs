@@ -60,11 +60,12 @@ impl RepairModule for HeaderRasterModule {
     fn display_name(&self) -> &'static str { "Nagłówek GIF/BMP/TIFF/WEBP (wstrzyknięcie sygnatury)" }
 
     /// Ta sama bramka co w [`super::header_png`]: format z listy plus zgłoszony
-    /// przez Fazę 12 powód zawierający `"Nagłówek"`. Bez tego warunku moduł
-    /// próbowałby doklejać sygnaturę do plików uszkodzonych zupełnie inaczej.
+    /// przez Fazę 12 powód zawierający `"Nagłówek"`, ALBO nieudane pełne
+    /// dekodowanie z Fazy 13. Bez tego warunku moduł próbowałby doklejać
+    /// sygnaturę do plików uszkodzonych zupełnie inaczej.
     fn applies_to(&self, ctx: &RepairContext) -> bool {
         sygnatury_dla(ctx.ext).is_some()
-            && ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+            && (ctx.media_reason.is_some_and(|r| r.contains("Nagłówek")) || ctx.media_decoded == Some(false))
     }
 
     fn repair(
@@ -133,7 +134,7 @@ mod tests {
             eof_ok: None,
             match_type: None,
             video_ok: None,
-            structure_ok: None,
+            structure_ok: None, media_decoded: None,
         }
     }
 
@@ -160,6 +161,19 @@ mod tests {
         for ext in ["jpg", "jpeg", "png"] {
             assert!(!m.applies_to(&ctx(ext, Some("Zniszczony Nagłówek"))));
         }
+    }
+
+    /// Patrz analogiczny test w `header_jpg.rs` — ten sam silniejszy sygnał
+    /// z Fazy 13, niezależny od powodu z Fazy 12.
+    #[test]
+    fn test_stosuje_sie_gdy_faza13_nie_zdekodowala() {
+        let m = HeaderRasterModule;
+        let kontekst = RepairContext {
+            ext: "bmp", media_reason: None, utf8_ok: None, is_oneliner: None,
+            eof_ok: None, match_type: None, video_ok: None, structure_ok: None,
+            media_decoded: Some(false),
+        };
+        assert!(m.applies_to(&kontekst));
     }
 
     #[test]

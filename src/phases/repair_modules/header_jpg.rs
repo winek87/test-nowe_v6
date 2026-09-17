@@ -14,10 +14,13 @@ impl RepairModule for HeaderJpgModule {
     fn display_name(&self) -> &'static str { "Nagłówek JPG (wstrzyknięcie SOI/JFIF)" }
 
     /// Stosuje się do plików `.jpg`/`.jpeg`, dla których Faza 12 zgłosiła
-    /// powód zawierający `"Nagłówek"` (zniszczony nagłówek obrazu).
+    /// powód zawierający `"Nagłówek"` (zniszczony nagłówek obrazu), ALBO
+    /// Faza 13 nie zdołała ich w ogóle zdekodować (`media_decoded == Some(false)`)
+    /// — silniejszy sygnał, łapiący też pliki z formalnie poprawnym
+    /// nagłówkiem, których zawartości i tak nie da się wyrenderować.
     fn applies_to(&self, ctx: &RepairContext) -> bool {
         (ctx.ext == "jpg" || ctx.ext == "jpeg")
-            && ctx.media_reason.is_some_and(|r| r.contains("Nagłówek"))
+            && (ctx.media_reason.is_some_and(|r| r.contains("Nagłówek")) || ctx.media_decoded == Some(false))
     }
 
     /// Jeśli plik NIE zaczyna się od `FF D8` (Start Of Image), doklejany jest
@@ -53,28 +56,38 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_ctx() -> RepairContext<'static> {
-        RepairContext { ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None }
+        RepairContext { ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None }
     }
 
     #[test]
     fn test_applies_to_jpg_with_header_reason() {
         let m = HeaderJpgModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_to_png() {
         let m = HeaderJpgModule;
-        let ctx = RepairContext { ext: "png", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "png", media_reason: Some("Zniszczony Nagłówek"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
     }
 
     #[test]
     fn test_does_not_apply_without_header_reason() {
         let m = HeaderJpgModule;
-        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "jpg", media_reason: Some("Fałszywe rozszerzenie"), utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
+    }
+
+    /// Nagłówek formalnie poprawny (brak powodu z Fazy 12), ale Faza 13 nie
+    /// zdołała zdekodować pliku (np. Gray Banding) — moduł musi zareagować
+    /// na ten silniejszy sygnał samodzielnie, bez żadnego innego powodu.
+    #[test]
+    fn test_applies_to_jpg_gdy_faza13_nie_zdekodowala() {
+        let m = HeaderJpgModule;
+        let ctx = RepairContext { ext: "jpg", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None, video_ok: None, structure_ok: None, media_decoded: Some(false) };
+        assert!(m.applies_to(&ctx));
     }
 
     #[test]

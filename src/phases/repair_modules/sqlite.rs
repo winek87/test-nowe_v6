@@ -87,14 +87,14 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_ctx() -> RepairContext<'static> {
-        RepairContext { ext: "db", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None }
+        RepairContext { ext: "db", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None }
     }
 
     #[test]
     fn test_applies_to_known_sqlite_extensions() {
         let m = SqliteModule;
         for ext in ["db", "sqlite", "sqlite3"] {
-            let ctx = RepairContext { ext, media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+            let ctx = RepairContext { ext, media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
             assert!(m.applies_to(&ctx), "powinno pasować dla .{}", ext);
         }
     }
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn test_does_not_apply_to_unrelated_extension() {
         let m = SqliteModule;
-        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None };
+        let ctx = RepairContext { ext: "txt", media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None, match_type: None , video_ok: None, structure_ok: None, media_decoded: None };
         assert!(!m.applies_to(&ctx));
     }
 

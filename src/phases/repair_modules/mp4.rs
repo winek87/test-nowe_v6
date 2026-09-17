@@ -400,7 +400,7 @@ mod tests {
     fn ctx(ext: &'static str, video_ok: Option<bool>, eof_ok: Option<bool>, media_reason: Option<&'static str>) -> RepairContext<'static> {
         RepairContext {
             ext, media_reason, utf8_ok: None, is_oneliner: None,
-            eof_ok, match_type: None, video_ok, structure_ok: None,
+            eof_ok, match_type: None, video_ok, structure_ok: None, media_decoded: None,
         }
     }
 
