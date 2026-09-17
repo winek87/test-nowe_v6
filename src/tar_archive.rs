@@ -233,6 +233,22 @@ pub fn splice_tar(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
 
     let mut out = Vec::new();
     for (ea, eb) in a.entries.iter().zip(b.entries.iter()) {
+        // REGRESJA (todo.dng_archive_repair.md, ŚREDNI): w odróżnieniu od
+        // siostrzanej `zip_splice::splice_zip`, ta funkcja nie sprawdzała w
+        // ogóle, czy wpisy na TEJ SAMEJ pozycji mają tę samą nazwę —
+        // bezpieczeństwo składania opierało się WYŁĄCZNIE na zgodności
+        // LICZBY wpisów. Dwa archiwa o tej samej liczbie wpisów, ale innej
+        // zawartości/kolejności (np. dwie różne wersje tego samego archiwum
+        // źródłowego, albo dwa niezwiązane archiwa, które przypadkiem mają
+        // tyle samo wpisów) mogły zostać cicho "złożone" w bezsensowny,
+        // hybrydowy wynik mieszający dane z dwóch niepowiązanych pozycji.
+        // Nazwa pusta oznacza nieczytelny nagłówek — bierzemy ją z tej
+        // strony, która ją ma; gdy obie są niepuste i się różnią, struktury
+        // się rozjechały i nie realignujemy (ten sam wzorzec co splice_zip).
+        if !ea.name.is_empty() && !eb.name.is_empty() && ea.name != eb.name {
+            return None;
+        }
+
         // Wybieramy stronę ze zdrowym nagłówkiem; przy remisie preferujemy A.
         let (src, entry) = if ea.header_valid && ea.data_complete {
             (bytes_a, ea)
@@ -491,6 +507,24 @@ mod tests {
         let a = build_tar(&[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
         let b = build_tar(&[("a.txt", b"aaa")]);
         assert!(splice_tar(&a, &b).is_none());
+    }
+
+    /// REGRESJA (todo.dng_archive_repair.md, ŚREDNI): w odróżnieniu od
+    /// siostrzanej `zip_splice::splice_zip`, `splice_tar` nie sprawdzało w
+    /// ogóle, czy wpisy na tej samej pozycji mają tę samą nazwę — poleganie
+    /// WYŁĄCZNIE na zgodności liczby wpisów pozwalało "złożyć" dwa RÓŻNE
+    /// archiwa o przypadkowo tej samej liczbie wpisów w bezsensowny,
+    /// hybrydowy wynik. Tu: te same liczby (2), ta sama nazwa na pozycji 0,
+    /// ale zupełnie inna nazwa na pozycji 1 — musi się to teraz zablokować.
+    #[test]
+    fn test_splice_fails_when_entry_names_diverge_at_same_position() {
+        let a = build_tar(&[("wspolny.txt", b"aaa"), ("tylko_w_a.txt", b"bbb")]);
+        let b = build_tar(&[("wspolny.txt", b"aaa"), ("zupelnie_inny_plik.bin", b"ccc")]);
+
+        assert!(
+            splice_tar(&a, &b).is_none(),
+            "wpisy o różnych nazwach na tej samej pozycji nie mogą zostać cicho złożone - struktury się rozjechały"
+        );
     }
 
     #[test]

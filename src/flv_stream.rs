@@ -85,7 +85,18 @@ impl FlvAnalysis {
 
     /// Zwięzły opis stanu do zapisania w bazie i pokazania użytkownikowi.
     pub fn describe(&self) -> String {
-        if self.total_tags() == 0 {
+        // REGRESJA (todo.video_container_repair.md, Ustalenie 2.1 - skutek
+        // uboczny naprawy podwójnego liczenia): odkąd licznik typu tagu jest
+        // inkrementowany dopiero PO potwierdzeniu kompletności tagu, plik z
+        // USZKODZONYM PIERWSZYM tagiem (zły PreviousTagSize) ma legalnie
+        // `total_tags() == 0`, mimo że realnie ZAWIERAŁ bajty tagu — tylko
+        // nigdy nie policzone jako poprawne. Bez tego warunku taki plik
+        // dostawałby mylący komunikat "plik pusty lub ucięty tuż za
+        // nagłówkiem", cicho gubiąc jedyny realny dowód uszkodzenia
+        // (`chain_errors`/`trailing_garbage_bytes`). Przed naprawą 2.1 ta
+        // kombinacja była nieosiągalna - uszkodzony pierwszy tag był wtedy
+        // ZAWSZE (błędnie) liczony jako poprawny.
+        if self.total_tags() == 0 && self.chain_errors == 0 && self.trailing_garbage_bytes == 0 {
             return "Nagłówek FLV poprawny, ale nie znaleziono żadnych tagów (plik pusty lub ucięty tuż za nagłówkiem)".to_string();
         }
         if self.is_healthy() {
@@ -161,13 +172,6 @@ pub fn analyze_flv(bytes: &[u8]) -> Option<FlvAnalysis> {
         // Znacznik czasu: 3 bajty + rozszerzenie w 4. bajcie jako najstarszy.
         let ts = u32::from_be_bytes([bytes[offset + 7], bytes[offset + 4], bytes[offset + 5], bytes[offset + 6]]);
 
-        match tag_type {
-            TAG_TYPE_AUDIO => audio_tags += 1,
-            TAG_TYPE_VIDEO => video_tags += 1,
-            TAG_TYPE_SCRIPT => script_tags += 1,
-            _ => unknown_tags += 1,
-        }
-
         // Regresja liczona TYLKO w obrębie tego samego typu strumienia.
         let prev_ts = last_ts_per_type.entry(tag_type).or_insert(0);
         if ts < *prev_ts { timestamp_regressions += 1; }
@@ -192,6 +196,26 @@ pub fn analyze_flv(bytes: &[u8]) -> Option<FlvAnalysis> {
             offset = next_offset + 4;
             break;
         }
+
+        // REGRESJA (todo.video_container_repair.md, Ustalenie 2.1): licznik
+        // typu tagu był wcześniej inkrementowany na podstawie SAMEGO
+        // NAGŁÓWKA (11 B), ZANIM potwierdzone zostało, że cały tag (dane +
+        // PreviousTagSize) w ogóle mieści się w pliku. Tag ucięty tuż przed
+        // końcem pliku był liczony RAZEM jako "poprawny" w audio_tags/
+        // video_tags/script_tags/unknown_tags ORAZ w trailing_garbage_bytes
+        // (bo `offset` zostawał na początku TEGO SAMEGO tagu przy `break`
+        // wyżej) — podwójna, niespójna księgowość dla tych samych bajtów.
+        // Licznik przesunięty tutaj, PO potwierdzeniu kompletności całego
+        // tagu łącznie z PreviousTagSize — dokładnie tak, jak `tag_pod`
+        // (używane przez `splice_flv`) już weryfikuje kompletność PRZED
+        // zwróceniem wyniku.
+        match tag_type {
+            TAG_TYPE_AUDIO => audio_tags += 1,
+            TAG_TYPE_VIDEO => video_tags += 1,
+            TAG_TYPE_SCRIPT => script_tags += 1,
+            _ => unknown_tags += 1,
+        }
+
         offset = next_offset + 4;
     }
 
@@ -516,6 +540,24 @@ mod tests {
         let a = analyze_flv(&flv).unwrap();
         assert!(a.trailing_garbage_bytes > 0, "Ucięcie musi zostać wykryte");
         assert!(!a.is_healthy());
+    }
+
+    /// REGRESJA (todo.video_container_repair.md, Ustalenie 2.1): tag ucięty
+    /// na końcu strumienia nie może zostać policzony JEDNOCZEŚNIE jako
+    /// poprawny tag (w `audio_tags`/`video_tags`/itd.) I jako
+    /// `trailing_garbage_bytes` — to te same bajty, nie dwa osobne fakty.
+    /// Pierwszy tag (VIDEO) jest w pełni kompletny i MUSI zostać policzony;
+    /// drugi (AUDIO) jest ucięty i NIE MOŻE trafić do `audio_tags`.
+    #[test]
+    fn test_uciety_tag_nie_jest_liczony_podwojnie_jako_poprawny_i_jako_smieci() {
+        let mut flv = build_flv(&[(TAG_TYPE_VIDEO, 0, 100), (TAG_TYPE_AUDIO, 23, 100)], None);
+        flv.truncate(flv.len() - 60); // ucinamy w środku drugiego (audio) tagu
+        let a = analyze_flv(&flv).unwrap();
+
+        assert_eq!(a.video_tags, 1, "pierwszy, w pełni kompletny tag musi zostać policzony");
+        assert_eq!(a.audio_tags, 0, "ucięty tag nie może zostać policzony jako poprawny");
+        assert_eq!(a.total_tags(), 1, "łączna liczba tagów musi liczyć wyłącznie kompletne tagi");
+        assert!(a.trailing_garbage_bytes > 0, "ucięcie musi zostać odnotowane jako bajty niepełnego tagu");
     }
 
     #[test]
