@@ -117,10 +117,11 @@ pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: 
 }
 
 /// Wysokość (w wierszach terminala) wymagana przez [`draw_paths_panel`], żeby
-/// zmieścić CAŁĄ treść bez obcięcia: 8 stałych linii (UFS, Skrypt, Ścieżka
-/// Docelowa, Baza Danych, Logi, Tryb I/O, Wątki CPU, Szybki Skan) + 1
-/// warunkowa ("DNG do przeglądu", widoczna tylko gdy jest coś do przejrzenia)
-/// + 2 linie obramowania (`Borders::ALL`).
+/// zmieścić CAŁĄ treść bez przewijania: 11 stałych linii (UFS, Skrypt,
+/// Ścieżka Docelowa, Baza Danych, Logi, Tryb I/O, Wątki CPU, Szybki Skan,
+/// CRC32, Limit ssdeep, Poziom Logów) + 1 warunkowa ("DNG do przeglądu",
+/// widoczna tylko gdy jest coś do przejrzenia) + 2 linie obramowania
+/// (`Borders::ALL`).
 ///
 /// JEDYNE źródło prawdy dla WSZYSTKICH miejsc wywołania tego panelu — patrz
 /// `dashboard.rs`/`menu/actions.rs` (dwie zduplikowane kopie layoutu ekranu
@@ -130,7 +131,14 @@ pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: 
 /// Stała istnieje właśnie po to, żeby TA KONKRETNA klasa błędu (jedno miejsce
 /// zaktualizowane, inne zapomniane) nie mogła się powtórzyć przy kolejnej
 /// zmianie treści panelu — zmiana liczby linii wymaga zmiany TYLKO tutaj.
-pub const WYSOKOSC_PANELU_SCIEZEK_MAX: u16 = 11;
+///
+/// UWAGA: panel jest też przewijalny klawiszem Tab (patrz `draw_paths_panel`)
+/// — ta stała nie jest już jedyną linią obrony przed obcięciem, TYLKO
+/// gwarancją, że w typowych warunkach (terminal wysokości co najmniej tyle)
+/// operator widzi WSZYSTKO od razu, bez konieczności przewijania. Na niższym
+/// terminalu albo po kolejnym dopisaniu pola bez zdążenia zaktualizować tej
+/// stałej, przewijanie łapie nadmiar zamiast go po cichu ucinać.
+pub const WYSOKOSC_PANELU_SCIEZEK_MAX: u16 = 14;
 
 /// Rysuje panel "Konfiguracja Środowiska". Fokusowalny i przewijalny klawiszem
 /// Tab na ekranie fazy na żywo — patrz dokumentacja [`draw_disks_panel`] dla
@@ -144,11 +152,12 @@ pub const WYSOKOSC_PANELU_SCIEZEK_MAX: u16 = 11;
 /// równoległego mechanizmu — matematyka przewijania listy i przewijania
 /// akapitu jest identyczna (zatrzask do `[0, N-1]`).
 ///
-/// Treść panelu jest dziś zawsze krótsza niż widoczna wysokość (`WYSOKOSC_PANELU_SCIEZEK_MAX`
-/// dobrana dokładnie pod nią), więc przewinięcie faktycznie nic nie zmienia —
-/// ale gdy przybędzie kolejnych pól (np. limit fallbacku ssdeep, poziom logów),
-/// panel automatycznie zacznie się przewijać zamiast ciąć treść, bez potrzeby
-/// dalszych zmian tutaj.
+/// Treść panelu mieści się CAŁKOWICIE w `WYSOKOSC_PANELU_SCIEZEK_MAX` (dobrana
+/// dokładnie pod nią — patrz jej dokumentacja), więc na typowym terminalu
+/// przewijanie nic nie zmienia. Jest tu mimo to jako świadomy zapas: na
+/// niższym terminalu, albo gdy przybędzie kolejnych pól bez pamiętania o
+/// zaktualizowaniu stałej, panel automatycznie zacznie się przewijać zamiast
+/// ciąć treść, bez potrzeby dalszych zmian tutaj.
 pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: &mut TableState, focused: bool) {
     let max_path_len = area.width.saturating_sub(25) as usize;
     let ufs_trunc = truncate_path(&app.ustawienia.ufs_path, max_path_len);
@@ -161,6 +170,7 @@ pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: 
     let io_str = if app.ustawienia.io_mode == "CONCURRENT" { "RÓWNOLEGŁY" } else { "SEKWENCYJNY" };
     let threads_str = if app.ustawienia.max_threads == 0 { "AUTO".to_string() } else { app.ustawienia.max_threads.to_string() };
     let fast_str = if app.ustawienia.phase13_fast_mode { "TAK" } else { "NIE" };
+    let crc_str = if app.ustawienia.deep_archive_scan { "TAK" } else { "NIE" };
 
     let mut paths_text = vec![
         Line::from(vec![
@@ -194,6 +204,18 @@ pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: 
         Line::from(vec![
             Span::styled("                      ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("Szybki Skan: {}", fast_str), Style::default().fg(Color::White))
+        ]),
+        Line::from(vec![
+            Span::styled("                      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("CRC32 (F.11): {}", crc_str), Style::default().fg(Color::White))
+        ]),
+        Line::from(vec![
+            Span::styled("                      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Limit ssdeep: {} MB", app.ustawienia.fuzzy_hash_fallback_max_mb), Style::default().fg(Color::White))
+        ]),
+        Line::from(vec![
+            Span::styled("                      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Poziom Logów: {}", app.ustawienia.log_level), Style::default().fg(Color::White))
         ]),
     ];
 
@@ -459,7 +481,7 @@ mod tests {
         terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut TableState::default(), false)).unwrap();
         let widok = ekran(terminal.backend().buffer());
 
-        for etykieta in ["Źródło UFS", "Skrypt Aut.", "Ścieżka Docelowa", "Baza Danych", "Ścieżka Logów", "Parametry", "Wątki CPU", "Szybki Skan", "DNG do przeglądu"] {
+        for etykieta in ["Źródło UFS", "Skrypt Aut.", "Ścieżka Docelowa", "Baza Danych", "Ścieżka Logów", "Parametry", "Wątki CPU", "Szybki Skan", "CRC32", "Limit ssdeep", "Poziom Logów", "DNG do przeglądu"] {
             assert!(widok.contains(etykieta), "etykieta \"{}\" musi zmieścić się w WYSOKOSC_PANELU_SCIEZEK_MAX={} wierszach, ale nie ma jej w renderze:\n{}", etykieta, WYSOKOSC_PANELU_SCIEZEK_MAX, widok);
         }
     }
@@ -529,6 +551,6 @@ mod tests {
         ts.select(Some(999));
         terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, true)).unwrap();
         let od_dolu = ekran(terminal.backend().buffer());
-        assert!(od_dolu.contains("Szybki Skan"), "po przewinięciu do końca ostatnia linia musi być widoczna:\n{}", od_dolu);
+        assert!(od_dolu.contains("Poziom Logów"), "po przewinięciu do końca ostatnia linia musi być widoczna:\n{}", od_dolu);
     }
 }
