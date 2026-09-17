@@ -1105,6 +1105,88 @@ mod tests {
         assert!(!ufs.path().join("_smart_splice_repaired").exists(), "katalog roboczy Fazy 18 NIE MOŻE powstać wewnątrz korpusu źródłowego");
     }
 
+    /// REGRESJA (todo.faza18.md N2): wszystkie testy tej fazy do tej pory
+    /// były jednostkowe (`splice_png`, `verify_candidate`, `qualifies_for_splice`
+    /// itd. wołane bezpośrednio) albo, jak wyżej, testowały wyłącznie ŚCIEŻKĘ
+    /// ODMOWY `run()`. Żaden test nie przepuszczał sukcesu przez CAŁY
+    /// łańcuch: prawdziwa baza SQLite -> `run()` -> `process_stream` ->
+    /// zapis na dysk -> transakcja UPDATE w bazie. Dokładnie ta luka
+    /// pozwoliła wcześniej przetrwać błędowi "GIF/BMP/WEBP nigdy nie trafiają
+    /// do generatora kandydatów" (martwy kod wykryty tylko przez jednostkowy
+    /// test `test_formaty_rastrowe_sa_wpiete_w_generator_kandydatow`, nie
+    /// przez brakujący tu test end-to-end).
+    ///
+    /// Scenariusz: prawdziwy PNG, dwa RÓŻNE uszkodzone chunki po obu
+    /// stronach (dokładnie jak `test_end_to_end_splice_and_verify_real_png`,
+    /// ale tym razem przez PRAWDZIWY `run()` z plikami na dysku i realną
+    /// bazą) - musi zostać poprawnie złożony i zapisany.
+    #[test]
+    fn test_run_end_to_end_skleja_prawdziwy_png_i_zapisuje_w_bazie() {
+        let ufs = tempdir().unwrap();
+        let script = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let logi = tempdir().unwrap();
+
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 100, 50]));
+        let mut original: Vec<u8> = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut original);
+            image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+        }
+        let chunks = parse_png_chunks(&original).unwrap();
+        assert!(chunks.len() >= 3, "Prawdziwy PNG powinien mieć co najmniej IHDR/IDAT/IEND");
+
+        let side_a = corrupt_chunk_crc(&original, 0); // IHDR zepsute po stronie UFS
+        let side_b = corrupt_chunk_crc(&original, 1); // pierwszy IDAT zepsuty po stronie Skryptu
+        std::fs::write(ufs.path().join("wspolny.png"), &side_a).unwrap();
+        std::fs::write(script.path().join("wspolny.png"), &side_b).unwrap();
+
+        let mut config = Ustawienia {
+            ufs_path: ufs.path().to_string_lossy().to_string(),
+            script_path: script.path().to_string_lossy().to_string(),
+            target_path: target.path().to_string_lossy().to_string(),
+            log_path: logi.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script, media_decoded_ufs, media_decoded_script)
+             VALUES ('wspolny.png', 1, 1, 0, 0)",
+            [],
+        ).unwrap();
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok dla poprawnej konfiguracji");
+
+        let (smart_splice_path, smart_splice_log, phase18_done): (Option<String>, Option<String>, bool) = conn.query_row(
+            "SELECT smart_splice_path, smart_splice_log, phase18_done FROM files WHERE relative_path = 'wspolny.png'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+
+        assert!(phase18_done, "wiersz musi zostać oznaczony jako obsłużony, inaczej wróci do kolejki w nieskończoność");
+        let sciezka_wyniku = smart_splice_path.expect("udane złożenie musi zapisać ścieżkę wyniku w bazie");
+        assert!(
+            smart_splice_log.as_deref().unwrap_or("").contains("Złożono"),
+            "log musi opisywać sukces złożenia: {:?}", smart_splice_log
+        );
+
+        let sciezka_wyniku = Path::new(&sciezka_wyniku);
+        assert!(sciezka_wyniku.exists(), "plik wynikowy musi FIZYCZNIE istnieć na dysku pod ścieżką zapisaną w bazie");
+        assert!(
+            sciezka_wyniku.starts_with(target.path()),
+            "plik wynikowy musi wylądować pod target_path, nie w korpusie źródłowym: {}", sciezka_wyniku.display()
+        );
+
+        let bajty_wyniku = std::fs::read(sciezka_wyniku).unwrap();
+        assert!(verify_image_bytes(&bajty_wyniku), "złożony plik zapisany przez run() musi być poprawnie dekodowalnym PNG");
+
+        let dziennik = std::fs::read_to_string(logi.path().join("dziennik_koncowy_faza18.txt")).expect("Dziennik Końcowy musi powstać");
+        assert!(dziennik.contains("Złożone PNG (CRC32 per-chunk): 1 plików"), "Dziennik Końcowy musi policzyć złożenie:\n{}", dziennik);
+    }
+
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
     /// równoległych — ułatwia maszynowe parsowanie panelu i utrzymuje spójność
     /// wizualną. Ten test utrwala ją dla tej fazy.
