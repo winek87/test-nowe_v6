@@ -726,7 +726,14 @@ mod tests {
         ).unwrap();
 
         assert_eq!(status, "accepted_auto", "tryb automatyczny musi być rozróżnialny w danych");
-        assert!(sciezka.ends_with("a_dngsplice.dng"), "ścieżka: {}", sciezka);
+        // REGRESJA (todo.dng_archive_repair.md, Ustalenie 2): nazwa pliku
+        // wynikowego zawiera teraz hash pełnej ścieżki źródłowej (unikalność
+        // między podkatalogami — patrz dng_repair::unikalna_nazwa_wyniku),
+        // więc dokładny sufiks "a_dngsplice.dng" już nie pasuje — sprawdzamy
+        // stabilną część: rozszerzenie i czytelny dla człowieka trzon nazwy.
+        assert!(sciezka.ends_with("_dngsplice.dng"), "ścieżka: {}", sciezka);
+        let nazwa_pliku = Path::new(&sciezka).file_name().unwrap().to_str().unwrap();
+        assert!(nazwa_pliku.starts_with("a_"), "trzon nazwy (stem źródła) musi pozostać czytelny: {}", sciezka);
     }
 
     #[test]

@@ -98,6 +98,32 @@ pub fn compute_candidates(task: &ReviewTask, ufs_base: &Path, script_base: &Path
     }).collect()
 }
 
+/// Buduje nazwę pliku wynikowego, unikalną per PEŁNA ścieżka źródłowa — nie
+/// tylko jej `file_stem()`. Ten sam wzorzec co Faza 18
+/// (`phase18_smart_splice::unikalna_nazwa_wyniku`): hash pełnej `rel_path`
+/// dopisany do czytelnego dla człowieka trzonu nazwy.
+///
+/// REGRESJA (todo.dng_archive_repair.md, Ustalenie 2): poprzednia wersja
+/// budowała nazwę WYŁĄCZNIE z `file_stem()`, zapisując do JEDNEGO, płaskiego
+/// katalogu wspólnego dla CAŁEGO korpusu (`target_path/_dng_structural_review`,
+/// patrz `menu::actions`). Dwa pliki o tej samej nazwie bazowej z różnych
+/// podkatalogów źródłowych (typowy układ przy konsolidacji wielu kart/
+/// folderów DCIM w jeden korpus odzysku — dokładnie scenariusz, dla którego
+/// Faza 18 dostała tę samą poprawkę) dawały IDENTYCZNĄ nazwę docelową — drugi
+/// zaakceptowany kandydat cicho nadpisywał bajty pierwszego, a OBA wiersze
+/// bazy wskazywały na tę samą ścieżkę (`dng_structural_path`), mimo że
+/// fizycznie zawierała tylko jednego z dwóch plików. Operator otwierający
+/// "zweryfikowaną rekonstrukcję" pierwszego pliku dostawał w rzeczywistości
+/// bajty zupełnie innego pliku źródłowego.
+fn unikalna_nazwa_wyniku(rel_path: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rel_path.hash(&mut hasher);
+    let hash = hasher.finish();
+    let stem = Path::new(rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("plik");
+    format!("{}_{:016x}_dngsplice.dng", stem, hash)
+}
+
 /// Zapisuje zaakceptowanego kandydata do katalogu przeglądowego (NIGDY do
 /// Złotej Kopii bezpośrednio) i aktualizuje status w bazie — `accepted` dla
 /// decyzji ręcznej, `accepted_auto` dla trybu automatycznego (rozróżnialne
@@ -111,8 +137,7 @@ pub fn compute_candidates(task: &ReviewTask, ufs_base: &Path, script_base: &Path
 /// **absolutna**, bo tak samo zapisują ją Faza 17 i Faza 18 i tak porównuje je
 /// sprzątanie.
 pub fn accept_candidate(conn: &Connection, task: &ReviewTask, candidate: &DisplayCandidate, target_base: &Path, auto: bool) -> std::io::Result<PathBuf> {
-    let stem = Path::new(&task.rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("plik");
-    let target_path = target_base.join(format!("{}_dngsplice.dng", stem));
+    let target_path = target_base.join(unikalna_nazwa_wyniku(&task.rel_path));
     if let Some(parent) = target_path.parent() { fs::create_dir_all(parent)?; }
     fs::write(&target_path, &candidate.bytes)?;
     let status = if auto { "accepted_auto" } else { "accepted" };
@@ -655,6 +680,42 @@ mod tests {
 
         let sciezka: String = conn.query_row("SELECT dng_structural_path FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
         assert!(Path::new(&sciezka).exists(), "zapisany plik musi istnieć: {}", sciezka);
+    }
+
+    /// REGRESJA (todo.dng_archive_repair.md, Ustalenie 2): dwa pliki o tej
+    /// samej nazwie bazowej z RÓŻNYCH podkatalogów źródłowych (typowy układ
+    /// przy konsolidacji wielu kart/folderów DCIM) muszą dostać RÓŻNE ścieżki
+    /// docelowe w płaskim katalogu przeglądowym — inaczej drugi zaakceptowany
+    /// kandydat cicho nadpisuje bajty pierwszego, a oba wiersze bazy
+    /// wskazują na tę samą ścieżkę, mimo że fizycznie zawiera tylko jednego
+    /// z dwóch plików.
+    #[test]
+    fn test_akceptacja_dwoch_plikow_o_tej_samej_nazwie_z_roznych_katalogow_nie_koliduje() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = baza();
+        wstaw_kandydata_do_przegladu(&conn, 1, "karta1/IMG_0001.dng");
+        wstaw_kandydata_do_przegladu(&conn, 2, "karta2/IMG_0001.dng");
+
+        let p = sciezki(dir.path());
+        let task1 = ReviewTask { id: 1, rel_path: "karta1/IMG_0001.dng".into() };
+        let task2 = ReviewTask { id: 2, rel_path: "karta2/IMG_0001.dng".into() };
+
+        let mut kandydat1 = kandydat("Karta 1", 5.0, true);
+        kandydat1.bytes = vec![0x11; 256];
+        let mut kandydat2 = kandydat("Karta 2", 5.0, true);
+        kandydat2.bytes = vec![0x22; 256];
+
+        let sciezka1 = accept_candidate(&conn, &task1, &kandydat1, &p.target_base, false).unwrap();
+        let sciezka2 = accept_candidate(&conn, &task2, &kandydat2, &p.target_base, false).unwrap();
+
+        assert_ne!(sciezka1, sciezka2, "różne pliki źródłowe o tej samej nazwie bazowej muszą dostać różne ścieżki docelowe");
+        assert_eq!(fs::read(&sciezka1).unwrap(), vec![0x11; 256], "plik z karty 1 nie może zostać nadpisany bajtami z karty 2");
+        assert_eq!(fs::read(&sciezka2).unwrap(), vec![0x22; 256], "plik z karty 2 musi zawierać własne bajty");
+
+        let db_sciezka1: String = conn.query_row("SELECT dng_structural_path FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let db_sciezka2: String = conn.query_row("SELECT dng_structural_path FROM files WHERE id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(db_sciezka1, sciezka1.to_string_lossy());
+        assert_eq!(db_sciezka2, sciezka2.to_string_lossy());
     }
 
     #[test]
