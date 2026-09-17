@@ -69,20 +69,24 @@ const STRONA_LOGOW: usize = 10;
 enum PanelWFokusie {
     Logi,
     Dyski,
+    Konfiguracja,
     SkanerLive,
     SciezkiIO,
 }
 
 impl PanelWFokusie {
-    /// Kolejność cyklu Tab. `SkanerLive` pomijany, gdy panel nie jest w ogóle
-    /// narysowany (`ui_state.side_texts.is_empty()`) — fokusowanie
-    /// niewidocznego panelu myliłoby operatora (strzałki "nic by nie robiły"
-    /// bez wyjaśnienia).
+    /// Kolejność cyklu Tab — odzwierciedla kolejność wizualną na ekranie
+    /// (lewa kolumna od góry, potem prawa, potem dół): Dyski -> Konfiguracja
+    /// -> (SkanerLive, jeśli widoczny) -> Logi -> Ścieżki I/O. `SkanerLive`
+    /// pomijany, gdy panel nie jest w ogóle narysowany
+    /// (`ui_state.side_texts.is_empty()`) — fokusowanie niewidocznego panelu
+    /// myliłoby operatora (strzałki "nic by nie robiły" bez wyjaśnienia).
     fn kolejnosc(pokaz_skaner_live: bool) -> Vec<PanelWFokusie> {
-        let mut v = vec![PanelWFokusie::Logi, PanelWFokusie::Dyski];
+        let mut v = vec![PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja];
         if pokaz_skaner_live {
             v.push(PanelWFokusie::SkanerLive);
         }
+        v.push(PanelWFokusie::Logi);
         v.push(PanelWFokusie::SciezkiIO);
         v
     }
@@ -305,6 +309,8 @@ fn run_phase_z_opcjami(
     let mut fokus = PanelWFokusie::Logi;
     let mut dyski_ts = TableState::default();
     dyski_ts.select(Some(0));
+    let mut konfiguracja_ts = TableState::default();
+    konfiguracja_ts.select(Some(0));
     let mut skaner_live_ts = TableState::default();
     skaner_live_ts.select(Some(0));
     let mut sciezki_io_ts = TableState::default();
@@ -374,6 +380,7 @@ fn run_phase_z_opcjami(
                                 KeyCode::Up => match fokus {
                                     PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
                                     PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
+                                    PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
                                     // SkanerLive: liczba wierszy nieznana tutaj (zależy od
                                     // parsowania `side_texts`, patrz `draw_side_stats_panel`) —
                                     // funkcja tylko dekrementuje, więc górny limit jest
@@ -384,6 +391,7 @@ fn run_phase_z_opcjami(
                                 KeyCode::Down => match fokus {
                                     PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
                                     PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
+                                    PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
                                     // Patrz komentarz przy Up: `draw_side_stats_panel` samo
                                     // zatrzaskuje `selected()` do rzeczywistej liczby wierszy
                                     // na KAŻDEJ klatce, więc `usize::MAX` tutaj jest bezpieczne
@@ -394,24 +402,28 @@ fn run_phase_z_opcjami(
                                 KeyCode::PageUp => match fokus {
                                     PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
                                     PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                                    PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
                                     PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
                                     PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
                                 },
                                 KeyCode::PageDown => match fokus {
                                     PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
                                     PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                                    PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
                                     PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
                                     PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
                                 },
                                 KeyCode::Home => match fokus {
                                     PanelWFokusie::Logi => {}
                                     PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
+                                    PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
                                     PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
                                     PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                                 },
                                 KeyCode::End => match fokus {
                                     PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
                                     PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
+                                    PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
                                     PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
                                     PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                                 },
@@ -481,7 +493,7 @@ fn run_phase_z_opcjami(
                 // Rysujemy Lewą Stronę
                 crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
                 crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
-                crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2]);
+                crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
                 
                 if !ui_state.side_texts.is_empty() {
                     crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
@@ -553,7 +565,7 @@ fn run_phase_z_opcjami(
 
             crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
             crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
-            crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2]);
+            crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
             
             if !ui_state.side_texts.is_empty() {
                 crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
@@ -583,36 +595,42 @@ fn run_phase_z_opcjami(
                         KeyCode::Up => match fokus {
                             PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
                             PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
+                            PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
                             PanelWFokusie::SkanerLive => table_select_prev(&mut skaner_live_ts, usize::MAX),
                             PanelWFokusie::SciezkiIO => table_select_prev(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                         },
                         KeyCode::Down => match fokus {
                             PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
                             PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
+                            PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
                             PanelWFokusie::SkanerLive => table_select_next(&mut skaner_live_ts, usize::MAX),
                             PanelWFokusie::SciezkiIO => table_select_next(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                         },
                         KeyCode::PageUp => match fokus {
                             PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
                             PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                            PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
                             PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
                             PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
                         },
                         KeyCode::PageDown => match fokus {
                             PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
                             PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
+                            PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
                             PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
                             PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
                         },
                         KeyCode::Home => match fokus {
                             PanelWFokusie::Logi => {}
                             PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
+                            PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
                             PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
                             PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                         },
                         KeyCode::End => match fokus {
                             PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
                             PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
+                            PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
                             PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
                             PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
                         },
@@ -1204,22 +1222,22 @@ mod tests {
     fn test_kolejnosc_bez_skanera_live_pomija_ten_panel() {
         assert_eq!(
             PanelWFokusie::kolejnosc(false),
-            vec![PanelWFokusie::Logi, PanelWFokusie::Dyski, PanelWFokusie::SciezkiIO]
+            vec![PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::Logi, PanelWFokusie::SciezkiIO]
         );
     }
 
     #[test]
-    fn test_kolejnosc_ze_skanerem_live_zawiera_wszystkie_cztery() {
+    fn test_kolejnosc_ze_skanerem_live_zawiera_wszystkie_piec() {
         assert_eq!(
             PanelWFokusie::kolejnosc(true),
-            vec![PanelWFokusie::Logi, PanelWFokusie::Dyski, PanelWFokusie::SkanerLive, PanelWFokusie::SciezkiIO]
+            vec![PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::SkanerLive, PanelWFokusie::Logi, PanelWFokusie::SciezkiIO]
         );
     }
 
     #[test]
     fn test_nastepny_cyklicznie_okraza_cala_liste() {
         let mut p = PanelWFokusie::Logi;
-        for oczekiwany in [PanelWFokusie::Dyski, PanelWFokusie::SkanerLive, PanelWFokusie::SciezkiIO, PanelWFokusie::Logi] {
+        for oczekiwany in [PanelWFokusie::SciezkiIO, PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::SkanerLive, PanelWFokusie::Logi] {
             p = p.nastepny(true);
             assert_eq!(p, oczekiwany);
         }
@@ -1228,7 +1246,7 @@ mod tests {
     #[test]
     fn test_poprzedni_cyklicznie_okraza_cala_liste_w_odwrotna_strone() {
         let mut p = PanelWFokusie::Logi;
-        for oczekiwany in [PanelWFokusie::SciezkiIO, PanelWFokusie::SkanerLive, PanelWFokusie::Dyski, PanelWFokusie::Logi] {
+        for oczekiwany in [PanelWFokusie::SkanerLive, PanelWFokusie::Konfiguracja, PanelWFokusie::Dyski, PanelWFokusie::SciezkiIO, PanelWFokusie::Logi] {
             p = p.poprzedni(true);
             assert_eq!(p, oczekiwany);
         }
@@ -1236,8 +1254,8 @@ mod tests {
 
     #[test]
     fn test_nastepny_pomija_skaner_live_gdy_nieobecny() {
-        // Dyski -> (pominięty SkanerLive) -> SciezkiIO
-        assert_eq!(PanelWFokusie::Dyski.nastepny(false), PanelWFokusie::SciezkiIO);
+        // Konfiguracja -> (pominięty SkanerLive) -> Logi
+        assert_eq!(PanelWFokusie::Konfiguracja.nastepny(false), PanelWFokusie::Logi);
     }
 
     #[test]

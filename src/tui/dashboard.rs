@@ -55,7 +55,7 @@ pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
     draw_disks_panel(f, app, chunks[2], &mut TableState::default(), false);
 
     // --- 3: KONFIGURACJA ŚRODOWISKA ---
-    draw_paths_panel(f, app, chunks[3]);
+    draw_paths_panel(f, app, chunks[3], &mut TableState::default(), false);
 
     // --- 4: MENU LISTA WYBORU ---
     let items: Vec<ListItem> = app.selections.iter().enumerate().map(|(idx, (title, desc))| {

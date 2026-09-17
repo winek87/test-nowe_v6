@@ -132,7 +132,24 @@ pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: 
 /// zmianie treści panelu — zmiana liczby linii wymaga zmiany TYLKO tutaj.
 pub const WYSOKOSC_PANELU_SCIEZEK_MAX: u16 = 11;
 
-pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
+/// Rysuje panel "Konfiguracja Środowiska". Fokusowalny i przewijalny klawiszem
+/// Tab na ekranie fazy na żywo — patrz dokumentacja [`draw_disks_panel`] dla
+/// ogólnego wzorca `table_state`/`focused`. RÓŻNICA: to `Paragraph`, nie
+/// `Table` — nie ma dyskretnych "wierszy" do zaznaczania, więc `table_state`
+/// jest tu wykorzystywany WYŁĄCZNIE jako licznik przewinięcia w dół (liczba
+/// linii schowanych nad widocznym oknem), nie jako zaznaczenie — stąd brak
+/// prefiksu `❯` przy którejkolwiek linii, w odróżnieniu od pozostałych
+/// czterech paneli. Pozwala to na ponowne użycie [`table_select_next`] i
+/// reszty rodziny `table_select_*` z `menu/actions.rs` bez pisania nowego,
+/// równoległego mechanizmu — matematyka przewijania listy i przewijania
+/// akapitu jest identyczna (zatrzask do `[0, N-1]`).
+///
+/// Treść panelu jest dziś zawsze krótsza niż widoczna wysokość (`WYSOKOSC_PANELU_SCIEZEK_MAX`
+/// dobrana dokładnie pod nią), więc przewinięcie faktycznie nic nie zmienia —
+/// ale gdy przybędzie kolejnych pól (np. limit fallbacku ssdeep, poziom logów),
+/// panel automatycznie zacznie się przewijać zamiast ciąć treść, bez potrzeby
+/// dalszych zmian tutaj.
+pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: &mut TableState, focused: bool) {
     let max_path_len = area.width.saturating_sub(25) as usize;
     let ufs_trunc = truncate_path(&app.ustawienia.ufs_path, max_path_len);
     let scr_trunc = truncate_path(&app.ustawienia.script_path, max_path_len);
@@ -190,7 +207,24 @@ pub fn draw_paths_panel(f: &mut Frame, app: &AppState, area: Rect) {
         ]));
     }
 
-    let paths_paragraph = Paragraph::new(paths_text).block(Block::default().borders(Borders::ALL).title(" Konfiguracja Środowiska "));
+    // Samoleczący zatrzask przewinięcia — ten sam wzorzec co
+    // `scanner_panel::draw_side_stats_panel`: liczba linii jest znana dopiero
+    // TUTAJ (po zbudowaniu `paths_text`), więc to ta funkcja, nie wywołujący,
+    // pilnuje granicy `[0, max(0, linie - widoczna_wysokosc)]`.
+    let widoczna_wysokosc = area.height.saturating_sub(2) as usize; // minus obramowanie
+    let max_offset = paths_text.len().saturating_sub(widoczna_wysokosc);
+    if let Some(i) = table_state.selected()
+        && i > max_offset {
+            table_state.select(Some(max_offset));
+        }
+    let offset = table_state.selected().unwrap_or(0) as u16;
+
+    let tytul = if focused { " ▶ Konfiguracja Środowiska (aktywny — ↑↓ PgUp/PgDn) " } else { " Konfiguracja Środowiska [Tab] " };
+    let border_styl = if focused { Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD) } else { Style::default() };
+
+    let paths_paragraph = Paragraph::new(paths_text)
+        .block(Block::default().borders(Borders::ALL).title(tytul).border_style(border_styl))
+        .scroll((offset, 0));
     f.render_widget(paths_paragraph, area);
 }
 
@@ -309,7 +343,9 @@ mod tests {
         u.io_mode = "SEQUENTIAL".to_string();
         u.max_threads = 0;
 
-        let widok = wyrenderuj(140, 14, &mut u, draw_paths_panel);
+        let widok = wyrenderuj(140, 14, &mut u, |f, app, area| {
+            draw_paths_panel(f, app, area, &mut TableState::default(), false)
+        });
 
         assert!(widok.contains("/moje/zrodlo/ufs"), "Brak ścieżki UFS:\n{}", widok);
         assert!(widok.contains("/moje/miejsce/docelowe"), "Brak ścieżki docelowej:\n{}", widok);
@@ -324,7 +360,9 @@ mod tests {
         let mut u = Ustawienia::default();
         for (szer, wys) in [(1u16, 1u16), (10, 3), (20, 5), (200, 60)] {
             let _ = wyrenderuj(szer, wys, &mut u, draw_hw_panel);
-            let _ = wyrenderuj(szer, wys, &mut u, draw_paths_panel);
+            let _ = wyrenderuj(szer, wys, &mut u, |f, app, area| {
+                draw_paths_panel(f, app, area, &mut TableState::default(), false)
+            });
             let _ = wyrenderuj(szer, wys, &mut u, |f, app, area| {
                 draw_disks_panel(f, app, area, &mut TableState::default(), false)
             });
@@ -418,11 +456,79 @@ mod tests {
         app.dng_pending_review = 3;
 
         let mut terminal = Terminal::new(TestBackend::new(80, WYSOKOSC_PANELU_SCIEZEK_MAX)).unwrap();
-        terminal.draw(|f| draw_paths_panel(f, &app, f.area())).unwrap();
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut TableState::default(), false)).unwrap();
         let widok = ekran(terminal.backend().buffer());
 
         for etykieta in ["Źródło UFS", "Skrypt Aut.", "Ścieżka Docelowa", "Baza Danych", "Ścieżka Logów", "Parametry", "Wątki CPU", "Szybki Skan", "DNG do przeglądu"] {
             assert!(widok.contains(etykieta), "etykieta \"{}\" musi zmieścić się w WYSOKOSC_PANELU_SCIEZEK_MAX={} wierszach, ale nie ma jej w renderze:\n{}", etykieta, WYSOKOSC_PANELU_SCIEZEK_MAX, widok);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FOKUS I PRZEWIJANIE (Tab między panelami na ekranie fazy na żywo)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_tytul_panelu_konfiguracji_odzwierciedla_fokus() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, WYSOKOSC_PANELU_SCIEZEK_MAX)).unwrap();
+        let mut ts = TableState::default();
+
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, false)).unwrap();
+        let bez_fokusu = ekran(terminal.backend().buffer());
+        assert!(bez_fokusu.contains("Tab"), "widok:\n{}", bez_fokusu);
+
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, true)).unwrap();
+        let z_fokusem = ekran(terminal.backend().buffer());
+        assert!(z_fokusem.contains("aktywny"), "widok:\n{}", z_fokusem);
+    }
+
+    /// Sedno funkcji: przy treści krótszej niż widoczna wysokość (dzisiejszy
+    /// stan — 9 linii w 9 widocznych wierszach) przewinięcie w dół musi się
+    /// samo zatrzasnąć na zero, NIE chować treści poza ekranem.
+    #[test]
+    fn test_przewiniecie_gdy_tresc_miesci_sie_w_calosci_nie_chowa_niczego() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, WYSOKOSC_PANELU_SCIEZEK_MAX)).unwrap();
+        let mut ts = TableState::default();
+        ts.select(Some(500)); // "za daleko" przewinięte przed renderem
+
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, true)).unwrap();
+        let widok = ekran(terminal.backend().buffer());
+
+        assert_eq!(ts.selected(), Some(0), "zatrzask musi sprowadzić przewinięcie do zera, gdy cała treść i tak się mieści");
+        assert!(widok.contains("Źródło UFS"), "pierwsza linia musi zostać widoczna:\n{}", widok);
+    }
+
+    /// Gdy treści faktycznie przybędzie ponad widoczną wysokość (przyszły
+    /// scenariusz z dodatkowymi polami ustawień), przewinięcie musi realnie
+    /// przesunąć widok, a nie zablokować się na zerze.
+    #[test]
+    fn test_przewiniecie_na_niskim_oknie_pokazuje_pozniejsze_linie() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+
+        // Okno niższe niż treść (9 linii w oknie o wysokości 5, minus 2
+        // obramowania = 3 widoczne wiersze) - symuluje sytuację, jaką da
+        // dodanie kolejnych pól ustawień bez zmiany WYSOKOSC_PANELU_SCIEZEK_MAX.
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        let mut ts = TableState::default();
+
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, true)).unwrap();
+        let od_gory = ekran(terminal.backend().buffer());
+        assert!(od_gory.contains("Źródło UFS"), "bez przewinięcia widoczny musi być początek:\n{}", od_gory);
+        assert!(!od_gory.contains("Szybki Skan"), "bez przewinięcia koniec NIE powinien być jeszcze widoczny:\n{}", od_gory);
+
+        ts.select(Some(999));
+        terminal.draw(|f| draw_paths_panel(f, &app, f.area(), &mut ts, true)).unwrap();
+        let od_dolu = ekran(terminal.backend().buffer());
+        assert!(od_dolu.contains("Szybki Skan"), "po przewinięciu do końca ostatnia linia musi być widoczna:\n{}", od_dolu);
     }
 }
