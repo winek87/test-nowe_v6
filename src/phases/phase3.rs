@@ -327,6 +327,73 @@ pub struct StreamCtx<'a> {
     pub start_time: Instant,
 }
 
+/// Odnotowuje, że JEDEN plik z `chunk` został "rozpatrzony" — niezależnie od
+/// tego, czy zakończyło się to sukcesem, błędem `File::open`, błędem odczytu
+/// nagłówka, czy okazał się pusty. Wołane z KAŻDEJ z czterech ścieżek
+/// wyjścia pętli w [`process_side_stream`].
+///
+/// ## Dlaczego to w ogóle istnieje jako osobna funkcja (regresja z audytu)
+///
+/// `stats.processed_files`/`processed_bytes` napędzają widoczny operatorowi
+/// pasek postępu (`current` w [`PhaseEvent::UpdateBar`]) — a wcześniej były
+/// inkrementowane WYŁĄCZNIE na końcu "normalnej" ścieżki (plik otwarty,
+/// nagłówek odczytany, niepusty). Trzy pozostałe ścieżki (błąd otwarcia,
+/// błąd odczytu nagłówka, PUSTY plik — nawet przy udanym zahashowaniu
+/// pustki) kończyły się wcześniejszym `continue`, więc licznik nigdy ich nie
+/// widział. Efekt: pasek postępu nigdy nie osiągał wizualnie 100% na
+/// korpusach z wieloma pustymi/uszkodzonymi plikami — mimo że same dane w
+/// bazie były poprawne (te pliki i tak trafiały do `results`, ginęło tylko
+/// odzwierciedlenie postępu w UI, nie same dane).
+#[allow(clippy::too_many_arguments)]
+fn advance_progress(
+    stats: &LiveStats,
+    other_stats: &LiveStats,
+    tx_ui: &mpsc::Sender<PhaseEvent>,
+    bar_idx: usize,
+    start_time: Instant,
+    last_ui_update: &mut Instant,
+    local_ext_weights: &mut HashMap<String, u64>,
+    full_path: &Path,
+    task: &Task,
+    file_size: u64,
+) {
+    stats.processed_files.fetch_add(1, Ordering::Relaxed);
+    stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
+
+    let current = stats.processed_files.load(Ordering::Relaxed);
+    let now = Instant::now();
+
+    // Stabilne odświeżanie UI - stoper nie resetuje się na każdym 500-elementowym chunku
+    if now.duration_since(*last_ui_update).as_millis() > 60 {
+        *last_ui_update = now;
+
+        if !local_ext_weights.is_empty() {
+            let mut global_map = stats.ext_weights.lock().unwrap();
+            for (k, v) in local_ext_weights.drain() {
+                *global_map.entry(k).or_insert(0) += v;
+            }
+        }
+
+        let _ = tx_ui.send(PhaseEvent::UpdateBar {
+            idx: bar_idx,
+            current: current as u64,
+            message: format_display_path(&task.rel_path),
+        });
+        let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
+            idx: bar_idx,
+            path: full_path.to_string_lossy().to_string(),
+        });
+        let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+            idx: 0,
+            text: build_crypto_block(stats, other_stats, start_time),
+        });
+        let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+            idx: 1,
+            text: build_anomaly_block(stats, other_stats),
+        });
+    }
+}
+
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 #[allow(clippy::match_like_matches_macro)]
@@ -342,6 +409,25 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let mut results = Vec::with_capacity(chunk.len());
             let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
 
+            // REGRESJA (todo.faza03.md): liczniki `processed_files`/
+            // `processed_bytes` — a więc i pasek postępu, który czyta
+            // wyłącznie `processed_files` (patrz `current` niżej) —
+            // były inkrementowane WYŁĄCZNIE na końcu "normalnej" ścieżki
+            // (plik otwarty, nagłówek odczytany, niepusty). Trzy inne
+            // ścieżki wyjścia z pętli (błąd `File::open`, błąd odczytu
+            // nagłówka, PUSTY plik — nawet przy udanym zahashowaniu
+            // pustki) kończyły się wcześniejszym `continue` PRZED tym
+            // punktem. Efekt: pasek postępu nigdy nie osiągał
+            // wizualnie 100% na korpusach z wieloma pustymi/uszkodzonymi
+            // plikami, mimo że baza danych była w pełni poprawna (te
+            // pliki i tak trafiały do `results`, więc dane nie ginęły —
+            // ginęło tylko odzwierciedlenie postępu w UI).
+            //
+            // Naprawa: WSPÓLNA funkcja wołana z KAŻDEJ z czterech ścieżek
+            // wyjścia — każdy plik z `chunk` inkrementuje licznik dokładnie
+            // raz, niezależnie od tego, jak się skończył (patrz definicja
+            // niżej pliku: `advance_progress`).
+
             for task in chunk {
                 if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
 
@@ -354,6 +440,8 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         // Logujemy do lokalnego wektora zamiast blokować Mutexa
                         log_buf.push(format!("[{}] Błąd I/O (Brak dostępu): \"{}\"", side_label, task.rel_path));
                         results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        // Rozmiar nieznany - plik nigdy się nie otworzył, nie ma czego zmierzyć.
+                        advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, 0);
                         continue;
                     }
                 };
@@ -380,6 +468,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
                         log_buf.push(format!("[{}] Błąd I/O (odczyt nagłówka): \"{}\"", side_label, task.rel_path));
                         results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
                         continue;
                     }
                 };
@@ -408,6 +497,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                             results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
                         }
                     }
+                    advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
                     continue;
                 }
 
@@ -514,50 +604,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
 
-                stats.processed_files.fetch_add(1, Ordering::Relaxed);
-                stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
-
-                let current = stats.processed_files.load(Ordering::Relaxed);
-                let now = Instant::now();
-                
-                // Stabilne odświeżanie UI - stoper nie resetuje się na każdym 500-elementowym chunku
-                if now.duration_since(*last_ui_update).as_millis() > 60 {
-                    *last_ui_update = now; 
-
-                    if !local_ext_weights.is_empty() {
-                        let mut global_map = stats.ext_weights.lock().unwrap();
-                        for (k, v) in local_ext_weights.drain() {
-                            *global_map.entry(k).or_insert(0) += v;
-                        }
-                    }
-
-                    let _ = tx_ui.send(PhaseEvent::UpdateBar {
-                        idx: bar_idx,
-                        current: current as u64,
-                        message: format_display_path(&task.rel_path),
-                    });
-
-                    // REGRESJA (menu/dashboard — naprawa dolnego panelu ścieżek):
-                    // brakowało tu tej wysyłki, mimo że blok odświeżania UI już
-                    // istniał — dolny panel "Aktualnie skanowane ścieżki" (patrz
-                    // `tui::scanner_panel::draw_bottom_paths_panel`) zostawał na
-                    // "(Oczekiwanie na dane...)" przez CAŁĄ Fazę 3, w przeciwieństwie
-                    // do 14 pozostałych faz. Ten sam wzorzec co `phase4.rs`/
-                    // `phase5.rs`/`phase6.rs`/`phase7.rs`.
-                    let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
-                        idx: bar_idx,
-                        path: full_path.to_string_lossy().to_string(),
-                    });
-
-                    let _ = tx_ui.send(PhaseEvent::UpdateSideText {
-                        idx: 0,
-                        text: build_crypto_block(stats, other_stats, start_time),
-                    });
-                    let _ = tx_ui.send(PhaseEvent::UpdateSideText {
-                        idx: 1,
-                        text: build_anomaly_block(stats, other_stats),
-                    });
-                }
+                advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
 
                 results.push(ScanResult {
                     id: task.id,
@@ -1464,5 +1511,94 @@ mod tests {
         let r = &wyniki[0];
         assert!(r.hash.is_some(), "pusty plik ma poprawny hash BLAKE3 pustego ciągu, nie None");
         assert_eq!(r.io_error, Some(false), "pusty plik to NIE jest błąd I/O");
+    }
+
+    // ------------------------------------------------------------------
+    // REGRESJA (todo.faza03.md): pasek postępu musi liczyć KAŻDY plik z
+    // `chunk`, nie tylko te, które przeszły "normalną" ścieżkę.
+    // ------------------------------------------------------------------
+
+    fn uruchom_strumien_i_zwroc_postep(base_path: &Path, zadania: Vec<Task>) -> (Vec<ScanResult>, usize, u64) {
+        let stats = LiveStats::new(1);
+        let other_stats = LiveStats::new(1);
+        let (tx_db, rx_db) = mpsc::sync_channel(8);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let opr_log = Arc::new(Mutex::new(File::create(log_dir.path().join("log.txt")).unwrap()));
+
+        process_side_stream(StreamCtx {
+            base_path,
+            tasks: &zadania,
+            side_label: "UFS Explorer",
+            stats: &stats,
+            other_stats: &other_stats,
+            tx_db,
+            is_ufs: true,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            opr_log,
+            start_time: Instant::now(),
+        });
+
+        let mut wyniki = Vec::new();
+        while let Ok(msg) = rx_db.try_recv() {
+            match msg {
+                ScanMsg::UfsChunk(r) | ScanMsg::ScriptChunk(r) => wyniki.extend(r),
+            }
+        }
+        (wyniki, stats.processed_files.load(Ordering::Relaxed), stats.processed_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Sedno naprawy: MIESZANKA czterech różnych ścieżek wyjścia w JEDNEJ
+    /// paczce — brak pliku (`File::open` zawodzi), katalog-jako-plik (błąd
+    /// odczytu nagłówka), prawdziwie pusty plik (sukces, ale wcześniejszy
+    /// `continue`) i zwykły niepusty plik (ścieżka "normalna"). Wszystkie
+    /// CZTERY muszą podnieść `processed_files` dokładnie raz — przed
+    /// naprawą tylko ostatni by to zrobił, a pasek postępu zatrzymywałby
+    /// się na 25% mimo ukończenia całej paczki.
+    #[test]
+    fn test_kazda_z_czterech_sciezek_wyjscia_liczy_sie_do_postepu() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("katalog")).unwrap();
+        std::fs::write(dir.path().join("pusty.bin"), b"").unwrap();
+        std::fs::write(dir.path().join("zwykly.bin"), b"tresc pliku").unwrap();
+        // "brak.bin" celowo NIE tworzony - File::open musi zawieść.
+
+        let zadania = vec![
+            Task { id: 1, rel_path: "brak.bin".to_string() },
+            Task { id: 2, rel_path: "katalog".to_string() },
+            Task { id: 3, rel_path: "pusty.bin".to_string() },
+            Task { id: 4, rel_path: "zwykly.bin".to_string() },
+        ];
+
+        let (wyniki, przetworzone, _bajty) = uruchom_strumien_i_zwroc_postep(dir.path(), zadania);
+
+        assert_eq!(wyniki.len(), 4, "żaden plik nie może zniknąć bez wyniku");
+        assert_eq!(
+            przetworzone, 4,
+            "pasek postępu (processed_files) musi policzyć WSZYSTKIE cztery pliki, \
+             niezależnie od tego, którą z czterech ścieżek wyjścia przeszły - \
+             inaczej operator widzi pasek zatrzymany poniżej 100% mimo ukończonej fazy"
+        );
+    }
+
+    /// `processed_bytes` (używane do wyliczenia prędkości MB/s) musi
+    /// doliczyć wolumen zwykłego pliku, nawet gdy w tej samej paczce inne
+    /// pliki nie mają znanego rozmiaru (błąd otwarcia).
+    #[test]
+    fn test_processed_bytes_liczy_wolumen_mimo_bledow_w_tej_samej_paczce() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zwykly.bin"), &vec![0u8; 500]).unwrap();
+
+        let zadania = vec![
+            Task { id: 1, rel_path: "brak.bin".to_string() },
+            Task { id: 2, rel_path: "zwykly.bin".to_string() },
+        ];
+
+        let (_wyniki, przetworzone, bajty) = uruchom_strumien_i_zwroc_postep(dir.path(), zadania);
+
+        assert_eq!(przetworzone, 2);
+        assert_eq!(bajty, 500, "wolumen brakującego pliku wynosi 0, ale zwykły plik musi się doliczyć");
     }
 }
