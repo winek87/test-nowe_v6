@@ -30,6 +30,7 @@ mod header_png;
 mod header_raster;
 mod archive;
 mod dng;
+mod tiff;
 mod heic;
 mod jpeg;
 mod mkv;
@@ -632,6 +633,10 @@ pub fn all_modules() -> Vec<Box<dyn RepairModule>> {
         // DNG — składanie strukturalne (gwarancja SŁABA, patrz dokumentacja
         // modułu). Przed `splice`, bo bajtowe zszycie nie zna TIFF/IFD.
         Box::new(dng::DngStructuralModule),
+        // Zwykły TIFF — TEN SAM silnik (dng_splice), ale weryfikowany przez
+        // `image`, nie `rawloader` (rawloader dekoduje RAW z aparatu, nie
+        // zwykłą fotografię TIFF). Przed `splice` z tego samego powodu.
+        Box::new(tiff::TiffStructuralModule),
         // Archiwa — składanie per wpis z dwóch kopii. Przed `splice`, bo
         // bajtowe zszycie nie zna struktury wpisów; uzasadnienie i różnica
         // siły gwarancji ZIP vs TAR w dokumentacji `repair_modules::archive`.
