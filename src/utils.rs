@@ -51,11 +51,29 @@ pub fn zdejmij_przerwanie() {
 /// które mogłyby zepsuć bufor rysowania (Anti-Terminal-Breaking).
 pub fn format_display_path(full_path: &str) -> String {
     let sanitize = |c: char| {
-        if c.is_control() || c as u32 > 0x25FF {
-            '_'
-        } else {
-            c
-        }
+        if c.is_control() { return '_'; }
+
+        let cp = c as u32;
+        if cp <= 0x25FF { return c; }
+
+        // REGRESJA (todo.core_infra.md): próg `> 0x25FF` blokował WSZYSTKO
+        // powyżej tej wartości bez rozróżnienia - w tym całe legalne
+        // alfabety powszechne w realnych korpusach danych: japoński/chiński
+        // (Hiragana/Katakana/CJK zaczynają się od U+3040), koreański
+        // (Hangul Jamo od U+1100, Hangul Syllables od U+AC00) - zamieniając
+        // poprawne nazwy plików w ciąg podkreślników w UI. Jawnie
+        // dopuszczamy te bloki, zachowując blokadę dla wszystkiego innego
+        // powyżej progu (w tym emoji, które nadal ma zostać zablokowane -
+        // stąd próg pozostaje, nie jest usuwany całkowicie).
+        let jest_dopuszczonym_alfabetem =
+            (0x1100..=0x11FF).contains(&cp)    // Hangul Jamo
+            || (0x3000..=0x303F).contains(&cp) // Interpunkcja CJK (、。「」)
+            || (0x3040..=0x30FF).contains(&cp) // Hiragana + Katakana
+            || (0x3400..=0x4DBF).contains(&cp) // CJK Unified Ideographs Extension A
+            || (0x4E00..=0x9FFF).contains(&cp) // CJK Unified Ideographs
+            || (0xAC00..=0xD7A3).contains(&cp); // Hangul Syllables
+
+        if jest_dopuszczonym_alfabetem { c } else { '_' }
     };
 
     full_path.chars().map(sanitize).collect()
@@ -165,6 +183,24 @@ pub fn check_magic(path: &Path) -> Option<bool> {
         return Some(true); // Brak rozszerzenia -> brak punktu odniesienia do falsyfikacji
     }
 
+    // REGRESJA (todo.core_infra.md): ukryte pliki uniksowe (`.bashrc`,
+    // `.xauthority`, `.gitignore`) mają wiodącą kropkę jako część KONWENCJI
+    // NAZEWNICZEJ, nie jako separator rozszerzenia - cała nazwa PO kropce to
+    // ich WŁAŚCIWA NAZWA, nie rozszerzenie do zweryfikowania. Bez tego
+    // rozróżnienia `.bashrc` trafiał w tę samą gałąź co `plik.jpg` -
+    // `ext_parts` stawało się `["bashrc"]`, więc KAŻDY ukryty plik z realnie
+    // rozpoznawalną sygnaturą binarną (np. ukryty JPG/PNG/ZIP zapisany bez
+    // właściwego rozszerzenia - dokładnie scenariusz, który to narzędzie ma
+    // WYKRYWAĆ, nie fałszywie oskarżać) dostawał fałszywy "Spoofing Alert"
+    // tylko dlatego, że jego WŁASNA NAZWA nie zgadzała się z jego prawdziwym
+    // typem. Sprawdzamy więc, czy poza WIODĄCĄ kropką istnieje jeszcze
+    // JAKAKOLWIEK inna - jeśli nie, traktujemy to tak samo jak "brak
+    // rozszerzenia" wyżej.
+    let nazwa_bez_wiodacej_kropki = file_name.strip_prefix('.').unwrap_or(file_name.as_str());
+    if !nazwa_bez_wiodacej_kropki.contains('.') {
+        return Some(true);
+    }
+
     let parts: Vec<&str> = file_name.split('.').filter(|s| !s.is_empty()).collect();
     let ext_parts = if parts.len() > 1 { &parts[1..] } else { &parts[0..] };
 
@@ -257,6 +293,34 @@ mod tests {
         assert_eq!(result, long_path);
     }
 
+    /// REGRESJA (todo.core_infra.md): próg sanityzacji blokował CAŁE
+    /// alfabety CJK/Hangul, nie tylko emoji/znaki kontrolne. Nazwy plików w
+    /// tych alfabetach są częste w realnych korpusach (np. zrzuty z
+    /// urządzeń japońskich/koreańskich) i muszą przechodzić bez zmian.
+    #[test]
+    fn test_znaki_cjk_i_hangul_przechodza_bez_zmian() {
+        assert_eq!(format_display_path("/dane/写真.jpg"), "/dane/写真.jpg", "CJK Unified Ideographs");
+        assert_eq!(format_display_path("/dane/ひらがな.jpg"), "/dane/ひらがな.jpg", "Hiragana");
+        assert_eq!(format_display_path("/dane/カタカナ.jpg"), "/dane/カタカナ.jpg", "Katakana");
+        assert_eq!(format_display_path("/dane/한글파일.jpg"), "/dane/한글파일.jpg", "Hangul Syllables");
+    }
+
+    /// Kontrola pozytywna: naprawa nie może wyłączyć blokady w ogóle -
+    /// prawdziwe emoji (płaszczyzna dodatkowa, znacznie powyżej progu) nadal
+    /// musi zostać zamienione na `_`.
+    #[test]
+    fn test_prawdziwe_emoji_nadal_jest_blokowane() {
+        let wynik = format_display_path("/dane/plik😀.jpg");
+        assert!(!wynik.contains('😀'), "emoji musi zostać zablokowane: {}", wynik);
+        assert_eq!(wynik, "/dane/plik_.jpg");
+    }
+
+    #[test]
+    fn test_znaki_kontrolne_nadal_sa_blokowane() {
+        let wynik = format_display_path("/dane/plik\x07dzwonek.jpg");
+        assert_eq!(wynik, "/dane/plik_dzwonek.jpg");
+    }
+
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(500), "500 B");
@@ -306,6 +370,53 @@ mod tests {
 
         let is_ok = check_magic(&new_path);
         assert_eq!(is_ok, Some(true));
+    }
+
+    // Sygnatura GZIP - wystarczy do rozpoznania przez `infer`, nie musi być
+    // kompletnym, poprawnym strumieniem (sniffing nagłówka, nie dekodowanie).
+    const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03reszta danych";
+
+    /// REGRESJA (todo.core_infra.md): plik ukryty uniksowy (`.bashrc` i
+    /// podobne) ma wiodącą kropkę jako KONWENCJĘ NAZEWNICZĄ, nie separator
+    /// rozszerzenia - jego treść nie ma z czym porównać, więc NIE MOŻE
+    /// dostać fałszywego alarmu "Spoofing", nawet gdy rozpoznawalna binarnie
+    /// (dokładnie odwrotność tego, co narzędzie ma wykrywać).
+    #[test]
+    fn test_ukryty_plik_bez_prawdziwego_rozszerzenia_nie_dostaje_falszywego_alarmu() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join(".ukryty_bez_rozszerzenia");
+        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+
+        assert_eq!(
+            check_magic(&sciezka), Some(true),
+            "plik ukryty BEZ prawdziwego rozszerzenia nie może dostać fałszywego alarmu spoofing"
+        );
+    }
+
+    /// Kontrola pozytywna: gdy ukryty plik MA realne (drugie) rozszerzenie,
+    /// wykrywanie fałszerstwa musi nadal działać poprawnie - naprawa dotyczy
+    /// wyłącznie przypadku "brak rozszerzenia", nie wyłącza detekcji w ogóle.
+    #[test]
+    fn test_ukryty_plik_z_prawdziwym_zlym_rozszerzeniem_nadal_wykrywa_spoofing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join(".ukryty.txt");
+        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+
+        assert_eq!(
+            check_magic(&sciezka), Some(false),
+            "GZIP zadeklarowany jako .txt musi zostać wykryty jako spoofing, nawet dla pliku ukrytego"
+        );
+    }
+
+    /// Skrajny przypadek: nazwa złożona z samych kropek nie może panikować
+    /// (regresja od strony bezpieczeństwa naprawy - `parts` może wyjść puste).
+    #[test]
+    fn test_nazwa_z_samych_kropek_nie_panikuje() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("...");
+        std::fs::write(&sciezka, b"cokolwiek").unwrap();
+
+        let _ = check_magic(&sciezka);
     }
 
     // ------------------------------------------------------------------
