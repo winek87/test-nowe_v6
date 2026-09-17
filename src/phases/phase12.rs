@@ -868,7 +868,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
     let info_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza12_zdrowe_media.txt");
 
-    let log_anom = Arc::new(Mutex::new(File::create(&opr_path).unwrap()));
+    // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
+    // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
+    // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
+    // powodu samego logowania, zanim jakikolwiek plik został przetworzony.
+    let log_anom_file = match File::create(&opr_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            return Ok(());
+        }
+    };
+    let log_anom = Arc::new(Mutex::new(log_anom_file));
     let log_info = Arc::new(Mutex::new(File::create(&info_path).unwrap()));
     
     {

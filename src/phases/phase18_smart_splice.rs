@@ -505,7 +505,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
     let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    let opr_log = Arc::new(Mutex::new(File::create(&opr_path).unwrap()));
+    // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
+    // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
+    // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
+    // powodu samego logowania, zanim jakikolwiek plik został przetworzony.
+    let opr_log_file = match File::create(&opr_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            return Ok(());
+        }
+    };
+    let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
         let mut f = opr_log.lock().unwrap();
         let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 18: INTELIGENTNA REKONSTRUKCJA ===");
