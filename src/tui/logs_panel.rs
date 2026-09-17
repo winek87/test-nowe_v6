@@ -7,19 +7,27 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, Borders, List, ListItem},
     Frame,
 };
 
 // Zakładamy, że po refaktoryzacji stan UI znajdzie się w module `state`
+use crate::tui::hardware_panel::KOLOR_FOKUSU;
 use crate::tui::state::PhaseUIState;
 
-/// Rysuje historyczne logi w formie listy. 
-/// Samodzielnie oblicza wcięcia i potrafi zawijać długie ciągi znaków 
+/// Rysuje historyczne logi w formie listy.
+/// Samodzielnie oblicza wcięcia i potrafi zawijać długie ciągi znaków
 /// (Intelligent Word-Wrap), aby uniknąć obcinania ważnych informacji.
-pub fn draw_logs(f: &mut Frame, state: &PhaseUIState, area: Rect) {
+///
+/// `focused` steruje WYŁĄCZNIE wizualnym sygnałem fokusu (obramowanie/tytuł)
+/// na ekranie fazy na żywo (Tab między panelami, `menu/actions.rs`) — dane
+/// przewijania (`state.log_scroll`) są od niego całkowicie niezależne, ten
+/// panel ma zawsze klawiaturowy fokus domyślnie (patrz `PanelWFokusie::Logi`
+/// jako wartość startowa), więc dotychczasowe zachowanie PageUp/PageDown/End
+/// dla kogoś, kto nigdy nie naciśnie Tab, zostaje bez zmian.
+pub fn draw_logs(f: &mut Frame, state: &PhaseUIState, area: Rect, focused: bool) {
     let max_width = area.width.saturating_sub(4).max(1) as usize; 
     let mut display_lines = Vec::new();
 
@@ -76,17 +84,27 @@ pub fn draw_logs(f: &mut Frame, state: &PhaseUIState, area: Rect) {
         Some(cofniecie) => bottom_start.saturating_sub(cofniecie),
     };
 
-    let tytul = if state.log_scroll.is_some() {
-        " Logi Operacyjne (Przewijanie ręczne — [End] wróć do końca) "
+    let tryb = if state.log_scroll.is_some() {
+        "Przewijanie ręczne — [End] wróć do końca"
     } else {
-        " Logi Operacyjne (Auto-Scroll) "
+        "Auto-Scroll"
+    };
+    let tytul = if focused {
+        format!(" ▶ Logi Operacyjne ({}) (aktywny — ↑↓ PgUp/PgDn) ", tryb)
+    } else {
+        format!(" Logi Operacyjne ({}) [Tab] ", tryb)
+    };
+    let border_styl = if focused {
+        Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
 
     let list = List::new(display_lines[start_idx..].to_vec())
         .block(Block::default()
             .borders(Borders::ALL)
             .title(tytul)
-            .border_style(Style::default().fg(Color::DarkGray)));
+            .border_style(border_styl));
 
     f.render_widget(list, area);
 }
@@ -110,7 +128,7 @@ mod tests {
 
     fn wyrenderuj(szer: u16, wys: u16, state: &PhaseUIState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(szer, wys)).unwrap();
-        terminal.draw(|f| { let obszar = f.area(); draw_logs(f, state, obszar); }).unwrap();
+        terminal.draw(|f| { let obszar = f.area(); draw_logs(f, state, obszar, false); }).unwrap();
         ekran(terminal.backend().buffer())
     }
 
@@ -218,5 +236,38 @@ mod tests {
         for (szer, wys) in [(1u16, 1u16), (5, 2), (20, 3), (200, 60)] {
             let _ = wyrenderuj(szer, wys, &s);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FOKUS (Tab między panelami na ekranie fazy na żywo)
+    // ------------------------------------------------------------------
+
+    fn wyrenderuj_z_fokusem(szer: u16, wys: u16, state: &PhaseUIState, focused: bool) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(szer, wys)).unwrap();
+        terminal.draw(|f| { let obszar = f.area(); draw_logs(f, state, obszar, focused); }).unwrap();
+        ekran(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn test_tytul_logow_odzwierciedla_fokus_niezaleznie_od_trybu_przewijania() {
+        let s = stan_z_logami(5);
+
+        let bez_fokusu = wyrenderuj_z_fokusem(80, 10, &s, false);
+        assert!(bez_fokusu.contains("Tab"), "widok:\n{}", bez_fokusu);
+        assert!(bez_fokusu.contains("Auto-Scroll"), "tryb przewijania musi zostać widoczny mimo braku fokusu:\n{}", bez_fokusu);
+
+        let z_fokusem = wyrenderuj_z_fokusem(80, 10, &s, true);
+        assert!(z_fokusem.contains("aktywny"), "widok:\n{}", z_fokusem);
+        assert!(z_fokusem.contains("Auto-Scroll"), "tryb przewijania musi zostać widoczny mimo fokusu:\n{}", z_fokusem);
+    }
+
+    #[test]
+    fn test_tytul_logow_w_recznym_przewijaniu_z_fokusem_pokazuje_oba_sygnaly() {
+        let mut s = stan_z_logami(100);
+        s.scroll_logs_up(10);
+
+        let widok = wyrenderuj_z_fokusem(80, 10, &s, true);
+        assert!(widok.contains("aktywny"), "widok:\n{}", widok);
+        assert!(widok.contains("Przewijanie ręczne"), "widok:\n{}", widok);
     }
 }

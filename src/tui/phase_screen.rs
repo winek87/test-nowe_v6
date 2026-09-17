@@ -19,7 +19,11 @@ use crate::tui::logs_panel::draw_logs;
 
 /// Główny orkiestrator rysowania roboczego ekranu Fazy (Zajmuje prawą stronę Dashboardu).
 /// Automatycznie dzieli powierzony mu `Rect` na Nagłówek, Paski Postępu i Logi na całej szerokości.
-pub fn draw_phase_screen(f: &mut Frame, state: &PhaseUIState, area: Rect) {
+///
+/// `logs_focused` jest czystym przekazaniem dalej do [`draw_logs`] — patrz
+/// jej dokumentacja i `menu/actions.rs::PanelWFokusie` (Tab między panelami
+/// na ekranie fazy na żywo).
+pub fn draw_phase_screen(f: &mut Frame, state: &PhaseUIState, area: Rect, logs_focused: bool) {
     let bars_height = (state.progress_bars.len() as u16) * 3;
 
     let chunks = Layout::default()
@@ -38,7 +42,7 @@ pub fn draw_phase_screen(f: &mut Frame, state: &PhaseUIState, area: Rect) {
     }
     
     // Logi zajmują całą szerokość prawej strony ekranu
-    draw_logs(f, state, chunks[2]);
+    draw_logs(f, state, chunks[2], logs_focused);
 }
 
 // --- KOMPONENT Wewnętrzny: NAGŁÓWEK FAZY ---
@@ -85,7 +89,7 @@ mod tests {
 
     fn wyrenderuj(szer: u16, wys: u16, state: &PhaseUIState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(szer, wys)).unwrap();
-        terminal.draw(|f| { let obszar = f.area(); draw_phase_screen(f, state, obszar); }).unwrap();
+        terminal.draw(|f| { let obszar = f.area(); draw_phase_screen(f, state, obszar, false); }).unwrap();
         ekran(terminal.backend().buffer())
     }
 
