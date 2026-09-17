@@ -11,11 +11,18 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 
 use crate::menu::state::AppState;
+
+/// Barwa obramowania i tytułu panelu, gdy to ON ma fokus klawiatury (ekran
+/// fazy na żywo, `menu/actions.rs::run_phase_z_opcjami` — Tab między
+/// panelami). Wspólna dla wszystkich fokusowalnych paneli, żeby operator
+/// rozpoznawał "aktywny panel" jednym spójnym kolorem niezależnie od tego,
+/// który to panel — patrz też `scanner_panel.rs`/`logs_panel.rs`.
+pub const KOLOR_FOKUSU: Color = Color::Magenta;
 
 /// Konwersja procentu obciążenia (0-100) na barwę krytyczną dla TUI (System Termowizji).
 pub fn get_thermal_color_ratatui(pct: f64) -> Color {
@@ -57,18 +64,45 @@ pub fn draw_hw_panel(f: &mut Frame, app: &AppState, area: Rect) {
     f.render_widget(hw_paragraph, area);
 }
 
-pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect) {
+/// Rysuje tabelę zamontowanych dysków. Podczas ekranu fazy na żywo
+/// (`menu/actions.rs`) tabela jest stanowa i fokusowalna klawiszem Tab —
+/// `table_state.selected()` wskazuje podświetlony wiersz (Ratatui sam
+/// przesuwa widoczny zakres, żeby zaznaczenie było zawsze widoczne — ten
+/// sam mechanizm co `ListState` w `dashboard.rs`), a `focused` steruje TYLKO
+/// warstwą wizualną (kolor obramowania/tytuł) — podświetlenie wiersza jest
+/// widoczne niezależnie od fokusu, dokładnie jak zaznaczenie w
+/// `dashboard.rs`. Na bezczynnym ekranie menu (`dashboard.rs`) wywołujący
+/// przekazuje jednorazowy, odrzucany `TableState` i `focused: false`.
+pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect, table_state: &mut TableState, focused: bool) {
+    // Samoleczący zatrzask: jeśli dysk zniknął (np. odpięty nośnik) między
+    // naciśnięciami klawiszy a tą klatką, zaznaczenie wraca w zakres zamiast
+    // trwale wskazywać "donikąd" — patrz identyczny wzorzec w
+    // `scanner_panel::draw_side_stats_panel`.
+    if let Some(i) = table_state.selected()
+        && i >= app.disk_list.len() {
+            table_state.select(if app.disk_list.is_empty() { None } else { Some(app.disk_list.len() - 1) });
+        }
+    let wybrany = table_state.selected();
     let mut disk_rows = Vec::new();
-    for disk in &app.disk_list {
+    for (i, disk) in app.disk_list.iter().enumerate() {
         let free_color = if disk.available_gb > 50.0 { Color::Green } else if disk.available_gb > 10.0 { Color::Yellow } else { Color::Red };
+        let zaznaczony = wybrany == Some(i);
+        let prefix = if zaznaczony { "❯ " } else { "  " };
+        let nazwa_styl = if zaznaczony {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
         disk_rows.push(Row::new(vec![
-            Cell::from(format!("[ 💽 ] /dev/{}", disk.name)).style(Style::default().fg(Color::Cyan)),
+            Cell::from(format!("{}[ 💽 ] /dev/{}", prefix, disk.name)).style(nazwa_styl),
             Cell::from(disk.mount_point.clone()),
             Cell::from(format!("{:.1} / {:.1} GB", disk.used_gb, disk.total_gb)),
             Cell::from(format!("{:.1} GB", disk.available_gb)).style(Style::default().fg(free_color)),
             Cell::from(format!("{:.1}%", disk.usage_pct)),
         ]));
     }
+    let tytul = if focused { " ▶ Dyski Fizyczne (aktywny — ↑↓ PgUp/PgDn) " } else { " Dyski Fizyczne [Tab] " };
+    let border_styl = if focused { Style::default().fg(KOLOR_FOKUSU).add_modifier(Modifier::BOLD) } else { Style::default() };
     let disks_table = Table::new(disk_rows, &[
         Constraint::Percentage(25),
         Constraint::Percentage(25),
@@ -78,8 +112,8 @@ pub fn draw_disks_panel(f: &mut Frame, app: &AppState, area: Rect) {
     ])
     .header(Row::new(vec![
         "[ 💽 ] URZĄDZENIE", "PUNKT MONTOWANIA", "ZAJĘTE / RAZEM GB", "WOLNE GB", "Zajętość %"]).style(Style::default().fg(Color::DarkGray)))
-    .block(Block::default().borders(Borders::ALL).title(" Dyski Fizyczne "));
-    f.render_widget(disks_table, area);
+    .block(Block::default().borders(Borders::ALL).title(tytul).border_style(border_styl));
+    f.render_stateful_widget(disks_table, area, table_state);
 }
 
 /// Wysokość (w wierszach terminala) wymagana przez [`draw_paths_panel`], żeby
@@ -289,9 +323,76 @@ mod tests {
         let mut u = Ustawienia::default();
         for (szer, wys) in [(1u16, 1u16), (10, 3), (20, 5), (200, 60)] {
             let _ = wyrenderuj(szer, wys, &mut u, draw_hw_panel);
-            let _ = wyrenderuj(szer, wys, &mut u, draw_disks_panel);
             let _ = wyrenderuj(szer, wys, &mut u, draw_paths_panel);
+            let _ = wyrenderuj(szer, wys, &mut u, |f, app, area| {
+                draw_disks_panel(f, app, area, &mut TableState::default(), false)
+            });
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FOKUS I ZAZNACZENIE (Tab między panelami na ekranie fazy na żywo)
+    // ------------------------------------------------------------------
+
+    fn dysk(nazwa: &str) -> crate::menu::state::DiskInfo {
+        crate::menu::state::DiskInfo {
+            name: nazwa.to_string(),
+            mount_point: format!("/mnt/{}", nazwa),
+            used_gb: 10.0,
+            total_gb: 100.0,
+            available_gb: 90.0,
+            usage_pct: 10.0,
+        }
+    }
+
+    #[test]
+    fn test_tytul_panelu_dyskow_odzwierciedla_fokus() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let mut ts = TableState::default();
+
+        terminal.draw(|f| draw_disks_panel(f, &app, f.area(), &mut ts, false)).unwrap();
+        let bez_fokusu = ekran(terminal.backend().buffer());
+        assert!(bez_fokusu.contains("Tab"), "Bez fokusu tytuł musi podpowiadać klawisz:\n{}", bez_fokusu);
+
+        terminal.draw(|f| draw_disks_panel(f, &app, f.area(), &mut ts, true)).unwrap();
+        let z_fokusem = ekran(terminal.backend().buffer());
+        assert!(z_fokusem.contains("aktywny"), "Z fokusem tytuł musi to jawnie nazwać:\n{}", z_fokusem);
+    }
+
+    #[test]
+    fn test_zaznaczony_dysk_ma_widoczny_prefiks_niezaleznie_od_fokusu() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+        app.disk_list = vec![dysk("sda"), dysk("sdb"), dysk("sdc")];
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let mut ts = TableState::default();
+        ts.select(Some(1));
+
+        terminal.draw(|f| draw_disks_panel(f, &app, f.area(), &mut ts, false)).unwrap();
+        let widok = ekran(terminal.backend().buffer());
+        assert!(widok.contains("❯"), "Zaznaczenie musi być widoczne nawet bez fokusu (jak w dashboard.rs):\n{}", widok);
+    }
+
+    /// `selected()` wskazujący poza aktualną liczbą dysków (np. lista dysków
+    /// skurczyła się między klatkami po odpięciu nośnika) nie może panikować.
+    #[test]
+    fn test_zaznaczenie_poza_zakresem_nie_panikuje() {
+        let mut u = Ustawienia::default();
+        let mut app = AppState::new(&mut u).expect("stan menu musi się zbudować");
+        app.tick_hw();
+        app.disk_list = vec![dysk("sda")];
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let mut ts = TableState::default();
+        ts.select(Some(999));
+
+        let _ = terminal.draw(|f| draw_disks_panel(f, &app, f.area(), &mut ts, true));
     }
 
     // ------------------------------------------------------------------

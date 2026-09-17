@@ -8,7 +8,7 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, TableState},
     Frame,
 };
 
@@ -48,7 +48,11 @@ pub fn draw_dashboard(f: &mut Frame, app: &AppState) {
     draw_hw_panel(f, app, chunks[1]);
 
     // --- 2: TABELA DYSKÓW FIZYCZNYCH ---
-    draw_disks_panel(f, app, chunks[2]);
+    // Bezczynny ekran menu nie ma pojęcia fokusu/klawiatury per-panel (to
+    // istnieje wyłącznie na ekranie trwającej fazy, `menu/actions.rs`) —
+    // jednorazowy, odrzucany stan i `focused: false` dają dokładnie
+    // dotychczasowe zachowanie (bez podświetlenia, bez zmiany tytułu).
+    draw_disks_panel(f, app, chunks[2], &mut TableState::default(), false);
 
     // --- 3: KONFIGURACJA ŚRODOWISKA ---
     draw_paths_panel(f, app, chunks[3]);
