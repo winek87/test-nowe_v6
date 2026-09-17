@@ -110,6 +110,29 @@ mod tests {
         assert!(!is_expected_panic_in_progress(), "Flaga musi zostać zdjęta mimo realnej paniki wewnątrz strażnika");
     }
 
+    /// Wszystkie pozostałe testy tego modułu sprawdzają MECHANIZM
+    /// (`catch_unwind`) na SYMULOWANYCH panikach — uzasadnienie w
+    /// `phases::phase13::tests::test_analyze_image_generic_branch_is_panic_guarded`:
+    /// crate `image` jest mocno ufuzzowane (Firefox), więc nie ma znanego,
+    /// stabilnego pliku wejściowego, który wiarygodnie wywoła w nim panikę.
+    /// Ten test domyka inną, węższą lukę: dowodzi, że `decode_guarded`
+    /// faktycznie POPRAWNIE PRZEPUSZCZA wynik prawdziwego, udanego
+    /// dekodowania (nie tylko poprawnie łapie sztuczne awarie) — na
+    /// prawdziwym pliku z dysku (`image/test_fixture.bmp`), tą samą drogą
+    /// (`image::open`), której używa Faza 13.
+    #[test]
+    #[ignore = "Wymaga image/test_fixture.bmp (already checked into repo). Uruchom z --ignored."]
+    fn test_decode_guarded_przepuszcza_prawdziwy_udany_odczyt_obrazu() {
+        let sciezka = std::path::Path::new("image/test_fixture.bmp");
+        let wynik = decode_guarded(|| image::open(sciezka));
+
+        let obraz = wynik
+            .expect("decode_guarded nie może zgubić wyniku udanego wywołania")
+            .expect("prawdziwy plik BMP z korpusu testowego musi się poprawnie zdekodować");
+        assert!(obraz.width() > 0 && obraz.height() > 0, "zdekodowany obraz musi mieć realne wymiary");
+        assert!(!is_expected_panic_in_progress(), "flaga musi pozostać zdjęta po udanym, niepanikującym wywołaniu");
+    }
+
     #[test]
     fn test_decode_guarded_nested_panics_do_not_leak_flag_state() {
         // Dwa kolejne wywołania na tym samym wątku (dokładnie jak w pętli
