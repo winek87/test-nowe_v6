@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, instrument, warn};
 
@@ -194,6 +195,84 @@ fn get_file_stats(path: &Path) -> std::result::Result<FileStats, std::io::Error>
     })
 }
 
+/// Jak często pętla oczekująca na wynik `lstat` sprawdza [`CANCEL_SIGNAL`] —
+/// patrz [`StatWatchdog`]. Kompromis: krótszy interwał = szybsza reakcja na
+/// Ctrl+C, ale też częstsze budzenie wątku bez powodu w normalnym,
+/// nieopóźnionym przypadku (koszt pomijalny wobec samego kosztu syscalla).
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Domyka lukę, w której [`CANCEL_SIGNAL`] jest sprawdzany wyłącznie MIĘDZY
+/// kolejnymi plikami w pętli (patrz `process_side_stream`) — jeśli sam
+/// pojedynczy `fs::symlink_metadata` (lstat) zawiesi się (typowo: martwe
+/// montowanie sieciowe / FUSE), operator naciskający Ctrl+C nie doczekałby
+/// się reakcji, dopóki ten JEDEN syscall by nie wrócił — co przy zawieszonym
+/// mountpoincie może oznaczać "nigdy" bez zewnętrznej interwencji (SIGKILL).
+///
+/// ## Mechanizm: stały wątek-towarzysz, NIE wątek na plik
+///
+/// Naiwne rozwiązanie ("odpal nowy wątek na każdy plik i czekaj z
+/// timeoutem") jest niedopuszczalnie kosztowne przy milionach plików —
+/// tworzenie wątku systemowego to realny koszt, wielokrotnie większy niż
+/// sam `lstat` w gorącym cache. Zamiast tego KAŻDY wątek roboczy Rayon
+/// (jeden `for_each_init` na wątek — patrz `process_side_stream`) tworzy
+/// SWÓJ WŁASNY, DŁUGOŻYJĄCY wątek-towarzysz JEDEN RAZ na cały przebieg
+/// strony, i zleca mu KOLEJNE pliki przez kanał — koszt jednorazowego
+/// `thread::spawn` amortyzuje się na cały bieg, a nie na pojedynczy plik.
+///
+/// Prywatna para kanałów per wątek roboczy (nie pula współdzielona) jest
+/// celowa: gdyby wiele wątków roboczych dzieliło JEDNĄ pulę wątków-
+/// towarzyszy, zawieszony syscall jednego pliku trwale "zjadałby" jednego
+/// współdzielonego workera, aż w końcu (przy kolejnych zawieszeniach)
+/// wyczerpałby całą pulę i zablokował WSZYSTKICH. Przy odizolowanych parach
+/// 1:1 zawieszenie dotyka wyłącznie TEGO JEDNEGO wątku roboczego Rayon —
+/// pozostałe kontynuują normalnie.
+///
+/// ## Co się dzieje z "porzuconym" zawieszonym wywołaniem
+///
+/// Gdy `stat_z_limitem` zwraca `None` (bo w międzyczasie zgłoszono
+/// anulowanie), wątek-towarzysz NIE jest zabijany (Rust/POSIX nie oferują
+/// bezpiecznego zabijania wątku w trakcie syscalla) — zostaje PORZUCONY.
+/// Jeśli kiedykolwiek dokończy swój `lstat`, spróbuje odesłać wynik, ale
+/// odbiorca (`rep_rx`) nie jest już czytany (globalny `CANCEL_SIGNAL`
+/// gwarantuje, że TEN wątek roboczy nigdy więcej nie zleci nowego zadania
+/// ani nie odczyta odpowiedzi) — więc wynik jest po prostu cicho gubiony,
+/// bez ryzyka pomylenia go z odpowiedzią na inny, późniejszy plik.
+struct StatWatchdog {
+    req_tx: mpsc::Sender<PathBuf>,
+    rep_rx: mpsc::Receiver<std::result::Result<FileStats, std::io::Error>>,
+}
+
+impl StatWatchdog {
+    fn new() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+        let (rep_tx, rep_rx) = mpsc::channel::<std::result::Result<FileStats, std::io::Error>>();
+        thread::spawn(move || {
+            for path in req_rx {
+                if rep_tx.send(get_file_stats(&path)).is_err() { break; }
+            }
+        });
+        Self { req_tx, rep_rx }
+    }
+
+    /// Zleca `lstat` wątkowi-towarzyszowi i czeka na wynik, sprawdzając
+    /// [`CANCEL_SIGNAL`] co [`CANCEL_POLL_INTERVAL`]. Zwraca `None`
+    /// NATYCHMIAST po najbliższym punkcie kontrolnym po zgłoszeniu
+    /// anulowania — nie czeka na faktyczne zakończenie zawieszonego
+    /// wywołania (patrz dokumentacja [`StatWatchdog`]).
+    fn stat_z_limitem(&self, path: PathBuf) -> Option<std::result::Result<FileStats, std::io::Error>> {
+        if self.req_tx.send(path).is_err() { return None; }
+        loop {
+            match self.rep_rx.recv_timeout(CANCEL_POLL_INTERVAL) {
+                Ok(wynik) => return Some(wynik),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if CANCEL_SIGNAL.load(Ordering::Relaxed) { return None; }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
 pub struct StreamCtx<'a> {
     pub base_path: &'a Path,
     pub tasks: &'a [Task],
@@ -212,10 +291,12 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
     let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log } = ctx;
 
     // for_each_init inicjalizuje lokalny stan dla KAŻDEGO wątku z osobna:
-    // (kanał, stoper utrzymywany między paczkami, lokalny bufor na logi tekstowe)
+    // (kanał, stoper utrzymywany między paczkami, lokalny bufor na logi
+    // tekstowe, wątek-towarzysz do lstat odpornego na zawieszenie — patrz
+    // dokumentacja `StatWatchdog`)
     tasks.par_chunks(CHUNK_SIZE).for_each_init(
-        || (tx_db.clone(), Instant::now(), Vec::new()),
-        |(tx, last_ui_update, log_buf), chunk| {
+        || (tx_db.clone(), Instant::now(), Vec::new(), StatWatchdog::new()),
+        |(tx, last_ui_update, log_buf, watchdog), chunk| {
             let mut results = Vec::with_capacity(chunk.len());
             let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
 
@@ -224,7 +305,12 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 let full_path = base_path.join(&task.rel_path);
 
-                let (stats_opt, io_err) = match stats.thread_activity.track_current(|| get_file_stats(&full_path)) {
+                let wynik_lstat = match stats.thread_activity.track_current(|| watchdog.stat_z_limitem(full_path.clone())) {
+                    Some(w) => w,
+                    None => break, // Anulowano podczas oczekiwania na zawieszone I/O — patrz `StatWatchdog`.
+                };
+
+                let (stats_opt, io_err) = match wynik_lstat {
                     Ok(s) => {
                         let size = s.size as u64;
                         stats.total_bytes.fetch_add(size, Ordering::Relaxed);
@@ -347,7 +433,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
     
-    let opr_log = Arc::new(Mutex::new(File::create(&opr_path).unwrap()));
+    // REGRESJA (todo.faza02.md): `.unwrap()` tu panikował, gdyby katalog
+    // logów stał się niezapisywalny między `create_dir_all` a tym miejscem
+    // (np. zablokowany przez antywirusa, drugą równoległą instancję, wolumin
+    // odmontowany w międzyczasie) — cały bieg fazy ginął z powodu samego
+    // logowania, zanim jakikolwiek plik został przetworzony. Ten sam wzorzec
+    // graceful fallback co w Fazie 1/10/13/17.
+    let opr_log_file = match File::create(&opr_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            return Ok(());
+        }
+    };
+    let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
         let mut f = opr_log.lock().unwrap();
         let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 2 (AKWIZYCJA ROZMIARÓW) ===");
@@ -638,6 +737,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut only_script = 0;
     let mut matched_bytes: u64 = 0;
     let mut mismatched_bytes_lost: u64 = 0;
+    // REGRESJA (todo.faza02.md, "cosmetic/reporting gap"): sekcja [2] liczyła
+    // wyłącznie liczbę plików unikalnych dla jednej strony, bez ich wolumenu
+    // w bajtach — w przeciwieństwie do sekcji [1], która od razu pokazuje
+    // "Zweryfikowany wolumen". Operator widział np. "Tylko w UFS: 40 000",
+    // ale nie miał jak ocenić, czy to 40 000 pustych plików, czy 40 000
+    // dużych nagrań wideo, bez ręcznego zapytania do bazy.
+    let mut only_ufs_bytes: u64 = 0;
+    let mut only_script_bytes: u64 = 0;
 
     // REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
     // obs. 2): `empty_ufs`/`empty_scr`/`errors` liczone były wcześniej z
@@ -689,8 +796,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                     else if larger.as_deref() == Some("SCRIPT") { script_won += 1; }
                 }
             },
-            (true, false) => only_ufs += 1,
-            (false, true) => only_script += 1,
+            (true, false) => { only_ufs += 1; if let Some(s) = s_ufs { only_ufs_bytes += s as u64; } }
+            (false, true) => { only_script += 1; if let Some(s) = s_scr { only_script_bytes += s as u64; } }
             _ => {}
         }
     }
@@ -716,8 +823,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
 
     let _ = writeln!(&mut final_report, "\n[ 2 ] UNIKALNE TRAFIENIA (Tylko na jednym z nośników):");
-    let _ = writeln!(&mut final_report, "   -> Tylko w UFS Explorer:       {}", only_ufs);
-    let _ = writeln!(&mut final_report, "   -> Tylko w Skrypcie Autorskim: {}\n", only_script);
+    let _ = writeln!(&mut final_report, "   -> Tylko w UFS Explorer:       {} (Wolumen: {})", only_ufs, format_bytes(only_ufs_bytes));
+    let _ = writeln!(&mut final_report, "   -> Tylko w Skrypcie Autorskim: {} (Wolumen: {})\n", only_script, format_bytes(only_script_bytes));
 
     let _ = writeln!(&mut final_report, "[ 3 ] ANOMALIE I BŁĘDY ODCZYTU I/O:");
     let _ = writeln!(&mut final_report, "   -> Puste pliki (Wydmuszki 0 B): {} (UFS: {}, Skrypt: {})", empty_ufs + empty_scr, empty_ufs, empty_scr);
@@ -744,6 +851,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         errors,
         empty_files = empty_ufs + empty_scr,
         matched_volume = format_bytes(matched_bytes),
+        only_ufs_volume = format_bytes(only_ufs_bytes),
+        only_script_volume = format_bytes(only_script_bytes),
         czas_trwania_sek = elapsed.as_secs_f64(),
         "Faza 2 zakończona"
     );
@@ -814,6 +923,84 @@ mod tests {
     #[test]
     fn test_brak_pliku_daje_blad() {
         assert!(get_file_stats(Path::new("/nie/ma/takiego/pliku")).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // StatWatchdog — regresja: Ctrl+C musi przerwać oczekiwanie na lstat,
+    // nawet gdy sam syscall się zawiesza (np. martwe montowanie sieciowe).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_stat_watchdog_normalny_plik_daje_taki_sam_wynik_co_bezposrednie_wywolanie() {
+        let dir = tempfile::tempdir().unwrap();
+        let plik = dir.path().join("a.bin");
+        utworz(&plik, &vec![0u8; 123]);
+
+        let watchdog = StatWatchdog::new();
+        let wynik = watchdog.stat_z_limitem(plik.clone()).expect("brak anulowania - musi zwrócić Some");
+
+        assert_eq!(wynik.unwrap().size, 123);
+    }
+
+    #[test]
+    fn test_stat_watchdog_propaguje_blad_io_tak_jak_wywolanie_bezposrednie() {
+        let watchdog = StatWatchdog::new();
+        let wynik = watchdog.stat_z_limitem(PathBuf::from("/nie/ma/takiego/pliku")).expect("brak anulowania - musi zwrócić Some");
+
+        assert!(wynik.is_err());
+    }
+
+    #[test]
+    fn test_stat_watchdog_wiele_kolejnych_zlecen_na_tym_samym_towarzyszu_dziala_poprawnie() {
+        // Sedno projektu: JEDEN wątek-towarzysz obsługuje WIELE plików pod
+        // rząd (reużycie, nie jednorazowe `thread::spawn` per plik) - musi
+        // poprawnie parować kolejne odpowiedzi z kolejnymi zleceniami.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        utworz(&a, &vec![0u8; 10]);
+        utworz(&b, &vec![0u8; 20]);
+
+        let watchdog = StatWatchdog::new();
+        assert_eq!(watchdog.stat_z_limitem(a).unwrap().unwrap().size, 10);
+        assert_eq!(watchdog.stat_z_limitem(b).unwrap().unwrap().size, 20);
+    }
+
+    /// Sedno naprawy: gdy `CANCEL_SIGNAL` jest już ustawiony ZANIM wątek-
+    /// towarzysz zdąży odpowiedzieć, oczekiwanie musi zakończyć się przy
+    /// najbliższym punkcie kontrolnym (`CANCEL_POLL_INTERVAL`), a nie czekać
+    /// w nieskończoność na wynik. Symulujemy "zawieszenie" NIE wysyłając w
+    /// ogóle żądania do kanału (nikt nigdy nie odpowie) - z punktu widzenia
+    /// `stat_z_limitem` jest to nieodróżnialne od realnie zawieszonego
+    /// `lstat` na martwym montowaniu sieciowym.
+    #[test]
+    #[ignore = "Mutuje globalny CANCEL_SIGNAL współdzielony ze wszystkimi testami \
+                w tym binarnym pliku testowym. cargo test domyślnie uruchamia testy \
+                równolegle w jednym procesie, więc równoczesny test odczytujący \
+                CANCEL_SIGNAL mógłby dostać fałszywe 'true'. Uruchamiaj świadomie: \
+                `cargo test -- --ignored test_stat_watchdog_anulowanie_przerywa_oczekiwanie_na_zawieszone_io`."]
+    fn test_stat_watchdog_anulowanie_przerywa_oczekiwanie_na_zawieszone_io() {
+        // Kanał BEZ żadnego wątku-towarzysza po drugiej stronie - żądanie
+        // trafia donikąd, więc odpowiedź NIGDY nie nadejdzie. Dokładny
+        // odpowiednik zawieszonego syscalla z punktu widzenia pętli
+        // oczekującej w `stat_z_limitem`.
+        let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+        let (_rep_tx, rep_rx) = mpsc::channel::<std::result::Result<FileStats, std::io::Error>>();
+        std::mem::forget(req_rx); // nikt nie odbiera - symulacja zawieszenia
+
+        let watchdog = StatWatchdog { req_tx, rep_rx };
+
+        CANCEL_SIGNAL.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        let wynik = watchdog.stat_z_limitem(PathBuf::from("/dowolna/sciezka"));
+        let czas = start.elapsed();
+        CANCEL_SIGNAL.store(false, Ordering::SeqCst); // Sprzątanie stanu globalnego po teście
+
+        assert!(wynik.is_none(), "anulowanie musi dać None, nie czekać na zawieszoną odpowiedź");
+        assert!(
+            czas < CANCEL_POLL_INTERVAL * 5,
+            "przerwanie musi nastąpić przy najbliższym punkcie kontrolnym, nie po arbitralnie długim czasie: {:?}", czas
+        );
     }
 
     /// Faza 2 używa `symlink_metadata`, więc NIE podąża za dowiązaniem.
@@ -1341,6 +1528,62 @@ mod tests {
         assert!(
             dziennik.contains("Trwałe błędy dyskowe (I/O):  1"),
             "raport musi zliczyć błąd I/O zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}", dziennik
+        );
+    }
+
+    /// REGRESJA (todo.faza02.md — sekcja [2] pokazywała tylko LICZBĘ plików
+    /// unikalnych dla jednej strony, bez ich wolumenu w bajtach, w
+    /// przeciwieństwie do sekcji [1]). Dziennik musi teraz wprost podawać
+    /// wolumen osobno dla plików unikalnych UFS i osobno dla Skryptu.
+    #[test]
+    fn test_dziennik_koncowy_pokazuje_wolumen_plikow_unikalnych() {
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, phase2_done)
+             VALUES (1, 'tylko_ufs.bin', 1, 0, 5000, 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_script, phase2_done)
+             VALUES (2, 'tylko_skrypt.bin', 0, 1, 3000, 1)",
+            [],
+        ).unwrap();
+        // Trzeci wiersz, genuine nowe zadanie — inaczej run() kończy się
+        // wcześniej w gałęzi `total_db_rows == 0`, bez zapisania Dziennika.
+        // Obecny po OBU stronach (found_in_ufs=1, found_in_script=1) - musi
+        // wylądować w [1] CZĘŚĆ WSPÓLNA, nie zanieczyścić liczonych tu
+        // wolumenów [2] UNIKALNE TRAFIENIA.
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, phase2_done)
+             VALUES (3, 'nowy.jpg', 1, 1, 0)",
+            [],
+        ).unwrap();
+
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc").unwrap();
+        fs::write(script_dir.path().join("nowy.jpg"), b"tresc").unwrap();
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut config = Ustawienia::default();
+        config.ufs_path = ufs_dir.path().to_string_lossy().to_string();
+        config.script_path = script_dir.path().to_string_lossy().to_string();
+        config.log_path = log_dir.path().to_string_lossy().to_string();
+        config.raporty_faz.clear();
+        config.max_threads = 1;
+
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        run(&mut conn, &config, tx_ui).expect("run() musi wygenerować Dziennik Końcowy");
+
+        let dziennik = std::fs::read_to_string(log_dir.path().join("dziennik_koncowy_faza2.txt")).unwrap();
+
+        assert!(
+            dziennik.contains(&format!("Tylko w UFS Explorer:       1 (Wolumen: {})", format_bytes(5000))),
+            "brak wolumenu plików unikalnych UFS w raporcie:\n{}", dziennik
+        );
+        assert!(
+            dziennik.contains(&format!("Tylko w Skrypcie Autorskim: 1 (Wolumen: {})", format_bytes(3000))),
+            "brak wolumenu plików unikalnych Skryptu w raporcie:\n{}", dziennik
         );
     }
 }
