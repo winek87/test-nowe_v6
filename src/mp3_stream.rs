@@ -242,6 +242,107 @@ pub fn is_mp3_extension(path_str: &str) -> bool {
     path_str.to_lowercase().ends_with(".mp3")
 }
 
+// ============================================================================
+// SKŁADANIE Z DWÓCH KOPII (RESYNC PO RAMKACH)
+// ============================================================================
+
+/// Czy treść ramki (BEZ 4-bajtowego nagłówka) to oczywista wydmuszka: same
+/// zera albo same `0xFF`. Ten sam sygnał co [`crate::riff_container`] i
+/// [`crate::asf_container`] — MP3 nie ma sumy kontrolnej per ramka, więc to
+/// jedyny bezpieczny, dostępny sygnał wyboru.
+fn wyglada_na_wydmuszke(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (bytes.iter().all(|&b| b == 0) || bytes.iter().all(|&b| b == 0xFF))
+}
+
+/// Składa jeden plik MP3 z dwóch uszkodzonych kopii, wybierając NA POZIOMIE
+/// KAŻDEJ RAMKI tę stronę, której ramka nie wygląda na wydmuszkę — ten sam
+/// wybór co [`crate::riff_container::splice_riff`]/[`crate::asf_container::splice_asf`].
+///
+/// ## Różnica względem RIFF/ASF: DŁUGOŚĆ ramki jako dowód, nie sama obecność
+///
+/// Ramki MPEG audio mają DŁUGOŚĆ ZMIENNĄ wyliczaną z własnego nagłówka —
+/// zamiast iterować po LIŚCIE fragmentów (jak RIFF/ASF), ta funkcja idzie
+/// po POZYCJI BAJTOWEJ, krok po kroku pobieranej z nagłówka JEDNEJ z dwóch
+/// stron (którakolwiek się sparsuje). Zakłada, że uszkodzenie NIE przesuwa
+/// pozycji kolejnych ramek między kopiami (bajty NADPISANE w miejscu — typowe
+/// uszkodzenie sektora dysku/kopii — nie bajty USUNIĘTE/DOSTAWIONE) — ten sam
+/// fundamentalny wybór co przy RIFF/ASF/MKV/TS: żadna z nich nie próbuje
+/// realignować się po przesunięciu, wszystkie odmawiają albo obcinają.
+///
+/// ## Kiedy odmawia CAŁKOWICIE (`None`)
+///
+/// - któraś strona nie ma ani jednej wiarygodnej ramki,
+/// - pierwsza ramka stoi pod RÓŻNYM offsetem w obu kopiach (różny rozmiar
+///   ID3v2 albo śmieci przed strumieniem - to nie są dwa odzyski tego
+///   samego pliku),
+/// - na tej samej pozycji obie strony mają PRAWDZIWIE sparsowaną ramkę o
+///   różnej długości (struktury się rozjechały — nie realignujemy),
+/// - żadna pojedyncza ramka nie dała się złożyć.
+///
+/// ## Kiedy OBCINA wynik zamiast odmawiać
+///
+/// Gdy TA SAMA pozycja jest niezdatna po OBU stronach (żadna strona nie ma
+/// tam sparsowanej, nie-wydmuszkowej ramki) — ten sam wzorzec "obetnij i
+/// zachowaj" co `splice_riff`/`splice_asf`/`splice_mkv`/`splice_flv`.
+pub fn splice_mp3(bytes_a: &[u8], bytes_b: &[u8]) -> Option<Vec<u8>> {
+    let start_a = znajdz_pierwsza_ramke(bytes_a, wielkosc_id3v2(bytes_a), bytes_a.len())?;
+    let start_b = znajdz_pierwsza_ramke(bytes_b, wielkosc_id3v2(bytes_b), bytes_b.len())?;
+    if start_a != start_b {
+        return None;
+    }
+
+    // Nagłówek (ID3v2 + ew. śmieci przed pierwszą ramką) bierzemy ze strony A
+    // - obie zaczynają pierwszą ramkę pod tym samym offsetem, co właśnie
+    // sprawdziliśmy.
+    let mut wynik = bytes_a.get(..start_a)?.to_vec();
+    let mut p = start_a;
+    let mut ramek = 0usize;
+
+    while p < bytes_a.len().max(bytes_b.len()) {
+        let ramka_a = bytes_a.get(p..)
+            .and_then(parsuj_naglowek_ramki)
+            .filter(|n| p + n.dlugosc_bajtow <= bytes_a.len());
+        let ramka_b = bytes_b.get(p..)
+            .and_then(parsuj_naglowek_ramki)
+            .filter(|n| p + n.dlugosc_bajtow <= bytes_b.len());
+
+        // Porównanie odmawiające tylko dla DWÓCH PRAWDZIWIE sparsowanych
+        // ramek o różnej długości - to jedyny wiarygodny dowód, że struktury
+        // się rozjechały (ten sam wyjątek co w `splice_riff`/`splice_asf`
+        // dla sentinela - tu odpowiednikiem sentinela jest po prostu `None`,
+        // które nie bierze udziału w tym porównaniu).
+        if let (Some(na), Some(nb)) = (&ramka_a, &ramka_b)
+            && na.dlugosc_bajtow != nb.dlugosc_bajtow
+        {
+            return None;
+        }
+
+        let uzyteczna_a = ramka_a.as_ref().is_some_and(|n| {
+            bytes_a.get(p + 4..p + n.dlugosc_bajtow).is_some_and(|t| !wyglada_na_wydmuszke(t))
+        });
+        let uzyteczna_b = ramka_b.as_ref().is_some_and(|n| {
+            bytes_b.get(p + 4..p + n.dlugosc_bajtow).is_some_and(|t| !wyglada_na_wydmuszke(t))
+        });
+
+        let (dlugosc, zrodlo) = if uzyteczna_a {
+            (ramka_a.unwrap().dlugosc_bajtow, bytes_a)
+        } else if uzyteczna_b {
+            (ramka_b.unwrap().dlugosc_bajtow, bytes_b)
+        } else {
+            break;
+        };
+
+        wynik.extend_from_slice(zrodlo.get(p..p + dlugosc)?);
+        p += dlugosc;
+        ramek += 1;
+    }
+
+    if ramek == 0 {
+        return None;
+    }
+    Some(wynik)
+}
+
 /// Analizuje elementarny strumień MP3: liczy ramki i miejsca, gdzie łańcuch
 /// się urywa. Zwraca `None`, gdy NIE znaleziono ani jednej wiarygodnej ramki
 /// w całym pliku - fałszywe rozszerzenie albo kompletnie zniszczona
@@ -474,6 +575,81 @@ mod tests {
         dane[100] = 0xFF;
         dane[101] = 0xFB; // wygląda na sync, ale nic po nim nie potwierdza ramki
         assert!(analyze_mp3(&dane).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // splice_mp3
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_splice_zdrowa_kopia_zlozona_sama_ze_soba_daje_oryginal() {
+        let strumien = zbuduj_ramki(4, 0xAA);
+        assert_eq!(splice_mp3(&strumien, &strumien).as_deref(), Some(strumien.as_slice()));
+    }
+
+    #[test]
+    fn test_splice_odmawia_gdy_pierwsza_ramka_ma_rozny_offset() {
+        let a = zbuduj_ramki(3, 0xAA);
+        let mut b = vec![0u8; 5]; // przesuwa pierwszą ramkę o 5 B
+        b.extend(zbuduj_ramki(3, 0xBB));
+        assert!(splice_mp3(&a, &b).is_none());
+    }
+
+    /// Sedno silnika: ramka wyzerowana po stronie A, zdrowa po stronie B -
+    /// wynik musi wziąć zdrowe dane z B.
+    #[test]
+    fn test_splice_wybiera_strone_bez_wydmuszki() {
+        let zdrowe = zbuduj_ramki(3, 0xAA);
+        let mut wyzerowane = zdrowe.clone();
+        for b in &mut wyzerowane[4..417] {
+            *b = 0; // zerujemy treść pierwszej ramki (bez nagłówka)
+        }
+
+        let wynik = splice_mp3(&wyzerowane, &zdrowe).expect("złożenie musi się udać");
+        assert_eq!(wynik, zdrowe, "wynik musi odtworzyć zdrowy oryginał");
+    }
+
+    #[test]
+    fn test_splice_ramka_zepsuta_po_obu_stronach_obcina_wynik() {
+        let zdrowe = zbuduj_ramki(3, 0xAA);
+        let mut a = zdrowe.clone();
+        let mut b = zdrowe.clone();
+        for buf in [&mut a, &mut b] {
+            for byte in &mut buf[417 + 4..417 + 417] { // treść drugiej ramki
+                *byte = 0;
+            }
+        }
+
+        let wynik = splice_mp3(&a, &b).expect("pierwsza ramka musi się złożyć");
+        assert_eq!(wynik.len(), 417, "wynik musi kończyć się dokładnie tam, gdzie zaczynała się zepsuta druga ramka");
+    }
+
+    #[test]
+    fn test_splice_wszystkie_ramki_zepsute_po_obu_stronach_daje_none() {
+        let zdrowe = zbuduj_ramki(2, 0xAA);
+        let mut a = zdrowe.clone();
+        let mut b = zdrowe.clone();
+        for buf in [&mut a, &mut b] {
+            buf[4..417].fill(0);
+            buf[417 + 4..417 + 417].fill(0);
+        }
+        assert!(splice_mp3(&a, &b).is_none());
+    }
+
+    /// Kopia dłuższa uzupełnia ramki, których w krótszej nie ma.
+    #[test]
+    fn test_splice_dluzsza_kopia_uzupelnia_brakujace_ramki() {
+        let uciety = zbuduj_ramki(2, 0xAA);
+        let pelny = zbuduj_ramki(4, 0xBB);
+
+        let wynik = splice_mp3(&uciety, &pelny).expect("składanie musi się udać");
+        assert_eq!(wynik.len(), 4 * 417, "wynik musi mieć komplet ramek");
+        assert_eq!(&wynik[..417], &zbuduj_ramki(1, 0xAA)[..], "pierwsza ramka zostaje z A");
+    }
+
+    #[test]
+    fn test_splice_material_niebedacy_mp3_nie_da_sie_zlozyc() {
+        assert!(splice_mp3(b"to nie jest strumien MPEG audio ani troche", b"to tez nie, kompletnie inne dane").is_none());
     }
 
     // ------------------------------------------------------------------

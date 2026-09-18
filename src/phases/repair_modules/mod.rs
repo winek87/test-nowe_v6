@@ -36,6 +36,7 @@ mod jpeg;
 mod mkv;
 mod riff;
 mod asf;
+mod mp3;
 mod mp4;
 mod mp4_autopilot;
 mod png;
@@ -667,6 +668,7 @@ pub fn all_modules() -> Vec<Box<dyn RepairModule>> {
         // pierwszeństwo przed ślepym bajtowym zszyciem.
         Box::new(riff::RiffCloneModule),
         Box::new(asf::AsfCloneModule),
+        Box::new(mp3::Mp3CloneModule),
         Box::new(splice::SpliceModule),
         Box::new(sqlite::SqliteModule),
         Box::new(trailer_trim::TrailerTrimModule),
