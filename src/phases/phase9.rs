@@ -114,8 +114,18 @@ pub(crate) struct LiveStats {
     /// Błędy przywracania metadanych (czas/uprawnienia/właściciel) — PLIK i tak
     /// został skopiowany poprawnie, to osobna, mniej krytyczna kategoria błędu.
     meta_errors: AtomicUsize,
-    /// Liczba przypadków, gdy zwycięzcą była wersja fizycznie zrekonstruowana przez Fazę 17.
-    repaired_used: AtomicUsize, 
+    /// Kopiowanie źródła do pliku tymczasowego się powiodło, ale rozmiar
+    /// wyniku NIE zgadza się z oczekiwanym rozmiarem z bazy — INNY rodzaj
+    /// problemu niż zwykły `io_errors` (nieudany odczyt/zapis): tu dane
+    /// fizycznie się skopiowały, ale nie te, których oczekiwano (możliwy
+    /// wyścig ze zmianą pliku źródłowego w międzyczasie, albo nieaktualny
+    /// rozmiar w bazie). Osobny licznik, nie wliczany do `io_errors`.
+    size_verification_errors: AtomicUsize,
+    /// Liczba przypadków, gdy zwycięzcą była wersja fizycznie zrekonstruowana
+    /// przez Fazę 17 — rozbite na stronę pochodzenia naprawy (mirror
+    /// `copied_ufs_unique`/`copied_script_unique`).
+    repaired_used_ufs: AtomicUsize,
+    repaired_used_script: AtomicUsize,
     /// Zliczenia wystąpień per dokładny tekst powodu decyzji — do "Top powody" w panelu.
     reasons: Mutex<HashMap<String, usize>>,
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon —
@@ -134,7 +144,8 @@ impl LiveStats {
             copied_splice: AtomicUsize::new(0),
             symlinks_recreated: AtomicUsize::new(0), renamed_files: AtomicUsize::new(0), 
             io_errors: AtomicUsize::new(0), meta_errors: AtomicUsize::new(0),
-            repaired_used: AtomicUsize::new(0),
+            size_verification_errors: AtomicUsize::new(0),
+            repaired_used_ufs: AtomicUsize::new(0), repaired_used_script: AtomicUsize::new(0),
             reasons: Mutex::new(HashMap::new()),
         }
     }
@@ -142,6 +153,13 @@ impl LiveStats {
 
 /// Buduje panel boczny "Podsumowanie na żywo" — jeden, wspólny panel bez
 /// podziału per-źródło (analogicznie do Fazy 8, patrz dokumentacja modułu).
+///
+/// REGRESJA: "Unikalne skopiowane" i "Użyto wersji naprawionej" sumowały
+/// UFS+Skrypt w jedną liczbę, mimo że oba źródła są liczone OSOBNO w
+/// `LiveStats` (`copied_ufs_unique`/`copied_script_unique`,
+/// `repaired_used_ufs`/`repaired_used_script`) i w Dzienniku Końcowym już
+/// rozbite — ten sam wzorzec luki co w Fazie 8 ("Naprawione" łączące Smart
+/// Splice i silnik Fazy 17 w jeden licznik).
 fn build_summary_block(stats: &LiveStats, start_time: Instant) -> String {
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
@@ -158,15 +176,16 @@ fn build_summary_block(stats: &LiveStats, start_time: Instant) -> String {
     };
 
     format!(
-        "[Podsumowanie]\nPrędkość: {:.2} MB/s\nWspólne — UFS: {} | Skrypt: {} | Złożone (Faza 18): {}\nUnikalne skopiowane: {}\nDowiązania odtworzone: {}\nUżyto wersji naprawionej: {}\nPrzemianowane (kolizja nazw): {}\nWątki kopiowania (Wariant A): {}\nBłędy I/O: {}\nBłędy metadanych: {}\nTop powody decyzji: {}",
+        "[Podsumowanie]\nPrędkość: {:.2} MB/s\nWspólne — UFS: {} | Skrypt: {} | Złożone (Faza 18): {}\nUnikalne skopiowane — UFS: {} | Skrypt: {}\nDowiązania odtworzone: {}\nUżyto wersji naprawionej — UFS: {} | Skrypt: {}\nPrzemianowane (kolizja nazw): {}\nWątki kopiowania (Wariant A): {}\nBłędy I/O: {}\nBłędy weryfikacji rozmiaru: {}\nBłędy metadanych: {}\nTop powody decyzji: {}",
         speed_mb,
         stats.copied_ufs_common.load(Ordering::Relaxed), stats.copied_script_common.load(Ordering::Relaxed), stats.copied_splice.load(Ordering::Relaxed),
-        stats.copied_ufs_unique.load(Ordering::Relaxed) + stats.copied_script_unique.load(Ordering::Relaxed),
+        stats.copied_ufs_unique.load(Ordering::Relaxed), stats.copied_script_unique.load(Ordering::Relaxed),
         stats.symlinks_recreated.load(Ordering::Relaxed),
-        stats.repaired_used.load(Ordering::Relaxed),
+        stats.repaired_used_ufs.load(Ordering::Relaxed), stats.repaired_used_script.load(Ordering::Relaxed),
         stats.renamed_files.load(Ordering::Relaxed),
         crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot()),
         stats.io_errors.load(Ordering::Relaxed),
+        stats.size_verification_errors.load(Ordering::Relaxed),
         stats.meta_errors.load(Ordering::Relaxed),
         top_reasons,
     )
@@ -589,14 +608,14 @@ fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Pa
         PathBuf::from(file.smart_splice_path.as_ref().expect("winner=splice implikuje Some(smart_splice_path) - patrz decide_winner"))
     } else if winner == "script" {
         if let Some(ref p) = file.repaired_path_script {
-            stats.repaired_used.fetch_add(1, Ordering::Relaxed);
+            stats.repaired_used_script.fetch_add(1, Ordering::Relaxed);
             sciezka_naprawiona(p, script_path)
         } else {
             script_path.join(&file.rel_path)
         }
     } else {
         if let Some(ref p) = file.repaired_path_ufs {
-            stats.repaired_used.fetch_add(1, Ordering::Relaxed);
+            stats.repaired_used_ufs.fetch_add(1, Ordering::Relaxed);
             sciezka_naprawiona(p, ufs_path)
         } else {
             ufs_path.join(&file.rel_path)
@@ -661,7 +680,7 @@ fn copy_file_and_meta(file: &MergeCandidate, winner: &'static str, ufs_path: &Pa
                 Ok(_) => {
                     warn!(path = %file.rel_path, "Błąd weryfikacji po skopiowaniu - rozmiar nie zgadza się!");
                     let _ = fs::remove_file(&tmp_path);
-                    stats.io_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
+                    stats.size_verification_errors.fetch_add(1, Ordering::Relaxed); return (false, final_rel_path, zrodlo_txt);
                 }
                 Err(_) => {
                     let _ = fs::remove_file(&tmp_path);
@@ -1129,7 +1148,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let ufs_u = stats.copied_ufs_unique.load(Ordering::SeqCst); let scr_u = stats.copied_script_unique.load(Ordering::SeqCst);
     let symlinks = stats.symlinks_recreated.load(Ordering::SeqCst); let renamed = stats.renamed_files.load(Ordering::SeqCst);
     let io_err = stats.io_errors.load(Ordering::SeqCst); let meta_err = stats.meta_errors.load(Ordering::SeqCst);
-    let repaired_used = stats.repaired_used.load(Ordering::SeqCst);
+    let size_err = stats.size_verification_errors.load(Ordering::SeqCst);
+    let rep_ufs = stats.repaired_used_ufs.load(Ordering::SeqCst); let rep_scr = stats.repaired_used_script.load(Ordering::SeqCst);
+    let repaired_used = rep_ufs + rep_scr;
 
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
@@ -1142,7 +1163,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = writeln!(&mut log_out, "[ 1 ] STATYSTYKI FUZJI:");
     let _ = writeln!(&mut log_out, "   -> Uratowano z puli wspólnej: UFS ({}), Skrypt ({})", ufs_c, scr_c);
     let _ = writeln!(&mut log_out, "   -> Skopiowano pliki unikalne: UFS ({}), Skrypt ({})", ufs_u, scr_u);
-    let _ = writeln!(&mut log_out, "   -> Wykorzystano Aktywnie Zrekonstruowane Wersje (Faza 17): {} plików\n", repaired_used);
+    let _ = writeln!(&mut log_out, "   -> Wykorzystano Aktywnie Zrekonstruowane Wersje (Faza 17): UFS ({}), Skrypt ({}), razem {} plików\n", rep_ufs, rep_scr, repaired_used);
     
     let _ = writeln!(&mut log_out, "[ 2 ] ŚLAD REWIZYJNY (Dlaczego algorytm odrzucał/wybierał poszczególne pliki):");
     let reasons_map = stats.reasons.lock().unwrap();
@@ -1150,11 +1171,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     sorted_reasons.sort_by(|a, b| b.1.cmp(a.1));
     for (reason, count) in sorted_reasons.iter() { let _ = writeln!(&mut log_out, "   -> {} (Ilość: {})", reason, count); }
     
-    if io_err > 0 || meta_err > 0 || renamed > 0 { 
-        let _ = writeln!(&mut log_out, "\n[ 3 ] BŁĘDY I ZMIANY SYSTEMOWE:"); 
+    if io_err > 0 || size_err > 0 || meta_err > 0 || renamed > 0 {
+        let _ = writeln!(&mut log_out, "\n[ 3 ] BŁĘDY I ZMIANY SYSTEMOWE:");
         if renamed > 0 { let _ = writeln!(&mut log_out, "   -> Zmieniono nazwę (Ochrona przed nadpisaniem): {}", renamed); }
         if symlinks > 0 { let _ = writeln!(&mut log_out, "   -> Odtworzono symlinki: {}", symlinks); }
         if io_err > 0 { let _ = writeln!(&mut log_out, "   -> Błędy I/O zapisu: {}", io_err); }
+        if size_err > 0 { let _ = writeln!(&mut log_out, "   -> Błędy weryfikacji rozmiaru po kopiowaniu: {}", size_err); }
     }
 
     // PRZYWRÓCONE: Zapis fizyczny z odpowiednimi ścieżkami zadeklarowanymi wcześniej
@@ -1177,6 +1199,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         scr_u,
         repaired_used,
         io_err,
+        size_err,
         "Faza 9 zakończona"
     );
 
@@ -1682,6 +1705,8 @@ mod tests {
         let pozostale: Vec<_> = std::fs::read_dir(target_dir.path()).unwrap().filter_map(|e| e.ok()).collect();
         assert!(pozostale.is_empty(), "katalog docelowy musi zostać pusty (bez osieroconych plików .tmp-*), znaleziono: {:?}",
             pozostale.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+        assert_eq!(stats.size_verification_errors.load(Ordering::Relaxed), 1, "niezgodność rozmiaru musi trafić do WŁASNEGO licznika, nie do io_errors");
+        assert_eq!(stats.io_errors.load(Ordering::Relaxed), 0, "niezgodność rozmiaru NIE jest zwykłym błędem I/O");
     }
 
     // ------------------------------------------------------------------
@@ -1943,14 +1968,20 @@ mod tests {
         stats.copied_ufs_common.store(3, Ordering::Relaxed);
         stats.copied_script_common.store(7, Ordering::Relaxed);
         stats.copied_ufs_unique.store(2, Ordering::Relaxed);
+        stats.copied_script_unique.store(5, Ordering::Relaxed);
+        stats.repaired_used_ufs.store(4, Ordering::Relaxed);
+        stats.repaired_used_script.store(6, Ordering::Relaxed);
         stats.io_errors.store(1, Ordering::Relaxed);
+        stats.size_verification_errors.store(9, Ordering::Relaxed);
 
         let start_time = Instant::now();
         let block = build_summary_block(&stats, start_time);
 
         assert!(block.contains("Wspólne — UFS: 3 | Skrypt: 7"));
-        assert!(block.contains("Unikalne skopiowane: 2"));
+        assert!(block.contains("Unikalne skopiowane — UFS: 2 | Skrypt: 5"));
+        assert!(block.contains("Użyto wersji naprawionej — UFS: 4 | Skrypt: 6"));
         assert!(block.contains("Błędy I/O: 1"));
+        assert!(block.contains("Błędy weryfikacji rozmiaru: 9"));
     }
 
     #[test]
@@ -1958,6 +1989,32 @@ mod tests {
         let stats = LiveStats::new(rayon::current_num_threads());
         let block = build_summary_block(&stats, Instant::now());
         assert!(block.contains("Top powody decyzji: -"));
+    }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 9 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) ALBO być jawnie
+    /// na liście generycznych etykiet, które go celowo nie potrzebują — ten
+    /// sam wzorzec co w Fazach 5/6/7.
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Wątki kopiowania (Wariant A)"];
+
+        let stats = LiveStats::new(1);
+        let block = build_summary_block(&stats, Instant::now());
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 9 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 9, "panel powinien mieć dokładnie 9 etykiet wymagających wyjaśnienia");
     }
 
     // ------------------------------------------------------------------
