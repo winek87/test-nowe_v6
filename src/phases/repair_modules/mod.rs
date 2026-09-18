@@ -34,6 +34,7 @@ mod tiff;
 mod heic;
 mod jpeg;
 mod mkv;
+mod riff;
 mod mp4;
 mod mp4_autopilot;
 mod png;
@@ -657,6 +658,13 @@ pub fn all_modules() -> Vec<Box<dyn RepairModule>> {
         // Stoi PRZED `splice` z tego samego powodu co silniki wyżej — patrz
         // nagłówek `mp4.rs`.
         Box::new(mp4_autopilot::Mp4AutopilotModule),
+        // WAV/AVI — składanie fragmentów RIFF (gwarancja ZAWSZE SŁABA, RIFF
+        // nie niesie sumy kontrolnej per fragment). Kwalifikuje się przez
+        // ten sam sygnał co `splice` (match_type == PARTIAL z Fazy 14, jedyny
+        // dostępny — żadna wcześniejsza faza nie diagnozuje WAV/AVI), więc
+        // MUSI stać przed nim: silnik świadomy struktury RIFF dostaje
+        // pierwszeństwo przed ślepym bajtowym zszyciem.
+        Box::new(riff::RiffCloneModule),
         Box::new(splice::SpliceModule),
         Box::new(sqlite::SqliteModule),
         Box::new(trailer_trim::TrailerTrimModule),
