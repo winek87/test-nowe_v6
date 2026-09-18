@@ -86,14 +86,29 @@ const SUSPICIOUS_ABSOLUTE_THRESHOLD: u64 = 50_000_000; // 50 MB
 // jawnego dodania byłby CAŁKOWICIE POMIJANY przez tę fazę (nie „uznawany
 // za poprawny" — po prostu nigdy nieanalizowany). To samo dotyczy
 // `.tbz2`/`.txz`, będących skrótami dla bzip2/xz.
+//
+// UWAGA na `.docm`/`.xlsm`/`.pptm`: to Office z MAKRAMI (ta sama struktura
+// ZIP co docx/xlsx/pptx) — typowy wektor malware w korpusach kryminalistycznych,
+// wcześniej całkowicie pomijany przez tę fazę. `.war`/`.xpi` to dalsze
+// pochodne ZIP (Java Web Archive, rozszerzenie Firefox), `.cbz` to komiks
+// pakowany jak ZIP. `.cbr` to komiks pakowany jak RAR (magic bytes RAR, nie
+// struktura ZIP). `.zst` to samodzielny format kompresji (Zstandard),
+// weryfikowany wyłącznie po magic bytes, tak jak gz/bz2/xz.
+//
+// CELOWO POMINIĘTE: `.crx` (rozszerzenie Chrome) NIE jest czystym ZIP-em —
+// ma własny nagłówek binarny (magic "Cr24" + klucz publiczny + podpis) PRZED
+// danymi ZIP, więc `ZipArchive::new` zawodzi na nim wprost i wymagałby
+// osobnej ścieżki parsowania nagłówka — poza zakresem tej zmiany.
 const ARCHIVE_EXTS: &[&str] = &[
     ".zip", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub", ".apk", ".jar",
+    ".docm", ".xlsm", ".pptm", ".war", ".xpi", ".cbz", ".cbr", ".zst",
     ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
     ".tgz", ".taz", ".tbz", ".tbz2", ".txz"
 ];
 
 const ZIP_DERIVATIVES: &[&str] = &[
-    "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk", "jar"
+    "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk", "jar",
+    "docm", "xlsm", "pptm", "war", "xpi", "cbz",
 ];
 
 // ============================================================================
@@ -186,6 +201,9 @@ pub(crate) enum ScanMsg {
 /// (Nagłówek/Wydmuszka/Fałszywe DNA/Bomba — w tym bomba plikowa) plus dwie
 /// kategorie INFORMACYJNE niezależne od ważności (szyfrowanie, podejrzana
 /// kompresja) plus (opcjonalnie, `config.deep_archive_scan`) błędy CRC32.
+/// `ok_common`/`ok_unique` (podobnie jak każda inna kategoria tego panelu)
+/// oraz `uncompressed_size_sum`/`ok_bytes_sum` (suma po zdrowych archiwach,
+/// dająca średni współczynnik kompresji próbki — patrz [`build_source_block`]).
 /// Nigdy nie łączone z licznikami drugiej strony.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
@@ -193,7 +211,15 @@ pub(crate) struct LiveStats {
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
     
-    ok: AtomicUsize,
+    ok_common: AtomicUsize, ok_unique: AtomicUsize,
+    /// Suma `uncompressed_size` WYŁĄCZNIE zdrowych archiwów (`is_valid`) —
+    /// razem z `ok_bytes_sum` daje średni współczynnik kompresji próbki.
+    uncompressed_size_sum: AtomicU64,
+    /// Suma rozmiaru na dysku (`file_size`) WYŁĄCZNIE zdrowych archiwów —
+    /// mianownik średniego współczynnika kompresji (nie `processed_bytes`,
+    /// bo ten obejmuje też uszkodzone/odrzucone pliki, dla których
+    /// `uncompressed_size` bywa 0 albo niemiarodajne).
+    ok_bytes_sum: AtomicU64,
     err_header_common: AtomicUsize,  err_header_unique: AtomicUsize,
     err_empty_common: AtomicUsize,   err_empty_unique: AtomicUsize,
     err_fake_common: AtomicUsize,    err_fake_unique: AtomicUsize,
@@ -219,7 +245,8 @@ impl LiveStats {
         Self {
             processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
-            ok: AtomicUsize::new(0),
+            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0),
+            uncompressed_size_sum: AtomicU64::new(0), ok_bytes_sum: AtomicU64::new(0),
             err_header_common: AtomicUsize::new(0), err_header_unique: AtomicUsize::new(0),
             err_empty_common: AtomicUsize::new(0),  err_empty_unique: AtomicUsize::new(0),
             err_fake_common: AtomicUsize::new(0),   err_fake_unique: AtomicUsize::new(0),
@@ -261,9 +288,9 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant, deep_
     let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
 
     let mut out = format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nZdrowe: {}\nUszkodzony nagłówek: {} wspólne / {} unikalne\nWydmuszki: {} wspólne / {} unikalne\nFałszywe DNA: {} wspólne / {} unikalne\nBomba (rozmiar): {} wspólne / {} unikalne\nBomba (liczba plików): {} wspólne / {} unikalne\nZaszyfrowane: {} wspólne / {} unikalne\nPodejrzana kompresja: {} wspólne / {} unikalne",
+        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nZdrowe: {} wspólne / {} unikalne\nUszkodzony nagłówek: {} wspólne / {} unikalne\nWydmuszki: {} wspólne / {} unikalne\nFałszywe DNA: {} wspólne / {} unikalne\nBomba (rozmiar): {} wspólne / {} unikalne\nBomba (liczba plików): {} wspólne / {} unikalne\nZaszyfrowane: {} wspólne / {} unikalne\nPodejrzana kompresja: {} wspólne / {} unikalne",
         label, speed_mb, display_ext,
-        stats.ok.load(Ordering::Relaxed),
+        stats.ok_common.load(Ordering::Relaxed), stats.ok_unique.load(Ordering::Relaxed),
         stats.err_header_common.load(Ordering::Relaxed), stats.err_header_unique.load(Ordering::Relaxed),
         stats.err_empty_common.load(Ordering::Relaxed), stats.err_empty_unique.load(Ordering::Relaxed),
         stats.err_fake_common.load(Ordering::Relaxed), stats.err_fake_unique.load(Ordering::Relaxed),
@@ -279,6 +306,14 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant, deep_
             stats.err_crc_common.load(Ordering::Relaxed), stats.err_crc_unique.load(Ordering::Relaxed)
         ));
     }
+
+    let uncompressed_sum = stats.uncompressed_size_sum.load(Ordering::Relaxed);
+    let ok_bytes_sum = stats.ok_bytes_sum.load(Ordering::Relaxed);
+    let avg_ratio = if ok_bytes_sum > 0 { uncompressed_sum as f64 / ok_bytes_sum as f64 } else { 0.0 };
+    out.push_str(&format!(
+        "\nRozmiar po rozpakowaniu (zdrowe): {}\nŚr. współczynnik kompresji (zdrowe): {:.1}x",
+        format_bytes(uncompressed_sum), avg_ratio
+    ));
 
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
     out.push_str(&format!("\nWątki analizy (Wariant A): {}", activity_markup));
@@ -402,8 +437,11 @@ fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bo
     }
 
     let mut is_fake = false;
-    if ext == "docx" && !has_word { is_fake = true; }
-    if ext == "xlsx" && !has_xl { is_fake = true; }
+    // `.docm`/`.xlsm` dzielą DNA (folder word/xl) ze swoimi odpowiednikami
+    // bez makr — to ten sam kontener OOXML, jedyna różnica to obecność
+    // dodatkowego strumienia VBA.
+    if (ext == "docx" || ext == "docm") && !has_word { is_fake = true; }
+    if (ext == "xlsx" || ext == "xlsm") && !has_xl { is_fake = true; }
     if ext == "apk" && !has_manifest { is_fake = true; }
     if ext == "epub" && !has_meta { is_fake = true; }
 
@@ -579,6 +617,9 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
         "tgz" | "taz" => "gz",
         "tbz" | "tbz2" => "bz2",
         "txz" => "xz",
+        // `.cbr` (komiks pakowany jak RAR) dzieli magic bytes z `.rar` —
+        // to ten sam format kontenera pod inną nazwą pliku.
+        "cbr" => "rar",
         other => other,
     };
 
@@ -588,8 +629,10 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
         "gz"  => header.starts_with(&[0x1F, 0x8B]),
         "bz2" => header.starts_with(&[0x42, 0x5A, 0x68]),
         "xz"  => header.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
+        // Zstandard: magic number standardowy dla formatu ramki (RFC 8478).
+        "zst" => header.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
         "tar" => { if n >= 262 { &header[257..262] == b"ustar" } else { false } },
-        _ => true, 
+        _ => true,
     };
 
     if !is_valid_magic {
@@ -673,8 +716,10 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     let kategoria = if task.is_common { "Wspólne" } else { "Osobne" };
 
                     if ana.is_valid {
-                        stats.ok.fetch_add(1, Ordering::Relaxed);
-                        
+                        if task.is_common { stats.ok_common.fetch_add(1, Ordering::Relaxed); } else { stats.ok_unique.fetch_add(1, Ordering::Relaxed); }
+                        stats.uncompressed_size_sum.fetch_add(ana.uncompressed_size, Ordering::Relaxed);
+                        stats.ok_bytes_sum.fetch_add(file_size, Ordering::Relaxed);
+
                         if let Ok(mut f) = info_log.lock() {
                             let pliki_info = if ZIP_DERIVATIVES.contains(&ext.as_str()) { 
                                 format!("Plików: {:<4} | Rozpakowane: {:>10}", ana.internal_files_count, format_bytes(ana.uncompressed_size)) 
@@ -1300,6 +1345,21 @@ mod tests {
     }
 
     #[test]
+    fn test_is_archive_extension_recognizes_office_macro_and_other_zip_variants() {
+        // REGRESJA: docm/xlsm/pptm (Office z makrami - typowy wektor malware),
+        // war/xpi (dalsze pochodne ZIP), cbz/cbr (komiksy), zst (Zstandard) —
+        // przed tą zmianą żaden z nich nie trafiał do analizy w ogóle.
+        assert!(is_archive_extension("faktura.docm"));
+        assert!(is_archive_extension("arkusz.xlsm"));
+        assert!(is_archive_extension("prezentacja.pptm"));
+        assert!(is_archive_extension("app.war"));
+        assert!(is_archive_extension("dodatek.xpi"));
+        assert!(is_archive_extension("komiks.cbz"));
+        assert!(is_archive_extension("komiks.cbr"));
+        assert!(is_archive_extension("dane.zst"));
+    }
+
+    #[test]
     fn test_is_archive_extension_recognizes_full_two_part_names() {
         // Warianty pełne działają przez `ends_with` na członie kompresji.
         assert!(is_archive_extension("archiwum.tar.gz"));
@@ -1644,6 +1704,70 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_fake_docm_missing_word_folder() {
+        // .docm dzieli DNA z .docx (ten sam kontener OOXML + makra).
+        let (_g, path) = build_zip(&[("cokolwiek.xml", b"<xml/>")], "docm");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let a = analyze_archive(&path, size, false).unwrap();
+        assert!(!a.is_valid);
+        assert!(a.reason.unwrap().contains("Fałszywe rozszerzenie"));
+    }
+
+    #[test]
+    fn test_analyze_real_docm_with_word_folder_is_valid() {
+        let (_g, path) = build_zip(&[("word/document.xml", b"<document/>"), ("word/vbaProject.bin", b"\x00")], "docm");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let a = analyze_archive(&path, size, false).unwrap();
+        assert!(a.is_valid);
+    }
+
+    #[test]
+    fn test_analyze_fake_xlsm_missing_xl_folder() {
+        let (_g, path) = build_zip(&[("cokolwiek.xml", b"<xml/>")], "xlsm");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let a = analyze_archive(&path, size, false).unwrap();
+        assert!(!a.is_valid);
+        assert!(a.reason.unwrap().contains("Fałszywe rozszerzenie"));
+    }
+
+    #[test]
+    fn test_analyze_real_war_is_valid_without_dna_check() {
+        // .war (Java Web Archive) nie ma zdefiniowanej weryfikacji DNA - jak .jar.
+        let (_g, path) = build_zip(&[("WEB-INF/web.xml", b"<web-app/>")], "war");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let a = analyze_archive(&path, size, false).unwrap();
+        assert!(a.is_valid);
+    }
+
+    #[test]
+    fn test_analyze_zst_valid_magic() {
+        let content = [0x28, 0xB5, 0x2F, 0xFD, 0x00];
+        let (_g, path) = temp_with_ext(&content, "zst");
+        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        assert!(a.is_valid);
+    }
+
+    #[test]
+    fn test_analyze_zst_invalid_magic() {
+        let content = [0x00u8; 10];
+        let (_g, path) = temp_with_ext(&content, "zst");
+        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        assert!(!a.is_valid);
+    }
+
+    #[test]
+    fn test_analyze_cbr_validates_rar_magic() {
+        // .cbr (komiks) dzieli magic bytes z .rar poprzez normalizację `effective_ext`.
+        let good = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+        let (_g, path) = temp_with_ext(&good, "cbr");
+        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+
+        let bad = [0x00u8; 10];
+        let (_g2, path2) = temp_with_ext(&bad, "cbr");
+        assert!(!analyze_archive(&path2, bad.len() as u64, false).unwrap().is_valid);
+    }
+
+    #[test]
     fn test_analyze_non_zip_content_with_zip_extension_is_broken_header() {
         let (_g, path) = temp_with_ext(b"to nie jest prawdziwy zip", "zip");
         let a = analyze_archive(&path, 25, false).unwrap();
@@ -1676,7 +1800,7 @@ mod tests {
     #[test]
     fn test_build_source_block_reports_all_categories() {
         let stats = LiveStats::new(4);
-        stats.ok.store(10, Ordering::Relaxed);
+        stats.ok_common.store(10, Ordering::Relaxed);
         stats.err_header_common.store(1, Ordering::Relaxed);
         stats.err_massfiles_unique.store(2, Ordering::Relaxed);
         stats.encrypted_common.store(3, Ordering::Relaxed);
@@ -1684,10 +1808,45 @@ mod tests {
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time, false);
 
-        assert!(block.contains("Zdrowe: 10"));
+        assert!(block.contains("Zdrowe: 10 wspólne / 0 unikalne"));
         assert!(block.contains("Bomba (liczba plików): 0 wspólne / 2 unikalne"));
         assert!(block.contains("Zaszyfrowane: 3 wspólne / 0 unikalne"));
         assert!(!block.contains("CRC32"), "Blok CRC nie powinien się pojawić gdy deep_scan_enabled=false");
+    }
+
+    #[test]
+    fn test_build_source_block_splits_zdrowe_common_and_unique() {
+        // REGRESJA: "Zdrowe" był jedynym licznikiem w tym panelu bez podziału
+        // wspólne/unikalne, mimo że KAŻDA inna kategoria go ma.
+        let stats = LiveStats::new(4);
+        stats.ok_common.store(5, Ordering::Relaxed);
+        stats.ok_unique.store(7, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time, false);
+
+        assert!(block.contains("Zdrowe: 5 wspólne / 7 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_average_compression_ratio() {
+        let stats = LiveStats::new(4);
+        stats.uncompressed_size_sum.store(400_000, Ordering::Relaxed);
+        stats.ok_bytes_sum.store(100_000, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time, false);
+
+        assert!(block.contains("Śr. współczynnik kompresji (zdrowe): 4.0x"));
+        assert!(block.contains("Rozmiar po rozpakowaniu (zdrowe): "));
+    }
+
+    #[test]
+    fn test_build_source_block_compression_ratio_zero_when_nothing_ok() {
+        let stats = LiveStats::new(4);
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time, false);
+        assert!(block.contains("Śr. współczynnik kompresji (zdrowe): 0.0x"));
     }
 
     #[test]
@@ -1836,6 +1995,36 @@ mod tests {
         let gzip = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00];
         let (_g2, path2) = temp_with_ext(&gzip, "tar.gz");
         assert!(analyze_archive(&path2, gzip.len() as u64, false).unwrap().is_valid);
+    }
+
+    // ------------------------------------------------------------------
+    // opisy_anomalii: każda REALNA etykieta wiersza panelu (poza
+    // generycznymi) musi mieć zarejestrowane wyjaśnienie — inaczej Enter na
+    // tym wierszu w prawdziwym UI nie pokaże nakładki. Mirror wzorca z Fazy
+    // 5-10.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki analizy (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(1);
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time, true);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta \"{}\" z panelu Fazy 11 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 11, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza11_archiwa.rs");
     }
 
     #[test]
