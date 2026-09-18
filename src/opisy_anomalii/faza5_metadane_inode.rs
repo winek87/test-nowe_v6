@@ -51,6 +51,26 @@ pub fn opisy() -> Vec<OpisAnomalii> {
             etykieta: "Top uprawnienia",
             wyjasnienie: "Najczęściej występujący zestaw uprawnień (format jak w poleceniu ls -l, np. -rw-r--r--) w tej próbce. Pierwszy znak to typ (- plik, d katalog, l symlink), kolejne dziewięć to prawa właściciela/grupy/innych (czytanie/pisanie/wykonywanie).",
         },
+        OpisAnomalii {
+            etykieta: "Top GID",
+            wyjasnienie: "Najczęściej występująca grupa (GID) plików w tej próbce, z liczbą wystąpień — analogicznie do Top UID, ale dla właściciela grupowego zamiast użytkownika.",
+        },
+        OpisAnomalii {
+            etykieta: "Epoka zerowa ctime (1970)",
+            wyjasnienie: "Czas zmiany metadanych i-node (ctime) wynosi zero lub mniej — różny od mtime (\"Epoka zerowa (1970)\" wyżej opisuje czas zmiany TREŚCI pliku). ctime jest zmieniany automatycznie przez system przy KAŻDEJ zmianie i-node (w tym samych uprawnień czy właściciela) i nie da się go ustawić ręcznie jak mtime — epoka zerowa tutaj to zwykle ślad tego samego uszkodzenia metadanych, tyle że w innym polu.",
+        },
+        OpisAnomalii {
+            etykieta: "Przepełnienie znacznika ctime",
+            wyjasnienie: "Ten sam mechanizm co \"Przepełnienie znacznika czasu\" wyżej (fizyczne uszkodzenie pola czasu, którego nie da się już zapisać jako precyzyjny znacznik nanosekundowy), zastosowany do ctime zamiast mtime.",
+        },
+        OpisAnomalii {
+            etykieta: "Pliki rzadkie (sparse)",
+            wyjasnienie: "Realnie zaalokowane bloki dysku (blocks() × 512 B) są wyraźnie mniejsze (poniżej połowy) niż zadeklarowany logiczny rozmiar pliku (len()) — plik ma dziury nigdy fizycznie nie zapisane na nośniku. Normalne dla niektórych formatów (obrazy dysków, pliki bazodanowe), ale warte odnotowania przy odzysku: logiczny rozmiar pliku nie odpowiada ilości realnie zajmowanego miejsca.",
+        },
+        OpisAnomalii {
+            etykieta: "Pliki specjalne (FIFO/socket/urządzenie)",
+            wyjasnienie: "Plik jest kolejką FIFO, gniazdem sieciowym (socket) albo węzłem urządzenia znakowego/blokowego, nie zwykłym plikiem z danymi. Takie obiekty są tworzone przez system w czasie działania i nie niosą trwałych danych użytkownika — ich obecność w korpusie odzyskanym z nośnika jest z definicji nietypowa.",
+        },
     ]
 }
 
@@ -59,14 +79,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dziewiec_wpisow_z_unikalnymi_etykietami() {
+    fn test_czternascie_wpisow_z_unikalnymi_etykietami() {
         let lista = opisy();
-        assert_eq!(lista.len(), 9, "panel Fazy 5 ma dokładnie 9 etykiet wymagających wyjaśnienia (bez generycznych)");
+        assert_eq!(lista.len(), 14, "panel Fazy 5 ma dokładnie 14 etykiet wymagających wyjaśnienia (bez generycznych)");
 
         let mut etykiety: Vec<&str> = lista.iter().map(|o| o.etykieta).collect();
         etykiety.sort_unstable();
         etykiety.dedup();
-        assert_eq!(etykiety.len(), 9, "etykiety muszą być unikalne, inaczej znajdz_opis znajdzie losowo pierwszą pasującą");
+        assert_eq!(etykiety.len(), 14, "etykiety muszą być unikalne, inaczej znajdz_opis znajdzie losowo pierwszą pasującą");
     }
 
     #[test]
@@ -84,7 +104,9 @@ mod tests {
         let oczekiwane = [
             "Dowiązania miękkie", "Dowiązania twarde", "Właściciel root", "SUID/SGID",
             "Pliki wykonywalne", "Epoka zerowa (1970)", "Przepełnienie znacznika czasu",
-            "Top UID", "Top uprawnienia",
+            "Top UID", "Top uprawnienia", "Top GID", "Epoka zerowa ctime (1970)",
+            "Przepełnienie znacznika ctime", "Pliki rzadkie (sparse)",
+            "Pliki specjalne (FIFO/socket/urządzenie)",
         ];
         let lista = opisy();
         for e in oczekiwane {

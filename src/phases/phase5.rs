@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 // --- FALLBACKS DLA WINDOWS (Aby IDE nie świeciło na czerwono) ---
 #[cfg(not(unix))]
@@ -44,9 +44,22 @@ trait DummyUnixMeta {
     fn uid(&self) -> u32 { 0 }
     fn gid(&self) -> u32 { 0 }
     fn mode(&self) -> u32 { 0o777 }
+    fn ctime(&self) -> i64 { 0 }
+    fn ctime_nsec(&self) -> i64 { 0 }
+    fn blocks(&self) -> u64 { 0 }
 }
 #[cfg(not(unix))]
 impl DummyUnixMeta for std::fs::Metadata {}
+
+#[cfg(not(unix))]
+trait DummyUnixFileType {
+    fn is_fifo(&self) -> bool { false }
+    fn is_socket(&self) -> bool { false }
+    fn is_char_device(&self) -> bool { false }
+    fn is_block_device(&self) -> bool { false }
+}
+#[cfg(not(unix))]
+impl DummyUnixFileType for std::fs::FileType {}
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -199,9 +212,11 @@ pub(crate) struct LiveStats {
     ext_weights: Mutex<HashMap<String, u64>>,
     /// Zliczenia wystąpień per UID właściciela — do wykrycia dominującego konta.
     uid_counts: Mutex<HashMap<u32, usize>>,
+    /// Zliczenia wystąpień per GID grupy — analogicznie do `uid_counts`.
+    gid_counts: Mutex<HashMap<u32, usize>>,
     /// Zliczenia wystąpień per czytelny string uprawnień (np. "-rwxr-xr-x").
     mode_counts: Mutex<HashMap<String, usize>>,
-    
+
     symlinks: AtomicUsize,
     /// Pliki z >1 dowiązaniem twardym (nlink > 1), z pominięciem symlinków.
     hardlinks: AtomicUsize,
@@ -216,6 +231,21 @@ pub(crate) struct LiveStats {
     /// uszkodzony w polu czasu na tyle, że nawet nie mieści się w typie danych.
     /// `mtime_ns` zapisany jako `None` (patrz [`compute_precise_mtime`]).
     mtime_overflow: AtomicUsize,
+    /// Ten sam sprawdzian co `epoch_zero`, zastosowany do `ctime` (czas
+    /// ZMIANY METADANYCH i-node, RÓŻNY od `mtime` — czasu zmiany TREŚCI).
+    /// Tylko do panelu live — w odróżnieniu od `mtime`, `ctime` NIE jest
+    /// zapisywany do SQLite (poza zakresem korelacji `meta_match`).
+    epoch_zero_ctime: AtomicUsize,
+    /// Ten sam sprawdzian co `mtime_overflow`, zastosowany do `ctime`.
+    ctime_overflow: AtomicUsize,
+    /// Pliki, gdzie realnie zaalokowane bloki dysku (`blocks() * 512`) są
+    /// WYRAŹNIE mniejsze niż logiczny rozmiar pliku (`len()`) — plik rzadki
+    /// (sparse), niosący dziury nigdy fizycznie nie zapisane na nośniku.
+    sparse_files: AtomicUsize,
+    /// Pliki będące FIFO, gniazdem (socket) albo urządzeniem znakowym/blokowym
+    /// — w korpusie odzyskanych danych użytkownika z definicji nietypowe,
+    /// bo to obiekty czasu działania systemu, nie trwałe dane.
+    special_files: AtomicUsize,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas wywołań `lstat()` — patrz moduł `thread_activity`.
@@ -230,6 +260,7 @@ impl LiveStats {
             errors: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
             uid_counts: Mutex::new(HashMap::new()),
+            gid_counts: Mutex::new(HashMap::new()),
             mode_counts: Mutex::new(HashMap::new()),
             symlinks: AtomicUsize::new(0),
             hardlinks: AtomicUsize::new(0),
@@ -238,6 +269,10 @@ impl LiveStats {
             executables: AtomicUsize::new(0),
             epoch_zero: AtomicUsize::new(0),
             mtime_overflow: AtomicUsize::new(0),
+            epoch_zero_ctime: AtomicUsize::new(0),
+            ctime_overflow: AtomicUsize::new(0),
+            sparse_files: AtomicUsize::new(0),
+            special_files: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -251,10 +286,12 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (UFS albo Skrypt) —
 /// prędkość w plikach/s (NIE MB/s — koszt tu to liczba syscalli `lstat`, nie
-/// objętość danych), top 3 rozszerzenia wagowo, top 3 UID, top 3 zestawy
-/// uprawnień, oraz liczniki anomalii i-node (symlinki, hardlinki, root,
-/// SUID/SGID, wykonywalne, epoka zerowa) i błędów I/O. Bez sumowania z drugą
-/// stroną — patrz uzasadnienie w dokumentacji modułu.
+/// objętość danych), top 3 rozszerzenia wagowo, top 3 UID, top 3 GID, top 3
+/// zestawy uprawnień, oraz liczniki anomalii i-node (symlinki, hardlinki,
+/// root, SUID/SGID, wykonywalne, epoka zerowa/przepełnienie mtime I ctime,
+/// pliki rzadkie/sparse, pliki specjalne FIFO/socket/urządzenie) i błędów
+/// I/O. Bez sumowania z drugą stroną — patrz uzasadnienie w dokumentacji
+/// modułu.
 fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
     let processed = stats.processed.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
@@ -279,6 +316,14 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     };
     let display_uid = if top_uid.is_empty() { "...".to_string() } else { top_uid };
 
+    let top_gid = {
+        let map = stats.gid_counts.lock().unwrap();
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        sorted.into_iter().take(3).map(|(g, c)| format!("GID {} ({})", g, c)).collect::<Vec<_>>().join(", ")
+    };
+    let display_gid = if top_gid.is_empty() { "...".to_string() } else { top_gid };
+
     let top_mode = {
         let map = stats.mode_counts.lock().unwrap();
         let mut sorted: Vec<_> = map.iter().collect();
@@ -290,8 +335,8 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.0} plików/s\nTop format: {}\nTop UID: {}\nTop uprawnienia: {}\nDowiązania miękkie: {}\nDowiązania twarde: {}\nWłaściciel root: {}\nSUID/SGID: {}\nPliki wykonywalne: {}\nEpoka zerowa (1970): {}\nPrzepełnienie znacznika czasu: {}\nWątki lstat (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_files, display_ext, display_uid, display_mode,
+        "[{}]\nPrędkość: {:.0} plików/s\nTop format: {}\nTop UID: {}\nTop GID: {}\nTop uprawnienia: {}\nDowiązania miękkie: {}\nDowiązania twarde: {}\nWłaściciel root: {}\nSUID/SGID: {}\nPliki wykonywalne: {}\nEpoka zerowa (1970): {}\nPrzepełnienie znacznika czasu: {}\nEpoka zerowa ctime (1970): {}\nPrzepełnienie znacznika ctime: {}\nPliki rzadkie (sparse): {}\nPliki specjalne (FIFO/socket/urządzenie): {}\nWątki lstat (Wariant A): {}\nBłędy I/O: {}",
+        label, speed_files, display_ext, display_uid, display_gid, display_mode,
         stats.symlinks.load(Ordering::Relaxed),
         stats.hardlinks.load(Ordering::Relaxed),
         stats.root_owned.load(Ordering::Relaxed),
@@ -299,6 +344,10 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         stats.executables.load(Ordering::Relaxed),
         stats.epoch_zero.load(Ordering::Relaxed),
         stats.mtime_overflow.load(Ordering::Relaxed),
+        stats.epoch_zero_ctime.load(Ordering::Relaxed),
+        stats.ctime_overflow.load(Ordering::Relaxed),
+        stats.sparse_files.load(Ordering::Relaxed),
+        stats.special_files.load(Ordering::Relaxed),
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -338,6 +387,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         let mut results = Vec::with_capacity(chunk.len());
         let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
         let mut local_uid_counts: HashMap<u32, usize> = HashMap::new();
+        let mut local_gid_counts: HashMap<u32, usize> = HashMap::new();
         let mut local_mode_counts: HashMap<String, usize> = HashMap::new();
         let mut last_ui_update = Instant::now();
 
@@ -368,6 +418,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
                     *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size;
                     *local_uid_counts.entry(uid).or_insert(0) += 1;
+                    *local_gid_counts.entry(gid).or_insert(0) += 1;
                     *local_mode_counts.entry(human_permissions.clone()).or_insert(0) += 1;
 
                     let mut anomalies: Vec<String> = Vec::new();
@@ -378,13 +429,45 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     if forensic_mode & 0o6000 != 0 { stats.suid_sgid.fetch_add(1, Ordering::Relaxed); anomalies.push("SUID/SGID".to_string()); }
                     if forensic_mode & 0o0111 != 0 && !is_sym { stats.executables.fetch_add(1, Ordering::Relaxed); }
                     match precise_mtime {
-                        Some(v) if v <= 0 => { stats.epoch_zero.fetch_add(1, Ordering::Relaxed); anomalies.push("Epoka 1970".to_string()); }
+                        Some(v) if v <= 0 => { stats.epoch_zero.fetch_add(1, Ordering::Relaxed); anomalies.push("Epoka 1970 (mtime)".to_string()); }
                         Some(_) => {}
                         None => {
                             stats.mtime_overflow.fetch_add(1, Ordering::Relaxed);
-                            anomalies.push("Nieprawidłowy znacznik czasu (przepełnienie)".to_string());
+                            anomalies.push("Nieprawidłowy znacznik czasu mtime (przepełnienie)".to_string());
                         }
                     }
+
+                    // Ten sam sprawdzian co dla mtime wyżej, zastosowany do ctime
+                    // (czas zmiany METADANYCH i-node, różny od mtime - czasu
+                    // zmiany TREŚCI) - tylko do panelu live, nie zapisywany do
+                    // SQLite (poza zakresem korelacji `meta_match`).
+                    match compute_precise_mtime(meta.ctime(), meta.ctime_nsec()) {
+                        Some(v) if v <= 0 => { stats.epoch_zero_ctime.fetch_add(1, Ordering::Relaxed); anomalies.push("Epoka 1970 (ctime)".to_string()); }
+                        Some(_) => {}
+                        None => {
+                            stats.ctime_overflow.fetch_add(1, Ordering::Relaxed);
+                            anomalies.push("Nieprawidłowy znacznik czasu ctime (przepełnienie)".to_string());
+                        }
+                    }
+
+                    // Plik rzadki (sparse): realnie zaalokowane bloki dysku
+                    // wyraźnie mniejsze niż logiczny rozmiar - dziury nigdy
+                    // fizycznie nie zapisane na nośniku. Próg 50% odsiewa
+                    // zwykły narzut zaokrąglenia do bloku systemu plików.
+                    let alokowane_bajty = meta.blocks() * 512;
+                    if file_size > 0 && alokowane_bajty < file_size / 2 {
+                        stats.sparse_files.fetch_add(1, Ordering::Relaxed);
+                        anomalies.push(format!("Plik rzadki/sparse ({} z {} zaalokowane)", format_bytes(alokowane_bajty), format_bytes(file_size)));
+                    }
+
+                    // Pliki specjalne (FIFO/socket/urządzenie) - w korpusie
+                    // odzyskanych danych użytkownika z definicji nietypowe,
+                    // to obiekty czasu działania systemu, nie trwałe dane.
+                    let typ = meta.file_type();
+                    if typ.is_fifo() { stats.special_files.fetch_add(1, Ordering::Relaxed); anomalies.push("Plik specjalny: FIFO".to_string()); }
+                    else if typ.is_socket() { stats.special_files.fetch_add(1, Ordering::Relaxed); anomalies.push("Plik specjalny: gniazdo (socket)".to_string()); }
+                    else if typ.is_char_device() { stats.special_files.fetch_add(1, Ordering::Relaxed); anomalies.push("Plik specjalny: urządzenie znakowe".to_string()); }
+                    else if typ.is_block_device() { stats.special_files.fetch_add(1, Ordering::Relaxed); anomalies.push("Plik specjalny: urządzenie blokowe".to_string()); }
 
                     if !anomalies.is_empty()
                         && let Ok(mut f) = opr_log.lock() {
@@ -432,6 +515,10 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 if !local_uid_counts.is_empty() {
                     let mut global_uid = stats.uid_counts.lock().unwrap();
                     for (k, v) in local_uid_counts.drain() { *global_uid.entry(k).or_insert(0) += v; }
+                }
+                if !local_gid_counts.is_empty() {
+                    let mut global_gid = stats.gid_counts.lock().unwrap();
+                    for (k, v) in local_gid_counts.drain() { *global_gid.entry(k).or_insert(0) += v; }
                 }
                 if !local_mode_counts.is_empty() {
                     let mut global_mode = stats.mode_counts.lock().unwrap();
@@ -1180,6 +1267,89 @@ mod tests {
     }
 
     #[test]
+    fn test_build_source_block_top_gid_by_frequency() {
+        let stats = LiveStats::new(4);
+        stats.gid_counts.lock().unwrap().insert(100, 3);
+        stats.gid_counts.lock().unwrap().insert(0, 9);
+
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let gid_line = block.lines().find(|l| l.starts_with("Top GID:")).unwrap();
+        let pos_root = gid_line.find("GID 0 (9)").expect("GID 0 powinien być na liście");
+        let pos_other = gid_line.find("GID 100 (3)").expect("GID 100 powinien być na liście");
+        assert!(pos_root < pos_other, "Częstszy GID powinien być wymieniony pierwszy");
+    }
+
+    #[test]
+    fn test_build_source_block_reports_ctime_sparse_and_special_counters() {
+        let stats = LiveStats::new(4);
+        stats.epoch_zero_ctime.store(2, Ordering::Relaxed);
+        stats.ctime_overflow.store(1, Ordering::Relaxed);
+        stats.sparse_files.store(4, Ordering::Relaxed);
+        stats.special_files.store(3, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Epoka zerowa ctime (1970): 2"));
+        assert!(block.contains("Przepełnienie znacznika ctime: 1"));
+        assert!(block.contains("Pliki rzadkie (sparse): 4"));
+        assert!(block.contains("Pliki specjalne (FIFO/socket/urządzenie): 3"));
+    }
+
+    // ------------------------------------------------------------------
+    // E2E na PRAWDZIWYCH obiektach systemowych (measure twice — sparse-file
+    // i special-file to nowa logika detekcji, nieoddzielona do czystej,
+    // testowalnej funkcji jak `analyze_header_cluster` w Fazie 3/4, więc
+    // zamiast ufać rozumowaniu o semantyce blocks()/file_type() prościej i
+    // pewniej sprawdzić ją wprost na realnych obiektach systemu plików).
+    // ------------------------------------------------------------------
+
+    fn uruchom(katalog: &Path, zadania: &[Task]) -> LiveStats {
+        let (tx_db, _rx_db) = mpsc::sync_channel(100);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        let stats = LiveStats::new(1);
+        let opr_log = Arc::new(Mutex::new(File::create(katalog.join("_test_log.txt")).unwrap()));
+
+        process_side_stream(StreamCtx {
+            base_path: katalog, tasks: zadania, side_label: "Test", stats: &stats,
+            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, opr_log, start_time: Instant::now(),
+        });
+
+        stats
+    }
+
+    #[test]
+    fn test_e2e_wykrywa_plik_rzadki_i_fifo_na_prawdziwych_obiektach() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Plik rzadki: 10 MB zadeklarowanego rozmiaru, zero fizycznie zapisanych bajtów.
+        let sparse_path = dir.path().join("rzadki.bin");
+        {
+            let f = File::create(&sparse_path).unwrap();
+            f.set_len(10 * 1024 * 1024).unwrap();
+        }
+
+        // FIFO: prawdziwy węzeł kolejki nazwanej, nie symulacja.
+        let fifo_path = dir.path().join("kolejka.fifo");
+        let fifo_cstr = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let wynik_mkfifo = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
+        assert_eq!(wynik_mkfifo, 0, "mkfifo musi się udać w katalogu tymczasowym");
+
+        let zadania = vec![
+            Task { id: 1, rel_path: "rzadki.bin".to_string() },
+            Task { id: 2, rel_path: "kolejka.fifo".to_string() },
+        ];
+
+        let stats = uruchom(dir.path(), &zadania);
+
+        assert_eq!(stats.sparse_files.load(Ordering::Relaxed), 1, "10 MB zadeklarowane, ~0 B zaalokowane - musi wykryć plik rzadki");
+        assert_eq!(stats.special_files.load(Ordering::Relaxed), 1, "FIFO musi zostać wykryte jako plik specjalny");
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "oba obiekty muszą się dać odczytać przez lstat() bez błędu I/O");
+    }
+
+    #[test]
     fn test_build_source_block_does_not_leak_other_side_data() {
         // Kontrakt architektoniczny: build_source_block przyjmuje TYLKO jeden
         // LiveStats - nie ma możliwości wmieszania drugiej strony (w przeciwieństwie
@@ -1219,6 +1389,6 @@ mod tests {
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 9, "panel powinien mieć dokładnie 9 etykiet wymagających wyjaśnienia");
+        assert_eq!(sprawdzonych, 14, "panel powinien mieć dokładnie 14 etykiet wymagających wyjaśnienia");
     }
 }
