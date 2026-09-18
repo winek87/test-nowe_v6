@@ -112,6 +112,32 @@ pub(crate) struct LiveStats {
     /// Wydmuszki SSD po TRIM (>99% bajtów 0xFF) w plikach UNIKALNYCH.
     ffs_unique: AtomicUsize,
 
+    /// Pliki o rozmiarze 0 B — INNY przypadek niż wydmuszka (zero_common/
+    /// zero_unique): nigdy nic nie zostało fizycznie zapisane, a nie realna
+    /// treść nadpisana/wyzerowana. `analyze_file` zwraca dla nich
+    /// `zeros_pct = 0.0`, więc bez osobnego licznika znikają bez śladu.
+    empty_files_common: AtomicUsize,
+    empty_files_unique: AtomicUsize,
+    /// Pliki z 50-99% zer LUB 50-99% bajtów 0xFF — poniżej progu pełnej
+    /// wydmuszki (>99%, `zero_common`/`ffs_common`), ale wciąż silny sygnał
+    /// częściowego skasowania/nadpisania zamiast pełnego.
+    partial_wydmuszka_common: AtomicUsize,
+    partial_wydmuszka_unique: AtomicUsize,
+    /// Zliczenia rozszerzeń plików z uciętym znacznikiem EOF — do wykrycia,
+    /// czy uszkodzenie koncentruje się w jednym formacie. Bez podziału
+    /// wspólne/unikalne, tak jak `ext_weights` (mapa wagowa, nie licznik
+    /// pojedynczej anomalii).
+    eof_by_ext: Mutex<HashMap<String, usize>>,
+    /// Suma `zeros_pct`/`ffs_pct` ze WSZYSTKICH poprawnie przeanalizowanych
+    /// plików (nie tylko wydmuszek) — do wyliczenia średniej "jak bardzo
+    /// zaszumiony" jest nośnik, niezależnie od pojedynczych ekstremów.
+    zeros_pct_sum: Mutex<f64>,
+    ffs_pct_sum: Mutex<f64>,
+    /// Mianownik dla średnich wyżej — TYLKO pliki z udaną analizą (bez
+    /// błędów I/O/anulowania), w odróżnieniu od `processed_files`, które
+    /// liczy WSZYSTKIE wyniki (używane do paska postępu).
+    analyzed_ok: AtomicUsize,
+
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas czytania i analizy zawartości pliku — patrz moduł
     /// `thread_activity`.
@@ -131,6 +157,14 @@ impl LiveStats {
             zero_unique: AtomicUsize::new(0),
             ffs_common: AtomicUsize::new(0),
             ffs_unique: AtomicUsize::new(0),
+            empty_files_common: AtomicUsize::new(0),
+            empty_files_unique: AtomicUsize::new(0),
+            partial_wydmuszka_common: AtomicUsize::new(0),
+            partial_wydmuszka_unique: AtomicUsize::new(0),
+            eof_by_ext: Mutex::new(HashMap::new()),
+            zeros_pct_sum: Mutex::new(0.0),
+            ffs_pct_sum: Mutex::new(0.0),
+            analyzed_ok: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -143,9 +177,11 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (UFS albo Skrypt) —
-/// prędkość MB/s, top 3 rozszerzenia wagowo, oraz trzy kategorie anomalii
-/// zawartości, każda rozbita na pliki wspólne/unikalne (patrz [`Task::is_common`]),
-/// plus błędy I/O. Bez sumowania z drugą stroną.
+/// prędkość MB/s, top 3 rozszerzenia wagowo, pięć kategorii anomalii
+/// zawartości (pełna/częściowa wydmuszka HDD/SSD, puste pliki, ucięty EOF),
+/// każda rozbita na pliki wspólne/unikalne (patrz [`Task::is_common`]), top 3
+/// formaty z uciętym EOF, średni % zer/0xFF w całej próbce, plus błędy I/O.
+/// Bez sumowania z drugą stroną.
 fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
@@ -162,14 +198,33 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     };
     let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
 
+    let top_eof_ext = {
+        let map = stats.eof_by_ext.lock().unwrap();
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        sorted.into_iter().take(3).map(|(ext, c)| {
+            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+            format!("{} ({})", e, c)
+        }).collect::<Vec<_>>().join(", ")
+    };
+    let display_eof_ext = if top_eof_ext.is_empty() { "brak".to_string() } else { top_eof_ext };
+
+    let analyzed = stats.analyzed_ok.load(Ordering::Relaxed);
+    let avg_zeros_pct = if analyzed > 0 { *stats.zeros_pct_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
+    let avg_ffs_pct = if analyzed > 0 { *stats.ffs_pct_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
+
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nWydmuszki HDD (zera): {} wspólne / {} unikalne\nWydmuszki SSD (TRIM/0xFF): {} wspólne / {} unikalne\nUcięte EOF: {} wspólne / {} unikalne\nWątki analizy (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nWydmuszki HDD (zera): {} wspólne / {} unikalne\nWydmuszki SSD (TRIM/0xFF): {} wspólne / {} unikalne\nCzęściowa wydmuszka (50-99%): {} wspólne / {} unikalne\nPuste pliki (0 B): {} wspólne / {} unikalne\nUcięte EOF: {} wspólne / {} unikalne\nTop formaty uciętego EOF: {}\nŚredni % zer w próbce: {:.1}%\nŚredni % 0xFF w próbce: {:.1}%\nWątki analizy (Wariant A): {}\nBłędy I/O: {}",
         label, speed_mb, display_ext,
         stats.zero_common.load(Ordering::Relaxed), stats.zero_unique.load(Ordering::Relaxed),
         stats.ffs_common.load(Ordering::Relaxed), stats.ffs_unique.load(Ordering::Relaxed),
+        stats.partial_wydmuszka_common.load(Ordering::Relaxed), stats.partial_wydmuszka_unique.load(Ordering::Relaxed),
+        stats.empty_files_common.load(Ordering::Relaxed), stats.empty_files_unique.load(Ordering::Relaxed),
         stats.eof_common.load(Ordering::Relaxed), stats.eof_unique.load(Ordering::Relaxed),
+        display_eof_ext,
+        avg_zeros_pct, avg_ffs_pct,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -353,22 +408,44 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let (analysis_opt, io_err) = match stats.thread_activity.track_current(|| analyze_file(&full_path, &task.rel_path)) {
                 Ok(a) => {
                     let mut anomalies = Vec::new();
-                    
+
                     if a.zeros_pct > 99.0 {
                         anomalies.push("Wydmuszka HDD (100% Zer)");
-                        if task.is_common { stats.zero_common.fetch_add(1, Ordering::Relaxed); } 
+                        if task.is_common { stats.zero_common.fetch_add(1, Ordering::Relaxed); }
                         else { stats.zero_unique.fetch_add(1, Ordering::Relaxed); }
+                    } else if a.zeros_pct > 50.0 {
+                        anomalies.push("Częściowa wydmuszka (zera)");
+                        if task.is_common { stats.partial_wydmuszka_common.fetch_add(1, Ordering::Relaxed); }
+                        else { stats.partial_wydmuszka_unique.fetch_add(1, Ordering::Relaxed); }
                     }
                     if a.ffs_pct > 99.0 {
                         anomalies.push("Wydmuszka SSD TRIM (Bloki 0xFF)");
-                        if task.is_common { stats.ffs_common.fetch_add(1, Ordering::Relaxed); } 
+                        if task.is_common { stats.ffs_common.fetch_add(1, Ordering::Relaxed); }
                         else { stats.ffs_unique.fetch_add(1, Ordering::Relaxed); }
+                    } else if a.ffs_pct > 50.0 {
+                        anomalies.push("Częściowa wydmuszka (0xFF)");
+                        if task.is_common { stats.partial_wydmuszka_common.fetch_add(1, Ordering::Relaxed); }
+                        else { stats.partial_wydmuszka_unique.fetch_add(1, Ordering::Relaxed); }
                     }
-                    if a.eof_ok == Some(false) {
+                    // Plik pusty (0 B) to INNY przypadek niż ucięty EOF - nigdy
+                    // nic nie zostało zapisane, nie realna treść ucięta. Ta sama
+                    // ścieżka `analyze_file` zwraca dla obu `eof_ok = Some(false)`,
+                    // więc rozstrzyga tu file_size (0 B nie może "mieć uciętego
+                    // ogona" - nie ma czego ucinać), a nie sam wynik eof_ok.
+                    if file_size == 0 {
+                        anomalies.push("Plik pusty (0 B)");
+                        if task.is_common { stats.empty_files_common.fetch_add(1, Ordering::Relaxed); }
+                        else { stats.empty_files_unique.fetch_add(1, Ordering::Relaxed); }
+                    } else if a.eof_ok == Some(false) {
                         anomalies.push("Ucięty Ogon (Brak znacznika EOF/EOCD)");
-                        if task.is_common { stats.eof_common.fetch_add(1, Ordering::Relaxed); } 
+                        if task.is_common { stats.eof_common.fetch_add(1, Ordering::Relaxed); }
                         else { stats.eof_unique.fetch_add(1, Ordering::Relaxed); }
+                        *stats.eof_by_ext.lock().unwrap().entry(ext.clone()).or_insert(0) += 1;
                     }
+
+                    *stats.zeros_pct_sum.lock().unwrap() += a.zeros_pct;
+                    *stats.ffs_pct_sum.lock().unwrap() += a.ffs_pct;
+                    stats.analyzed_ok.fetch_add(1, Ordering::Relaxed);
 
                     if !anomalies.is_empty()
                         && let Ok(mut f) = opr_log.lock() {
@@ -1226,6 +1303,104 @@ mod tests {
     }
 
     #[test]
+    fn test_build_source_block_reports_empty_and_partial_wydmuszka() {
+        let stats = LiveStats::new(4);
+        stats.empty_files_common.store(2, Ordering::Relaxed);
+        stats.empty_files_unique.store(1, Ordering::Relaxed);
+        stats.partial_wydmuszka_common.store(5, Ordering::Relaxed);
+        stats.partial_wydmuszka_unique.store(3, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Puste pliki (0 B): 2 wspólne / 1 unikalne"));
+        assert!(block.contains("Częściowa wydmuszka (50-99%): 5 wspólne / 3 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_top_eof_ext_by_frequency() {
+        let stats = LiveStats::new(4);
+        stats.eof_by_ext.lock().unwrap().insert("jpg".to_string(), 5);
+        stats.eof_by_ext.lock().unwrap().insert("pdf".to_string(), 12);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let line = block.lines().find(|l| l.starts_with("Top formaty uciętego EOF:")).unwrap();
+        let pos_pdf = line.find(".pdf (12)").expect(".pdf powinien być na liście");
+        let pos_jpg = line.find(".jpg (5)").expect(".jpg powinien być na liście");
+        assert!(pos_pdf < pos_jpg, "częstszy format uciętego EOF powinien być wymieniony pierwszy");
+    }
+
+    #[test]
+    fn test_build_source_block_average_zeros_and_ffs_pct() {
+        let stats = LiveStats::new(4);
+        *stats.zeros_pct_sum.lock().unwrap() = 150.0;
+        *stats.ffs_pct_sum.lock().unwrap() = 30.0;
+        stats.analyzed_ok.store(3, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Średni % zer w próbce: 50.0%"), "150/3 = 50.0: {}", block);
+        assert!(block.contains("Średni % 0xFF w próbce: 10.0%"), "30/3 = 10.0: {}", block);
+    }
+
+    #[test]
+    fn test_build_source_block_average_pct_is_zero_when_nothing_analyzed() {
+        let stats = LiveStats::new(4);
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+        assert!(block.contains("Średni % zer w próbce: 0.0%"), "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}", block);
+    }
+
+    /// E2E na realnych plikach tymczasowych (measure twice — cztery nowe
+    /// kategorie na raz, proces klasyfikacji nieoddzielony do czystej
+    /// funkcji jak `analyze_file`, więc bezpieczniej sprawdzić wprost przez
+    /// `process_side_stream`, nie tylko rozumowaniem o progach).
+    #[test]
+    fn test_e2e_nowe_kategorie_puste_czesciowa_wydmuszka_i_eof_by_ext() {
+        let pusty_content: Vec<u8> = vec![];
+        let (_g1, pusty_path) = temp_file_with_ext(&pusty_content, "dat");
+
+        // 600 zer + 400 bajtów różnorodnej treści = 60% zer - poniżej progu
+        // pełnej wydmuszki (>99%), powyżej progu częściowej (>50%).
+        let mut czesciowo_zerowy = vec![0u8; 600];
+        czesciowo_zerowy.extend((0..400u32).map(|i| (i % 256) as u8));
+        let (_g2, czesciowy_path) = temp_file_with_ext(&czesciowo_zerowy, "dat");
+
+        let mut jpg_content = b"\xFF\xD8\xFF\xE0".to_vec();
+        jpg_content.extend(vec![0x41u8; 50]); // brak FF D9 na końcu - ucięty
+        let (_g3, jpg_path) = temp_file_with_ext(&jpg_content, "jpg");
+
+        let base_path = pusty_path.parent().unwrap().to_path_buf();
+        let tasks = vec![
+            Task { id: 1, rel_path: pusty_path.file_name().unwrap().to_string_lossy().to_string(), is_common: true },
+            Task { id: 2, rel_path: czesciowy_path.file_name().unwrap().to_string_lossy().to_string(), is_common: true },
+            Task { id: 3, rel_path: jpg_path.file_name().unwrap().to_string_lossy().to_string(), is_common: false },
+        ];
+
+        let stats = LiveStats::new(1);
+        let (tx_db, _rx_db) = mpsc::sync_channel(10);
+        let (tx_ui, _rx_ui) = mpsc::channel();
+        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+
+        process_side_stream(StreamCtx {
+            base_path: &base_path, tasks: &tasks, side_label: "UFS Explorer", stats: &stats,
+            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log,
+        });
+
+        assert_eq!(stats.empty_files_common.load(Ordering::Relaxed), 1, "pusty plik wspólny musi trafić do nowego koszyka");
+        assert_eq!(stats.eof_common.load(Ordering::Relaxed), 0, "pusty plik NIE powinien też trafiać do koszyka uciętego EOF");
+        assert_eq!(stats.partial_wydmuszka_common.load(Ordering::Relaxed), 1, "60% zer musi trafić do częściowej wydmuszki");
+        assert_eq!(stats.zero_common.load(Ordering::Relaxed), 0, "60% to za mało na PEŁNĄ wydmuszkę (próg >99%)");
+        assert_eq!(stats.eof_unique.load(Ordering::Relaxed), 1, "ucięty JPG unikalny musi trafić do koszyka EOF");
+
+        let mapa = stats.eof_by_ext.lock().unwrap();
+        assert_eq!(mapa.get("jpg"), Some(&1), "rozszerzenie uciętego pliku musi trafić do rozbicia formatów");
+    }
+
+    #[test]
     fn test_build_source_block_shows_thread_activity_markup() {
         let stats = LiveStats::new(2);
         stats.thread_activity.mark_busy(1);
@@ -1252,5 +1427,32 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Wydmuszki HDD (zera): 0 wspólne / 99 unikalne"));
+    }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 6 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) ALBO być jawnie
+    /// na liście generycznych etykiet, które go celowo nie potrzebują — ten
+    /// sam wzorzec co w Fazie 5.
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki analizy (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(1);
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 6 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 8, "panel powinien mieć dokładnie 8 etykiet wymagających wyjaśnienia");
     }
 }
