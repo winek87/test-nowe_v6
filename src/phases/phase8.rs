@@ -275,18 +275,30 @@ fn fmt_opt_str(o: Option<String>) -> String { o.unwrap_or_else(|| "Brak".to_stri
 // GŁÓWNA FUNKCJA (Entrypoint)
 // ============================================================================
 
-/// Buduje panel boczny "Podsumowanie na żywo": cztery liczniki kategorii
-/// (Zdrowe/Odrzucone/Naprawione/Wirusy) oraz do 3 najczęstszych powodów
-/// odrzucenia i do 3 najczęstszych powodów podejrzenia, posortowane malejąco
-/// po liczności. W przeciwieństwie do Faz 1-7 nie ma tu podziału per-źródło —
-/// jeden, wspólny panel dla całego przebiegu (patrz dokumentacja modułu).
+/// Buduje panel boczny "Podsumowanie na żywo": liczniki kategorii
+/// (Zdrowe/Podejrzane/Odrzucone/Naprawione — rozbite na Smart Splice vs
+/// silnik Fazy 17/Wirusy), wskaźnik zaufania ogólnego (% zdrowych spośród
+/// dotąd ocenionych), oraz do 3 najczęstszych powodów odrzucenia, podejrzenia
+/// i dopasowanych reguł YARA, posortowane malejąco po liczności. W
+/// przeciwieństwie do Faz 1-7 nie ma tu podziału per-źródło — jeden, wspólny
+/// panel dla całego przebiegu (patrz dokumentacja modułu).
+///
+/// REGRESJA: `suspect_count` był już liczony w [`run`] i używany w Dzienniku
+/// Końcowym, ale nigdy nie docierał do TEGO panelu — operator widział "Top
+/// powody podejrzeń" (listę), ale nie samą łączną liczbę podejrzanych plików
+/// w trakcie skanowania. Naprawione dodaniem parametru.
+#[allow(clippy::too_many_arguments)]
 fn build_summary_block(
     ok_count: usize,
+    suspect_count: usize,
     to_reject_count: usize,
-    repaired_count: usize,
+    smart_splice_count: usize,
+    naprawiony_count: usize,
     infected_count: usize,
+    processed_so_far: usize,
     reject_reasons: &HashMap<String, usize>,
     suspect_reasons: &HashMap<String, usize>,
+    yara_rule_counts: &HashMap<String, usize>,
 ) -> String {
     let top_reasons = |map: &HashMap<String, usize>| -> String {
         let mut sorted: Vec<_> = map.iter().collect();
@@ -297,10 +309,13 @@ fn build_summary_block(
         if s.is_empty() { "-".to_string() } else { s }
     };
 
+    let confidence = if processed_so_far > 0 { (ok_count as f64 / processed_so_far as f64) * 100.0 } else { 0.0 };
+
     format!(
-        "[Podsumowanie]\nZdrowe: {}\nOdrzucone: {}\nNaprawione: {}\nWirusy: {}\nTop powody odrzuceń: {}\nTop powody podejrzeń: {}",
-        ok_count, to_reject_count, repaired_count, infected_count,
-        top_reasons(reject_reasons), top_reasons(suspect_reasons),
+        "[Podsumowanie]\nZdrowe: {}\nPodejrzane: {}\nOdrzucone: {}\nNaprawione (Smart Splice): {}\nNaprawione (Silnik Fazy 17): {}\nWirusy: {}\nWskaźnik zaufania: {:.1}%\nTop powody odrzuceń: {}\nTop powody podejrzeń: {}\nTop reguły YARA: {}",
+        ok_count, suspect_count, to_reject_count, smart_splice_count, naprawiony_count, infected_count,
+        confidence,
+        top_reasons(reject_reasons), top_reasons(suspect_reasons), top_reasons(yara_rule_counts),
     )
 }
 
@@ -340,7 +355,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "Silnik Heurystyczny (Ewaluacja)".to_string(), total: total_files as u64, color: Color::Yellow });
 
     let mut to_reject_count = 0; let mut suspect_count = 0; let mut ok_count = 0; let mut infected_count = 0; let mut repaired_count = 0;
+    // Rozbicie repaired_count na DWA różne mechanizmy - Faza 18 (Smart
+    // Splice, składanie z obu kopii naraz) i Faza 17 (naprawa pojedynczymi
+    // silnikami repair_modules) - dawniej zlane w jeden licznik przez
+    // dopasowanie tylko po wspólnym podciągu "ZREKONSTRUOWANY".
+    let mut smart_splice_count = 0; let mut naprawiony_count = 0;
     let mut reject_reasons: HashMap<String, usize> = HashMap::new(); let mut suspect_reasons: HashMap<String, usize> = HashMap::new();
+    let mut yara_rule_counts: HashMap<String, usize> = HashMap::new();
 
     let mut stmt = conn.prepare(
         "SELECT
@@ -377,10 +398,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let rec = record_result?;
         let eval = evaluate_file(&rec);
 
-        if eval.status.contains("ZAINFEKOWANY") { infected_count += 1; } 
-        else if eval.status.contains("ZREKONSTRUOWANY") { repaired_count += 1; }
-        else if eval.status.contains("USZKODZONY") || eval.status.contains("BŁĄD") { to_reject_count += 1; *reject_reasons.entry(eval.status.clone()).or_insert(0) += 1; } 
-        else if eval.status.contains("PODEJRZANY") || eval.status.contains("RÓŻNY") { suspect_count += 1; *suspect_reasons.entry(eval.status.clone()).or_insert(0) += 1; } 
+        if eval.status.contains("ZAINFEKOWANY") {
+            infected_count += 1;
+            *yara_rule_counts.entry(eval.yara_rule.clone()).or_insert(0) += 1;
+        }
+        else if eval.status.contains("ZREKONSTRUOWANY") {
+            repaired_count += 1;
+            if eval.status.contains("SMART SPLICE") { smart_splice_count += 1; } else { naprawiony_count += 1; }
+        }
+        else if eval.status.contains("USZKODZONY") || eval.status.contains("BŁĄD") { to_reject_count += 1; *reject_reasons.entry(eval.status.clone()).or_insert(0) += 1; }
+        else if eval.status.contains("PODEJRZANY") || eval.status.contains("RÓŻNY") { suspect_count += 1; *suspect_reasons.entry(eval.status.clone()).or_insert(0) += 1; }
         else { ok_count += 1; }
 
         let lokacja = match (rec.found_in_ufs, rec.found_in_script) { (true, true) => "Oba", (true, false) => "UFS", (false, true) => "Skrypt", _ => "Brak" };
@@ -414,7 +441,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             // PANEL BOCZNY: podsumowanie na żywo (bez podziału per-źródło - patrz dokumentacja modułu)
             let _ = tx_ui.send(PhaseEvent::UpdateSideText {
                 idx: 0,
-                text: build_summary_block(ok_count, to_reject_count, repaired_count, infected_count, &reject_reasons, &suspect_reasons),
+                text: build_summary_block(ok_count, suspect_count, to_reject_count, smart_splice_count, naprawiony_count, infected_count, i, &reject_reasons, &suspect_reasons, &yara_rule_counts),
             });
         }
     }
@@ -423,7 +450,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 0, current: total_files as u64, message: "Ewaluacja CSV w 100% zakończona.".to_string() });
     let _ = tx_ui.send(PhaseEvent::UpdateSideText {
         idx: 0,
-        text: build_summary_block(ok_count, to_reject_count, repaired_count, infected_count, &reject_reasons, &suspect_reasons),
+        text: build_summary_block(ok_count, suspect_count, to_reject_count, smart_splice_count, naprawiony_count, infected_count, i, &reject_reasons, &suspect_reasons, &yara_rule_counts),
     });
     
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
@@ -878,11 +905,22 @@ mod tests {
     fn test_build_summary_block_reports_counts() {
         let reject_reasons: HashMap<String, usize> = HashMap::new();
         let suspect_reasons: HashMap<String, usize> = HashMap::new();
-        let block = build_summary_block(10, 3, 1, 2, &reject_reasons, &suspect_reasons);
+        let yara_rule_counts: HashMap<String, usize> = HashMap::new();
+        let block = build_summary_block(10, 4, 3, 1, 2, 5, 20, &reject_reasons, &suspect_reasons, &yara_rule_counts);
         assert!(block.contains("Zdrowe: 10"));
+        assert!(block.contains("Podejrzane: 4"));
         assert!(block.contains("Odrzucone: 3"));
-        assert!(block.contains("Naprawione: 1"));
-        assert!(block.contains("Wirusy: 2"));
+        assert!(block.contains("Naprawione (Smart Splice): 1"));
+        assert!(block.contains("Naprawione (Silnik Fazy 17): 2"));
+        assert!(block.contains("Wirusy: 5"));
+        assert!(block.contains("Wskaźnik zaufania: 50.0%"), "10 zdrowych z 20 ocenionych = 50.0%: {}", block);
+    }
+
+    #[test]
+    fn test_build_summary_block_confidence_is_zero_when_nothing_processed() {
+        let empty: HashMap<String, usize> = HashMap::new();
+        let block = build_summary_block(0, 0, 0, 0, 0, 0, 0, &empty, &empty, &empty);
+        assert!(block.contains("Wskaźnik zaufania: 0.0%"), "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}", block);
     }
 
     #[test]
@@ -891,8 +929,9 @@ mod tests {
         reject_reasons.insert("USZKODZONY (WYDMUSZKA)".to_string(), 5);
         reject_reasons.insert("USZKODZONY (BRAK EOF)".to_string(), 20);
         let suspect_reasons: HashMap<String, usize> = HashMap::new();
+        let yara_rule_counts: HashMap<String, usize> = HashMap::new();
 
-        let block = build_summary_block(0, 25, 0, 0, &reject_reasons, &suspect_reasons);
+        let block = build_summary_block(0, 0, 25, 0, 0, 0, 25, &reject_reasons, &suspect_reasons, &yara_rule_counts);
         let line = block.lines().find(|l| l.starts_with("Top powody odrzuceń:")).unwrap();
         let pos_eof = line.find("USZKODZONY (BRAK EOF) (20)").expect("powinien zawierać powód EOF");
         let pos_wydmuszka = line.find("USZKODZONY (WYDMUSZKA) (5)").expect("powinien zawierać powód wydmuszki");
@@ -900,11 +939,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_summary_block_top_yara_rules_sorted_by_frequency() {
+        let empty: HashMap<String, usize> = HashMap::new();
+        let mut yara_rule_counts: HashMap<String, usize> = HashMap::new();
+        yara_rule_counts.insert("Ransomware_Generic".to_string(), 2);
+        yara_rule_counts.insert("Trojan_Downloader".to_string(), 9);
+
+        let block = build_summary_block(0, 0, 0, 0, 0, 11, 11, &empty, &empty, &yara_rule_counts);
+        let line = block.lines().find(|l| l.starts_with("Top reguły YARA:")).unwrap();
+        let pos_trojan = line.find("Trojan_Downloader (9)").expect("powinien zawierać regułę Trojan_Downloader");
+        let pos_ransom = line.find("Ransomware_Generic (2)").expect("powinien zawierać regułę Ransomware_Generic");
+        assert!(pos_trojan < pos_ransom, "Częściej dopasowana reguła powinna być wymieniona pierwsza");
+    }
+
+    #[test]
     fn test_build_summary_block_placeholder_when_no_reasons() {
         let empty: HashMap<String, usize> = HashMap::new();
-        let block = build_summary_block(5, 0, 0, 0, &empty, &empty);
+        let block = build_summary_block(5, 0, 0, 0, 0, 0, 5, &empty, &empty, &empty);
         assert!(block.contains("Top powody odrzuceń: -"));
         assert!(block.contains("Top powody podejrzeń: -"));
+        assert!(block.contains("Top reguły YARA: -"));
     }
 
     // ------------------------------------------------------------------
@@ -1011,5 +1065,29 @@ mod tests {
         assert_eq!(fields[0], "PRZED");
         assert_eq!(fields[1], log, "treść loga musi wrócić bajt w bajt po eskejpowaniu i parsowaniu");
         assert_eq!(fields[2], "PO");
+    }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 8 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) — w odróżnieniu
+    /// od Faz 5/6/7 nie ma tu żadnych generycznych etykiet do pominięcia
+    /// (panel Fazy 8 nie ma "Prędkość"/"Błędy I/O" - to jednoprzebiegowy
+    /// silnik decyzyjny, nie skaner I/O).
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia() {
+        let empty: HashMap<String, usize> = HashMap::new();
+        let block = build_summary_block(0, 0, 0, 0, 0, 0, 0, &empty, &empty, &empty);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 8 nie ma zarejestrowanego wyjaśnienia", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 10, "panel powinien mieć dokładnie 10 etykiet wymagających wyjaśnienia");
     }
 }
