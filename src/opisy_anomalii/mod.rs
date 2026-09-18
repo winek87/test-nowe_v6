@@ -18,6 +18,7 @@
 mod faza3_anomalie_klastra;
 mod faza5_metadane_inode;
 mod faza6_wydmuszki_i_eof;
+mod faza7_entropia;
 
 /// Jedno wyjaśnienie: dokładna etykieta wiersza (musi bajt-w-bajt zgadzać
 /// się z tym, co wysyła dana faza przez `PhaseEvent::UpdateSideText`) +
@@ -35,6 +36,7 @@ pub fn znajdz_opis(etykieta: &str) -> Option<&'static str> {
         .into_iter()
         .chain(faza5_metadane_inode::opisy())
         .chain(faza6_wydmuszki_i_eof::opisy())
+        .chain(faza7_entropia::opisy())
         .find(|o| o.etykieta == etykieta)
         .map(|o| o.wyjasnienie)
 }

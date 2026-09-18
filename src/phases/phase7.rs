@@ -115,6 +115,19 @@ pub(crate) struct LiveStats {
     /// Wariant A: licznik wystąpień per rozszerzenie dla kategorii "wydmuszka".
     low_ext: Mutex<HashMap<String, usize>>,
 
+    /// Suma entropii ze WSZYSTKICH poprawnie policzonych plików (nie tylko
+    /// tych sklasyfikowanych jako anomalia) — do wyliczenia średniej "jak
+    /// bardzo losowa" jest cała próbka, niezależnie od pojedynczych ekstremów.
+    entropy_sum: Mutex<f64>,
+    /// Najniższa/najwyższa entropia widziana w tej próbce. `None`, dopóki
+    /// żaden plik nie został jeszcze poprawnie policzony.
+    entropy_min: Mutex<Option<f64>>,
+    entropy_max: Mutex<Option<f64>>,
+    /// Mianownik dla średniej/zakresu wyżej — TYLKO pliki z udanym liczeniem
+    /// entropii (bez błędów I/O/anulowania), w odróżnieniu od
+    /// `processed_files` (liczy WSZYSTKIE wyniki, używane do paska postępu).
+    analyzed_ok: AtomicUsize,
+
     /// EKSPERYMENTALNE (Wariant A śledzenia wątków, patrz moduł
     /// `thread_activity`): śledzi zajętość logicznych slotów Rayon TEJ
     /// strony podczas liczenia entropii Shannon. Nie mylić z "Wariantem A"
@@ -142,6 +155,10 @@ impl LiveStats {
             crypto_ext: Mutex::new(HashMap::new()),
             broken_ext: Mutex::new(HashMap::new()),
             low_ext: Mutex::new(HashMap::new()),
+            entropy_sum: Mutex::new(0.0),
+            entropy_min: Mutex::new(None),
+            entropy_max: Mutex::new(None),
+            analyzed_ok: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -221,6 +238,40 @@ enum KategoriaEntropii {
     Wydmuszka,
 }
 
+/// Rozszerzenia formatów Z ZAŁOŻENIA skompresowanych (a więc naturalnie
+/// wysoko-entropijnych) — jedno źródło prawdy dla `is_compressed`, użyte
+/// zarówno w [`process_side_stream`] (klasyfikacja na żywo) jak i w
+/// generatorze Dziennika Końcowego w [`run`] (wcześniej dwie NIEZALEŻNE
+/// kopie tej samej listy, ryzyko rozjazdu przy przyszłej edycji jednej z
+/// nich — ten sam wzorzec regresji co przy `klasyfikuj_entropie`, patrz jej
+/// komentarz "Gemini review" niżej).
+///
+/// REGRESJA: poprzednia lista (`zip, rar, 7z, jpg, jpeg, png, mp4, mkv, pdf,
+/// apk, gz, docx, xlsx`) pomijała mnóstwo powszechnych formatów audio/wideo
+/// (mp3, ogg, avi, mov, webm, webp, heic i inne) — pliki tych formatów,
+/// mające z natury wysoką entropię dzięki WŁASNEJ kompresji, fałszywie
+/// trafiały do kategorii "podejrzanie wysoka entropia / szyfrowanie"
+/// (`KategoriaEntropii::Zaszyfrowany`) tylko dlatego, że ich rozszerzenia
+/// nie było na sztywnej liście — nie z powodu realnego szyfrowania.
+const FORMATY_SKOMPRESOWANE: &[&str] = &[
+    // Archiwa
+    "zip", "rar", "7z", "gz", "bz2", "xz", "zst", "jar",
+    // Kontenery biurowe oparte na ZIP
+    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk",
+    // Obrazy
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif",
+    // Wideo
+    "mp4", "mkv", "mov", "avi", "webm", "m4v", "flv", "wmv", "ts", "m2ts", "mts",
+    // Audio
+    "mp3", "ogg", "oga", "opus", "aac", "m4a", "wma", "flac",
+    // Dokumenty
+    "pdf",
+];
+
+fn jest_formatem_skompresowanym(ext: &str) -> bool {
+    FORMATY_SKOMPRESOWANE.contains(&ext)
+}
+
 /// Klasyfikuje wynik entropii pliku. Dokumentacja modułu deklaruje zakres
 /// "wydmuszki" jako domknięty przedział `0.0–1.0`, ale kod do niedawna
 /// implementował otwarty `(0.0, 1.0)` — plik z entropią DOKŁADNIE `0.0`
@@ -281,7 +332,9 @@ fn calculate_entropy(path: &Path) -> std::result::Result<f64, std::io::Error> {
 /// (każda rozbita na wspólne/unikalne), oraz — Wariant A — dla każdej kategorii
 /// najczęściej dotknięte rozszerzenie (samą nazwę i liczbę, bez konkretnych
 /// ścieżek; pełna lista ze ścieżkami trafia do `raport_operacyjny_faza7.txt`
-/// na bieżąco, niezależnie od tego panelu). Bez sumowania z drugą stroną.
+/// na bieżąco, niezależnie od tego panelu), plus średnia i zakres (min-max)
+/// entropii z CAŁEJ próbki (nie tylko plików sklasyfikowanych jako anomalia).
+/// Bez sumowania z drugą stroną.
 fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
@@ -307,15 +360,22 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         }).unwrap_or_else(|| "-".to_string())
     };
 
+    let analyzed = stats.analyzed_ok.load(Ordering::Relaxed);
+    let avg_entropy = if analyzed > 0 { *stats.entropy_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
+    let min_entropy = stats.entropy_min.lock().unwrap().unwrap_or(0.0);
+    let max_entropy = stats.entropy_max.lock().unwrap().unwrap_or(0.0);
+
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nSzum/Śmieci (H>7.99): {} wspólne / {} unikalne | top: {}\nSzyfrowanie (H>7.5): {} wspólne / {} unikalne | top: {}\nZepsuta kompresja (H<6.0): {} wspólne / {} unikalne | top: {}\nWydmuszki (H<1.0): {} wspólne / {} unikalne | top: {}\nWątki entropii (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nSzum/Śmieci (H>7.99): {} wspólne / {} unikalne | top: {}\nSzyfrowanie (H>7.5): {} wspólne / {} unikalne | top: {}\nZepsuta kompresja (H<6.0): {} wspólne / {} unikalne | top: {}\nWydmuszki (H<1.0): {} wspólne / {} unikalne | top: {}\nŚrednia entropia w próbce: {:.3} bit/B\nZakres entropii w próbce: {:.3} - {:.3} bit/B\nWątki entropii (Wariant A): {}\nBłędy I/O: {}",
         label, speed_mb, display_ext,
         stats.noise_common.load(Ordering::Relaxed), stats.noise_unique.load(Ordering::Relaxed), top_one(&stats.noise_ext),
         stats.crypto_common.load(Ordering::Relaxed), stats.crypto_unique.load(Ordering::Relaxed), top_one(&stats.crypto_ext),
         stats.broken_common.load(Ordering::Relaxed), stats.broken_unique.load(Ordering::Relaxed), top_one(&stats.broken_ext),
         stats.low_common.load(Ordering::Relaxed), stats.low_unique.load(Ordering::Relaxed), top_one(&stats.low_ext),
+        avg_entropy,
+        min_entropy, max_entropy,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -376,7 +436,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let (entropy_opt, io_err) = match stats.thread_activity.track_current(|| calculate_entropy(&full_path)) {
                 Ok(ent) => {
                     let mut anomalies = Vec::new();
-                    let is_compressed = matches!(ext.as_str(), "zip" | "rar" | "7z" | "jpg" | "jpeg" | "png" | "mp4" | "mkv" | "pdf" | "apk" | "gz" | "docx" | "xlsx");
+                    let is_compressed = jest_formatem_skompresowanym(&ext);
 
                     match klasyfikuj_entropie(ent, is_compressed) {
                         Some(KategoriaEntropii::Szum) => {
@@ -405,6 +465,17 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         }
                         None => {}
                     }
+
+                    *stats.entropy_sum.lock().unwrap() += ent;
+                    {
+                        let mut m = stats.entropy_min.lock().unwrap();
+                        *m = Some(m.map_or(ent, |cur| cur.min(ent)));
+                    }
+                    {
+                        let mut m = stats.entropy_max.lock().unwrap();
+                        *m = Some(m.map_or(ent, |cur| cur.max(ent)));
+                    }
+                    stats.analyzed_ok.fetch_add(1, Ordering::Relaxed);
 
                     if !anomalies.is_empty()
                         && let Ok(mut f) = opr_log.lock() {
@@ -824,7 +895,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let (rel_path, in_ufs, in_scr, e_ufs, e_scr) = r;
         let is_common = in_ufs && in_scr;
         let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
-        let is_compressed = matches!(ext.as_str(), "zip" | "rar" | "7z" | "jpg" | "jpeg" | "png" | "mp4" | "mkv" | "pdf" | "apk" | "gz" | "docx" | "xlsx");
+        let is_compressed = jest_formatem_skompresowanym(&ext);
 
         let add_to_cat = |cat: &mut AnomalyCategory, is_ufs_source: bool| {
             let target = if is_common { &mut cat.common } else { &mut cat.unique };
@@ -1070,6 +1141,38 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // jest_formatem_skompresowanym / REGRESJA listy is_compressed
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_formaty_wczesniej_brakujace_na_liscie_sa_teraz_rozpoznane() {
+        // Dokładnie formaty wymienione w regresji dokumentacji stałej
+        // FORMATY_SKOMPRESOWANE - dawniej nieobecne, fałszywie trafiały do
+        // kategorii "Zaszyfrowany" mimo wysokiej entropii z natury.
+        for ext in ["mp3", "ogg", "avi", "mov", "webm", "webp", "heic", "flac", "pptx"] {
+            assert!(jest_formatem_skompresowanym(ext), ".{} powinno być rozpoznane jako skompresowane", ext);
+        }
+    }
+
+    #[test]
+    fn test_formaty_niekompresowane_nadal_nie_sa_rozpoznane() {
+        // RAW/surowe formaty (dng, cr2, nef, bmp, txt, csv) NIE są z założenia
+        // skompresowane - wysoka entropia w nich POWINNA dalej wyglądać podejrzanie.
+        for ext in ["dng", "cr2", "nef", "bmp", "txt", "csv", "raw"] {
+            assert!(!jest_formatem_skompresowanym(ext), ".{} nie powinno być na liście skompresowanych", ext);
+        }
+    }
+
+    /// REGRESJA: plik .mp3 z entropią 7.7 (naturalnie wysoka dzięki WŁASNEJ
+    /// kompresji stratnej, nie szyfrowaniu) dawniej fałszywie trafiał do
+    /// kategorii "Zaszyfrowany", bo "mp3" nie było na liście `is_compressed`.
+    #[test]
+    fn test_mp3_o_wysokiej_entropii_nie_jest_juz_falszywie_zaszyfrowany() {
+        let is_compressed = jest_formatem_skompresowanym("mp3");
+        assert_eq!(klasyfikuj_entropie(7.7, is_compressed), None, "mp3 o typowo wysokiej entropii nie jest anomalią");
+    }
+
+    // ------------------------------------------------------------------
     // REGRESJA (Gemini review): anulowanie skanu (CANCEL_SIGNAL) w trakcie
     // liczenia entropii nie może być mylone z prawdziwym błędem I/O -
     // inaczej plik dostaje trwałe `io_error=true` mimo że nigdy nie został
@@ -1129,6 +1232,38 @@ mod tests {
     }
 
     #[test]
+    fn test_build_source_block_average_entropy() {
+        let stats = LiveStats::new(4);
+        *stats.entropy_sum.lock().unwrap() = 15.0;
+        stats.analyzed_ok.store(3, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Średnia entropia w próbce: 5.000 bit/B"), "15/3 = 5.0: {}", block);
+    }
+
+    #[test]
+    fn test_build_source_block_average_entropy_is_zero_when_nothing_analyzed() {
+        let stats = LiveStats::new(4);
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+        assert!(block.contains("Średnia entropia w próbce: 0.000 bit/B"), "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}", block);
+    }
+
+    #[test]
+    fn test_build_source_block_entropy_range() {
+        let stats = LiveStats::new(4);
+        *stats.entropy_min.lock().unwrap() = Some(0.42);
+        *stats.entropy_max.lock().unwrap() = Some(7.998);
+
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Zakres entropii w próbce: 0.420 - 7.998 bit/B"), "{}", block);
+    }
+
+    #[test]
     fn test_build_source_block_shows_thread_activity_markup() {
         let stats = LiveStats::new(4);
         stats.thread_activity.mark_busy(0);
@@ -1171,5 +1306,32 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Szum/Śmieci (H>7.99): 0 wspólne / 77 unikalne"));
+    }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 7 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) ALBO być jawnie
+    /// na liście generycznych etykiet, które go celowo nie potrzebują — ten
+    /// sam wzorzec co w Fazach 5/6.
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki entropii (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(1);
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 7 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 6, "panel powinien mieć dokładnie 6 etykiet wymagających wyjaśnienia");
     }
 }
