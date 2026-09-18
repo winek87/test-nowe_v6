@@ -47,9 +47,16 @@ use tracing::{info, instrument, warn};
 const CHUNK_SIZE: usize = 100;
 
 // Lista formatów multimedialnych obsługiwanych przez ExifTool
+//
+// UWAGA: `.gif` (bardzo powszechny format obrazu), `.avif` (nowoczesny
+// format obrazu) i `.3gp`/`.3g2` (wideo mobilne) wcześniej całkowicie
+// pomijane - trafiają tu przez generyczny fallback rodziny MIME w
+// `mime_family_for_ext` (żadna z tych czterech nie ma dedykowanej reguły
+// w `evaluate_metadata`, dokładnie jak `.webp`/`.avi` już wcześniej).
 const MEDIA_EXTS: &[&str] = &[
     ".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif", ".dng", ".cr2", ".nef", ".arw", ".png", ".webp", ".bmp",
-    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".ts",
+    ".gif", ".avif",
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".ts", ".3gp", ".3g2",
     ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"
 ];
 
@@ -85,8 +92,8 @@ fn format_duration(seconds: u64) -> String {
 /// jednoznacznej rodziny (nie blokuje ich, po prostu nie stosuje tej reguły).
 fn mime_family_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
-        "jpg" | "jpeg" | "tif" | "tiff" | "heic" | "heif" | "dng" | "cr2" | "nef" | "arw" | "png" | "webp" | "bmp" => Some("image"),
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "ts" => Some("video"),
+        "jpg" | "jpeg" | "tif" | "tiff" | "heic" | "heif" | "dng" | "cr2" | "nef" | "arw" | "png" | "webp" | "bmp" | "gif" | "avif" => Some("image"),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "ts" | "3gp" | "3g2" => Some("video"),
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => Some("audio"),
         _ => None,
     }
@@ -176,12 +183,25 @@ fn extract_year(date_str: &str) -> Option<i32> {
     if prefix.len() == 4 { prefix.parse::<i32>().ok() } else { None }
 }
 
-/// Rozstrzyga, czy dany rok jest nieprawdopodobny dowodowo: rok-widmo
-/// (patrz [`SENTINEL_YEARS`] — zresetowany zegar aparatu) lub data w
-/// przyszłości względem `current_year` (parametr, nie zegar systemowy —
-/// dla pełnej determinizmu w testach).
-fn is_implausible_year(year: i32, current_year: i32) -> bool {
-    SENTINEL_YEARS.contains(&year) || year > current_year
+/// Dwie różne dowodowo sytuacje ukryte pod jedną flagą "nieprawdopodobny
+/// rok": [`Sentinel`](ImplausibleYearKind::Sentinel) to zresetowany zegar
+/// aparatu (bateria wyjęta / ustawienia fabryczne) — nic nie mówi o realnej
+/// manipulacji. [`Future`](ImplausibleYearKind::Future) to data PO bieżącej
+/// chwili — znacznie bardziej podejrzana (możliwa manipulacja/uszkodzenie
+/// metadanych, nie tylko rozładowana bateria).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplausibleYearKind {
+    Sentinel,
+    Future,
+}
+
+/// Klasyfikuje rok jako nieprawdopodobny dowodowo (patrz [`ImplausibleYearKind`])
+/// albo `None`, gdy jest wiarygodny. `current_year` jest parametrem, nie
+/// zegarem systemowym — dla pełnej determinizmu w testach.
+fn classify_implausible_year(year: i32, current_year: i32) -> Option<ImplausibleYearKind> {
+    if SENTINEL_YEARS.contains(&year) { Some(ImplausibleYearKind::Sentinel) }
+    else if year > current_year { Some(ImplausibleYearKind::Future) }
+    else { None }
 }
 
 // ============================================================================
@@ -213,6 +233,9 @@ struct MediaAnalysis {
     has_suspicious_gps: bool,
     /// Data obecna, ale rok jest wartością-widmem lub przyszłością.
     has_implausible_date: bool,
+    /// Rozbicie `has_implausible_date` na konkretną przyczynę — patrz
+    /// [`ImplausibleYearKind`]. `None` gdy `has_implausible_date` jest `false`.
+    implausible_date_kind: Option<ImplausibleYearKind>,
     /// Plik nosi ślad przetworzenia narzędziem (pole `Software`) — nie jest
     /// surowym oryginałem z aparatu. Nazwa narzędzia w `Some(...)`.
     editing_software: Option<String>,
@@ -233,17 +256,19 @@ pub(crate) enum ScanMsg {
 
 /// Liczniki live dla JEDNEJ strony. Cztery kategorie "twardych" błędów
 /// (Ucięte/Zdegenerowane wymiary/Fałszywe MIME/Śmieci-trailer) każda
-/// wspólne/unikalne, plus trzy kategorie INFORMACYJNE niezależne od ważności
-/// (GPS podejrzany, data nieprawdopodobna, edytowane narzędziem). Nigdy nie
-/// łączone z licznikami drugiej strony.
+/// wspólne/unikalne, plus cztery kategorie INFORMACYJNE niezależne od
+/// ważności (GPS podejrzany, data nieprawdopodobna rozbita na rok-widmo/
+/// przyszłość — patrz [`ImplausibleYearKind`], edytowane narzędziem).
+/// `ok_common`/`ok_unique` (podobnie jak każda inna kategoria tego panelu)
+/// - patrz [`build_source_block`]. Nigdy nie łączone z licznikami drugiej strony.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
     
-    ok: AtomicUsize,
-    engine_rs: AtomicUsize,   
+    ok_common: AtomicUsize, ok_unique: AtomicUsize,
+    engine_rs: AtomicUsize,
     engine_cli: AtomicUsize,  
     last_engine: Mutex<String>,
 
@@ -258,8 +283,12 @@ pub(crate) struct LiveStats {
     feat_date_common: AtomicUsize,   feat_date_unique: AtomicUsize,
     /// INFORMACYJNE: GPS obecny, ale geograficznie niewiarygodny.
     gps_suspicious_common: AtomicUsize, gps_suspicious_unique: AtomicUsize,
-    /// INFORMACYJNE: data obecna, ale rok-widmo lub przyszłość.
-    date_implausible_common: AtomicUsize, date_implausible_unique: AtomicUsize,
+    /// INFORMACYJNE: data obecna, ale rok-widmo (reset zegara aparatu) —
+    /// dowodowo mniej znacząca niż `date_implausible_future` niżej.
+    date_implausible_sentinel_common: AtomicUsize, date_implausible_sentinel_unique: AtomicUsize,
+    /// INFORMACYJNE: data obecna, ale z przyszłości — możliwa manipulacja
+    /// lub uszkodzenie metadanych, dowodowo istotniejsze niż rok-widmo.
+    date_implausible_future_common: AtomicUsize, date_implausible_future_unique: AtomicUsize,
     /// INFORMACYJNE: plik nosi ślad przetworzenia narzędziem (pole Software).
     edited_common: AtomicUsize, edited_unique: AtomicUsize,
 
@@ -276,7 +305,8 @@ impl LiveStats {
         Self {
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
             processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
-            ext_weights: Mutex::new(HashMap::new()), ok: AtomicUsize::new(0),
+            ext_weights: Mutex::new(HashMap::new()),
+            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0),
             engine_rs: AtomicUsize::new(0), engine_cli: AtomicUsize::new(0),
             last_engine: Mutex::new("exiftool-rs".to_string()),
             err_trunc_common: AtomicUsize::new(0), err_trunc_unique: AtomicUsize::new(0),
@@ -287,7 +317,8 @@ impl LiveStats {
             feat_gps_common: AtomicUsize::new(0), feat_gps_unique: AtomicUsize::new(0),
             feat_date_common: AtomicUsize::new(0), feat_date_unique: AtomicUsize::new(0),
             gps_suspicious_common: AtomicUsize::new(0), gps_suspicious_unique: AtomicUsize::new(0),
-            date_implausible_common: AtomicUsize::new(0), date_implausible_unique: AtomicUsize::new(0),
+            date_implausible_sentinel_common: AtomicUsize::new(0), date_implausible_sentinel_unique: AtomicUsize::new(0),
+            date_implausible_future_common: AtomicUsize::new(0), date_implausible_future_unique: AtomicUsize::new(0),
             edited_common: AtomicUsize::new(0), edited_unique: AtomicUsize::new(0),
             total_duration_sec: AtomicU64::new(0), top_devices: Mutex::new(HashMap::new()),
         }
@@ -347,7 +378,7 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         Prędkość: {:.2} MB/s\n \
         Top format: {}\n \
         Silnik aktualny: {}\n \
-        Zdrowe: {}\n \
+        Zdrowe: {} wspólne / {} unikalne\n \
         Top urządzenia: {}\n \
         Ucięte: {} wspólne / {} unikalne\n \
         Brak wymiarów: {} wspólne / {} unikalne\n \
@@ -357,14 +388,15 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         GPS znaleziony: {} wspólne / {} unikalne\n \
         GPS podejrzany: {} wspólne / {} unikalne\n \
         Data znaleziona: {} wspólne / {} unikalne\n \
-        Data nieprawdopodobna: {} wspólne / {} unikalne\n \
+        Data nieprawdopodobna (rok-widmo): {} wspólne / {} unikalne\n \
+        Data nieprawdopodobna (przyszłość): {} wspólne / {} unikalne\n \
         Edytowane narzędziem: {} wspólne / {} unikalne\n \
         Wątki dekodowania (Wariant A): {}\n \
         Błędy I/O: {}",
         label, speed_mb,
         display_ext,
         engine_line,
-        stats.ok.load(Ordering::Relaxed),
+        stats.ok_common.load(Ordering::Relaxed), stats.ok_unique.load(Ordering::Relaxed),
         top_devices,
         stats.err_trunc_common.load(Ordering::Relaxed),
         stats.err_trunc_unique.load(Ordering::Relaxed),
@@ -382,8 +414,10 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         stats.gps_suspicious_unique.load(Ordering::Relaxed),
         stats.feat_date_common.load(Ordering::Relaxed),
         stats.feat_date_unique.load(Ordering::Relaxed),
-        stats.date_implausible_common.load(Ordering::Relaxed),
-        stats.date_implausible_unique.load(Ordering::Relaxed),
+        stats.date_implausible_sentinel_common.load(Ordering::Relaxed),
+        stats.date_implausible_sentinel_unique.load(Ordering::Relaxed),
+        stats.date_implausible_future_common.load(Ordering::Relaxed),
+        stats.date_implausible_future_unique.load(Ordering::Relaxed),
         stats.edited_common.load(Ordering::Relaxed),
         stats.edited_unique.load(Ordering::Relaxed),
         crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot()),
@@ -496,13 +530,13 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
 ///
 /// Po tym punkcie plik jest ważny. Dodatkowo (informacyjnie, NIE unieważnia):
 /// ekstrakcja urządzenia (Make+Model), daty, GPS + sanity-check GPS
-/// ([`is_gps_suspicious`]) i daty ([`is_implausible_year`]), oraz wykrycie
+/// ([`is_gps_suspicious`]) i daty ([`classify_implausible_year`]), oraz wykrycie
 /// narzędzia edycji (pole `Software`).
 fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i32) -> MediaAnalysis {
     let empty_analysis = |reason: &str, mime: &str| MediaAnalysis {
         is_valid: false, reason: Some(reason.to_string()), mime_type: mime.to_string(),
         dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-        has_suspicious_gps: false, has_implausible_date: false, editing_software: None,
+        has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
     };
 
     if meta.is_empty() {
@@ -545,7 +579,7 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
         return MediaAnalysis {
             is_valid: false, reason: Some(format!("Fałszywe rozszerzenie (Wewnątrz to: {})", mime_type)),
             mime_type, dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-            has_suspicious_gps: false, has_implausible_date: false, editing_software: None,
+            has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
         };
     }
 
@@ -559,7 +593,7 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
         return MediaAnalysis {
             is_valid: false, reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)".into()),
             mime_type, dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-            has_suspicious_gps: false, has_implausible_date: false, editing_software: None,
+            has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
         };
     }
 
@@ -569,7 +603,7 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
                 return MediaAnalysis {
                     is_valid: false, reason: Some("Zniszczony Nagłówek (Wymiary zerowe/1x1)".into()),
                     mime_type, dimensions, device: None, original_date: None, has_gps: false, duration_sec: 0,
-                    has_suspicious_gps: false, has_implausible_date: false, editing_software: None,
+                    has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
                 };
             }
 
@@ -580,10 +614,10 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
     } else { make.or(model) };
 
     let original_date = meta.get("DateTimeOriginal").or(meta.get("CreateDate")).cloned();
-    let has_implausible_date = original_date.as_deref()
+    let implausible_date_kind = original_date.as_deref()
         .and_then(extract_year)
-        .map(|y| is_implausible_year(y, current_year))
-        .unwrap_or(false);
+        .and_then(|y| classify_implausible_year(y, current_year));
+    let has_implausible_date = implausible_date_kind.is_some();
 
     let has_gps = meta.get("GPSLatitude").is_some() || meta.get("GPSPosition").is_some();
     let has_suspicious_gps = if has_gps {
@@ -604,7 +638,7 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
 
     MediaAnalysis {
         is_valid: true, reason: None, mime_type, dimensions, device, original_date, has_gps, duration_sec,
-        has_suspicious_gps, has_implausible_date, editing_software,
+        has_suspicious_gps, has_implausible_date, implausible_date_kind, editing_software,
     }
 }
 
@@ -677,7 +711,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     }
 
                     if ana.is_valid {
-                        stats.ok.fetch_add(1, Ordering::Relaxed);
+                        if task.is_common { stats.ok_common.fetch_add(1, Ordering::Relaxed); } else { stats.ok_unique.fetch_add(1, Ordering::Relaxed); }
                         stats.total_duration_sec.fetch_add(ana.duration_sec, Ordering::Relaxed);
 
                         if ana.has_gps { if task.is_common { stats.feat_gps_common.fetch_add(1, Ordering::Relaxed); } else { stats.feat_gps_unique.fetch_add(1, Ordering::Relaxed); } }
@@ -721,7 +755,11 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         if task.is_common { stats.gps_suspicious_common.fetch_add(1, Ordering::Relaxed); } else { stats.gps_suspicious_unique.fetch_add(1, Ordering::Relaxed); }
                     }
                     if ana.has_implausible_date {
-                        if task.is_common { stats.date_implausible_common.fetch_add(1, Ordering::Relaxed); } else { stats.date_implausible_unique.fetch_add(1, Ordering::Relaxed); }
+                        match ana.implausible_date_kind {
+                            Some(ImplausibleYearKind::Sentinel) => { if task.is_common { stats.date_implausible_sentinel_common.fetch_add(1, Ordering::Relaxed); } else { stats.date_implausible_sentinel_unique.fetch_add(1, Ordering::Relaxed); } }
+                            Some(ImplausibleYearKind::Future) => { if task.is_common { stats.date_implausible_future_common.fetch_add(1, Ordering::Relaxed); } else { stats.date_implausible_future_unique.fetch_add(1, Ordering::Relaxed); } }
+                            None => unreachable!("has_implausible_date był true, więc implausible_date_kind musi być Some"),
+                        }
                     }
                     if ana.editing_software.is_some() {
                         if task.is_common { stats.edited_common.fetch_add(1, Ordering::Relaxed); } else { stats.edited_unique.fetch_add(1, Ordering::Relaxed); }
@@ -1180,7 +1218,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = writeln!(&mut log_out, "   -> Odnaleziono koordynaty GPS w:  {} plikach", ufs_stats.feat_gps_common.load(Ordering::SeqCst) + script_stats.feat_gps_common.load(Ordering::SeqCst) + ufs_stats.feat_gps_unique.load(Ordering::SeqCst) + script_stats.feat_gps_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> ...z czego geograficznie podejrzanych (poza zakresem/Null Island): {}", ufs_stats.gps_suspicious_common.load(Ordering::SeqCst) + script_stats.gps_suspicious_common.load(Ordering::SeqCst) + ufs_stats.gps_suspicious_unique.load(Ordering::SeqCst) + script_stats.gps_suspicious_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> Zrekonstruowano Daty w:        {} plikach", ufs_stats.feat_date_common.load(Ordering::SeqCst) + script_stats.feat_date_common.load(Ordering::SeqCst) + ufs_stats.feat_date_unique.load(Ordering::SeqCst) + script_stats.feat_date_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> ...z czego nieprawdopodobnych (rok-widmo/przyszłość): {}", ufs_stats.date_implausible_common.load(Ordering::SeqCst) + script_stats.date_implausible_common.load(Ordering::SeqCst) + ufs_stats.date_implausible_unique.load(Ordering::SeqCst) + script_stats.date_implausible_unique.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "   -> ...z czego rok-widmo (reset zegara aparatu): {}", ufs_stats.date_implausible_sentinel_common.load(Ordering::SeqCst) + script_stats.date_implausible_sentinel_common.load(Ordering::SeqCst) + ufs_stats.date_implausible_sentinel_unique.load(Ordering::SeqCst) + script_stats.date_implausible_sentinel_unique.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "   -> ...z czego data z przyszłości (możliwa manipulacja): {}", ufs_stats.date_implausible_future_common.load(Ordering::SeqCst) + script_stats.date_implausible_future_common.load(Ordering::SeqCst) + ufs_stats.date_implausible_future_unique.load(Ordering::SeqCst) + script_stats.date_implausible_future_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> Pliki edytowane narzędziem (Software): {}", ufs_stats.edited_common.load(Ordering::SeqCst) + script_stats.edited_common.load(Ordering::SeqCst) + ufs_stats.edited_unique.load(Ordering::SeqCst) + script_stats.edited_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> Sumaryczny Czas Trwania Wideo: {}", sum_duration);
     let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Algorytm Smart Merge w kolejnej Fazie weźmie te wskaźniki pod uwagę, wybierając kopię wideo o najdłuższym czasie trwania i zachowanym GPS-ie.\n");
@@ -1291,6 +1330,39 @@ mod tests {
         assert!(is_media_extension("zdjecie.JPG"));
         assert!(is_media_extension("nagranie.mp4"));
         assert!(!is_media_extension("dokument.pdf"));
+    }
+
+    #[test]
+    fn test_is_media_extension_recognizes_previously_missing_formats() {
+        // REGRESJA: .gif (bardzo powszechny), .avif, .3gp/.3g2 - wcześniej
+        // całkowicie pomijane przez tę fazę.
+        assert!(is_media_extension("animacja.gif"));
+        assert!(is_media_extension("nowoczesne.avif"));
+        assert!(is_media_extension("wideo_mobilne.3gp"));
+        assert!(is_media_extension("wideo_mobilne.3g2"));
+    }
+
+    #[test]
+    fn test_mime_family_for_new_formats() {
+        assert_eq!(mime_family_for_ext("gif"), Some("image"));
+        assert_eq!(mime_family_for_ext("avif"), Some("image"));
+        assert_eq!(mime_family_for_ext("3gp"), Some("video"));
+        assert_eq!(mime_family_for_ext("3g2"), Some("video"));
+    }
+
+    #[test]
+    fn test_evaluate_gif_via_generic_family_fallback() {
+        let meta = meta_map(&[("MIMEType", "image/gif"), ("ImageWidth", "320"), ("ImageHeight", "240")]);
+        let a = evaluate_metadata(&meta, "gif", CURRENT_YEAR);
+        assert!(a.is_valid);
+    }
+
+    #[test]
+    fn test_evaluate_fake_gif_caught_by_generic_family_fallback() {
+        let meta = meta_map(&[("MIMEType", "video/mp4")]);
+        let a = evaluate_metadata(&meta, "gif", CURRENT_YEAR);
+        assert!(!a.is_valid);
+        assert!(a.reason.unwrap().contains("Fałszywe"));
     }
 
     #[test]
@@ -1438,7 +1510,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // extract_year / is_implausible_year
+    // extract_year / classify_implausible_year
     // ------------------------------------------------------------------
 
     #[test]
@@ -1452,21 +1524,21 @@ mod tests {
     }
 
     #[test]
-    fn test_implausible_year_sentinels() {
-        assert!(is_implausible_year(0, CURRENT_YEAR));
-        assert!(is_implausible_year(1900, CURRENT_YEAR));
-        assert!(is_implausible_year(1904, CURRENT_YEAR));
+    fn test_implausible_year_sentinels_classify_as_sentinel() {
+        assert_eq!(classify_implausible_year(0, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
+        assert_eq!(classify_implausible_year(1900, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
+        assert_eq!(classify_implausible_year(1904, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
     }
 
     #[test]
-    fn test_implausible_year_future() {
-        assert!(is_implausible_year(CURRENT_YEAR + 1, CURRENT_YEAR));
+    fn test_implausible_year_future_classifies_as_future() {
+        assert_eq!(classify_implausible_year(CURRENT_YEAR + 1, CURRENT_YEAR), Some(ImplausibleYearKind::Future));
     }
 
     #[test]
     fn test_plausible_year_not_implausible() {
-        assert!(!is_implausible_year(2023, CURRENT_YEAR));
-        assert!(!is_implausible_year(1999, CURRENT_YEAR));
+        assert_eq!(classify_implausible_year(2023, CURRENT_YEAR), None);
+        assert_eq!(classify_implausible_year(1999, CURRENT_YEAR), None);
     }
 
     // ------------------------------------------------------------------
@@ -1616,6 +1688,30 @@ mod tests {
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(a.is_valid);
         assert!(a.has_implausible_date);
+        assert_eq!(a.implausible_date_kind, Some(ImplausibleYearKind::Sentinel), "rok 1900 musi klasyfikować się jako rok-widmo, nie przyszłość");
+    }
+
+    #[test]
+    fn test_evaluate_future_date_classifies_as_future_not_sentinel() {
+        let meta = meta_map(&[
+            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("DateTimeOriginal", format!("{}:01:01 00:00:00", CURRENT_YEAR + 5).as_str()),
+        ]);
+        let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
+        assert!(a.is_valid);
+        assert!(a.has_implausible_date);
+        assert_eq!(a.implausible_date_kind, Some(ImplausibleYearKind::Future));
+    }
+
+    #[test]
+    fn test_evaluate_plausible_date_has_no_implausible_kind() {
+        let meta = meta_map(&[
+            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("DateTimeOriginal", "2023:06:15 14:30:00"),
+        ]);
+        let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
+        assert!(!a.has_implausible_date);
+        assert_eq!(a.implausible_date_kind, None);
     }
 
     #[test]
@@ -1650,7 +1746,8 @@ mod tests {
         let stats = LiveStats::new(rayon::current_num_threads());
         stats.err_zerodim_common.store(2, Ordering::Relaxed);
         stats.gps_suspicious_unique.store(1, Ordering::Relaxed);
-        stats.date_implausible_common.store(3, Ordering::Relaxed);
+        stats.date_implausible_sentinel_common.store(3, Ordering::Relaxed);
+        stats.date_implausible_future_unique.store(5, Ordering::Relaxed);
         stats.edited_unique.store(4, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -1658,8 +1755,21 @@ mod tests {
 
         assert!(block.contains("Wymiary zerowe/1x1: 2 wspólne / 0 unikalne"));
         assert!(block.contains("GPS podejrzany: 0 wspólne / 1 unikalne"));
-        assert!(block.contains("Data nieprawdopodobna: 3 wspólne / 0 unikalne"));
+        assert!(block.contains("Data nieprawdopodobna (rok-widmo): 3 wspólne / 0 unikalne"));
+        assert!(block.contains("Data nieprawdopodobna (przyszłość): 0 wspólne / 5 unikalne"));
         assert!(block.contains("Edytowane narzędziem: 0 wspólne / 4 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_splits_zdrowe_common_and_unique() {
+        // REGRESJA: mirror Fazy 11 - "Zdrowe" był jedynym licznikiem panelu
+        // bez podziału wspólne/unikalne.
+        let stats = LiveStats::new(rayon::current_num_threads());
+        stats.ok_common.store(6, Ordering::Relaxed);
+        stats.ok_unique.store(9, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Zdrowe: 6 wspólne / 9 unikalne"));
     }
 
     #[test]
@@ -1694,6 +1804,36 @@ mod tests {
     fn test_compute_half_threads() {
         assert_eq!(compute_half_threads(8), 4);
         assert_eq!(compute_half_threads(1), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // opisy_anomalii: każda REALNA etykieta wiersza panelu (poza
+    // generycznymi) musi mieć zarejestrowane wyjaśnienie — inaczej Enter na
+    // tym wierszu w prawdziwym UI nie pokaże nakładki. Mirror wzorca z Fazy
+    // 5-11.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki dekodowania (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(2);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            let line = line.trim();
+            if line.starts_with('[') || line.is_empty() { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta \"{}\" z panelu Fazy 12 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 14, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza12_multimedia.rs");
     }
 
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
