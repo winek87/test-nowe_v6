@@ -122,6 +122,20 @@ fn classify_decode_error(err_str_lower: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Klasyfikuje `color_space` zwrócony przez [`analyze_image`] do jednego z
+/// sześciu kubełków panelu live — patrz dokumentacja `LiveStats::col_raw`
+/// dla uzasadnienia (naprawiony błąd: DNG/HEIC wcześniej wpadały do "Szare"
+/// przez gałąź domyślną). Wydzielone jako czysta funkcja, testowalna bez
+/// rzeczywistego dekodowania obrazu — analogicznie do [`classify_decode_error`].
+fn classify_color_bucket(color_space: &str) -> &'static str {
+    if color_space == "RGB" { "rgb" }
+    else if color_space == "RGBA" { "rgba" }
+    else if color_space == "Grayscale" { "gray" }
+    else if color_space.starts_with("RAW Bayer") { "raw" }
+    else if color_space.starts_with("HEIC") { "heic" }
+    else { "other" }
+}
+
 /// Sprawdza, czy stosunek dłuższego do krótszego boku przekracza
 /// [`EXTREME_ASPECT_RATIO_THRESHOLD`]. Zwraca `false` dla wymiaru zerowego
 /// (unika dzielenia przez zero — taki przypadek i tak nie powinien wystąpić
@@ -213,18 +227,20 @@ pub(crate) enum ScanMsg {
 
 /// Liczniki live dla JEDNEJ strony. Trzy kategorie "twardych" błędów
 /// (Glitch/Bomba/Fałszywe) wspólne/unikalne, trzy kubełki rozdzielczości,
-/// trzy przestrzenie kolorów (bez podziału common/unique — to statystyka
-/// zbiorcza, nie anomalia), oraz dwie kategorie INFORMACYJNE (proporcje
-/// ekstremalne, zawartość jednolita) wspólne/unikalne. Nigdy nie łączone
-/// z licznikami drugiej strony.
+/// sześć przestrzeni kolorów (bez podziału common/unique — to statystyka
+/// zbiorcza, nie anomalia; RGB/RGBA/Grayscale/RAW/HEIC/Inne — patrz
+/// dokumentacja `col_raw`/`col_heic`/`col_other` niżej), oraz dwie kategorie
+/// INFORMACYJNE (proporcje ekstremalne, zawartość jednolita) wspólne/unikalne.
+/// `ok_common`/`ok_unique` (jak każda inna kategoria tego panelu). Nigdy nie
+/// łączone z licznikami drugiej strony.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
     
-    ok: AtomicUsize,
-    total_megapixels_x1_m: AtomicU64, 
+    ok_common: AtomicUsize, ok_unique: AtomicUsize,
+    total_megapixels_x1_m: AtomicU64,
     
     err_glitch_common: AtomicUsize,  err_glitch_unique: AtomicUsize,
     err_bomb_common: AtomicUsize,    err_bomb_unique: AtomicUsize,
@@ -234,7 +250,17 @@ pub(crate) struct LiveStats {
     res_std_common: AtomicUsize,     res_std_unique: AtomicUsize,
     res_high_common: AtomicUsize,    res_high_unique: AtomicUsize,
     
+    /// Rozbicie `color_space` zwróconego przez [`analyze_image`] — REGRESJA
+    /// (naprawiony błąd klasyfikacji): wcześniej `col_gray` był gałęzią
+    /// domyślną (`else`), więc łapał NIE TYLKO prawdziwy Grayscale, ale też
+    /// DNG ("RAW Bayer (1 składowa)") i HEIC ("HEIC z alfą/bez alfy") —
+    /// pliki RAW/HEIC były błędnie liczone i pokazywane jako "Szare" w
+    /// panelu. Teraz każda rodzina ma własny kubełek; `col_other` zostaje
+    /// jako gałąź domyślna dla prawdziwie niesklasyfikowanych przypadków
+    /// (`"Inny/Mieszany"` z crate `image` lub DNG o nietypowej liczbie
+    /// składowych).
     col_rgb: AtomicUsize, col_rgba: AtomicUsize, col_gray: AtomicUsize,
+    col_raw: AtomicUsize, col_heic: AtomicUsize, col_other: AtomicUsize,
 
     /// INFORMACYJNE: stosunek boków przekracza [`EXTREME_ASPECT_RATIO_THRESHOLD`].
     extreme_ratio_common: AtomicUsize, extreme_ratio_unique: AtomicUsize,
@@ -254,7 +280,8 @@ impl LiveStats {
     fn new(slot_count: usize) -> Self {
         Self {
             processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
-            ext_weights: Mutex::new(HashMap::new()), ok: AtomicUsize::new(0), total_megapixels_x1_m: AtomicU64::new(0),
+            ext_weights: Mutex::new(HashMap::new()),
+            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0), total_megapixels_x1_m: AtomicU64::new(0),
             err_glitch_common: AtomicUsize::new(0), err_glitch_unique: AtomicUsize::new(0),
             err_bomb_common: AtomicUsize::new(0), err_bomb_unique: AtomicUsize::new(0),
             err_fake_common: AtomicUsize::new(0), err_fake_unique: AtomicUsize::new(0),
@@ -262,6 +289,7 @@ impl LiveStats {
             res_std_common: AtomicUsize::new(0), res_std_unique: AtomicUsize::new(0),
             res_high_common: AtomicUsize::new(0), res_high_unique: AtomicUsize::new(0),
             col_rgb: AtomicUsize::new(0), col_rgba: AtomicUsize::new(0), col_gray: AtomicUsize::new(0),
+            col_raw: AtomicUsize::new(0), col_heic: AtomicUsize::new(0), col_other: AtomicUsize::new(0),
             extreme_ratio_common: AtomicUsize::new(0), extreme_ratio_unique: AtomicUsize::new(0),
             uniform_common: AtomicUsize::new(0), uniform_unique: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
@@ -298,11 +326,20 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
 
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
+    let ok_common = stats.ok_common.load(Ordering::Relaxed);
+    let ok_unique = stats.ok_unique.load(Ordering::Relaxed);
+    let ok_total = ok_common + ok_unique;
+    let avg_mp = if ok_total > 0 {
+        (stats.total_megapixels_x1_m.load(Ordering::Relaxed) as f64 / 1_000_000.0) / ok_total as f64
+    } else { 0.0 };
+
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s | {:.1} MP/s\nTop format: {}\nZdrowe: {} (RGB: {}, RGBA: {}, Szare: {})\nZepsute piksele: {} wspólne / {} unikalne\nFałszywe rozszerzenie: {} wspólne / {} unikalne\nBomba pikselowa: {} wspólne / {} unikalne\nEkstremalne proporcje: {} wspólne / {} unikalne\nZawartość jednolita (próbka): {} wspólne / {} unikalne\nWątki dekodowania (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.2} MB/s | {:.1} MP/s\nTop format: {}\nZdrowe: {} wspólne / {} unikalne\nŚr. megapikseli (zdrowe): {:.2} MP\nPrzestrzenie kolorów: RGB: {}, RGBA: {}, Szare: {}, RAW: {}, HEIC: {}, Inne: {}\nZepsute piksele: {} wspólne / {} unikalne\nFałszywe rozszerzenie: {} wspólne / {} unikalne\nBomba pikselowa: {} wspólne / {} unikalne\nEkstremalne proporcje: {} wspólne / {} unikalne\nZawartość jednolita (próbka): {} wspólne / {} unikalne\nWątki dekodowania (Wariant A): {}\nBłędy I/O: {}",
         label, speed_mb, speed_mp, display_ext,
-        stats.ok.load(Ordering::Relaxed),
+        ok_common, ok_unique,
+        avg_mp,
         stats.col_rgb.load(Ordering::Relaxed), stats.col_rgba.load(Ordering::Relaxed), stats.col_gray.load(Ordering::Relaxed),
+        stats.col_raw.load(Ordering::Relaxed), stats.col_heic.load(Ordering::Relaxed), stats.col_other.load(Ordering::Relaxed),
         stats.err_glitch_common.load(Ordering::Relaxed), stats.err_glitch_unique.load(Ordering::Relaxed),
         stats.err_fake_common.load(Ordering::Relaxed), stats.err_fake_unique.load(Ordering::Relaxed),
         stats.err_bomb_common.load(Ordering::Relaxed), stats.err_bomb_unique.load(Ordering::Relaxed),
@@ -537,16 +574,21 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     let kategoria = if task.is_common { "Wspólne" } else { "Osobne" };
 
                     if ana.is_valid {
-                        stats.ok.fetch_add(1, Ordering::Relaxed);
+                        if task.is_common { stats.ok_common.fetch_add(1, Ordering::Relaxed); } else { stats.ok_unique.fetch_add(1, Ordering::Relaxed); }
                         stats.total_megapixels_x1_m.fetch_add((ana.megapixels * 1_000_000.0) as u64, Ordering::Relaxed);
 
                         if ana.megapixels < 1.0 { if task.is_common { stats.res_thumb_common.fetch_add(1, Ordering::Relaxed); } else { stats.res_thumb_unique.fetch_add(1, Ordering::Relaxed); } }
                         else if ana.megapixels <= 8.0 { if task.is_common { stats.res_std_common.fetch_add(1, Ordering::Relaxed); } else { stats.res_std_unique.fetch_add(1, Ordering::Relaxed); } }
                         else { if task.is_common { stats.res_high_common.fetch_add(1, Ordering::Relaxed); } else { stats.res_high_unique.fetch_add(1, Ordering::Relaxed); } }
 
-                        if ana.color_space == "RGB" { stats.col_rgb.fetch_add(1, Ordering::Relaxed); }
-                        else if ana.color_space == "RGBA" { stats.col_rgba.fetch_add(1, Ordering::Relaxed); }
-                        else { stats.col_gray.fetch_add(1, Ordering::Relaxed); }
+                        match classify_color_bucket(&ana.color_space) {
+                            "rgb" => stats.col_rgb.fetch_add(1, Ordering::Relaxed),
+                            "rgba" => stats.col_rgba.fetch_add(1, Ordering::Relaxed),
+                            "gray" => stats.col_gray.fetch_add(1, Ordering::Relaxed),
+                            "raw" => stats.col_raw.fetch_add(1, Ordering::Relaxed),
+                            "heic" => stats.col_heic.fetch_add(1, Ordering::Relaxed),
+                            _ => stats.col_other.fetch_add(1, Ordering::Relaxed),
+                        };
 
                         if ana.has_extreme_aspect_ratio {
                             if task.is_common { stats.extreme_ratio_common.fetch_add(1, Ordering::Relaxed); } else { stats.extreme_ratio_unique.fetch_add(1, Ordering::Relaxed); }
@@ -1026,7 +1068,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let sum_mp = format!("{:.1} MP", (ufs_stats.total_megapixels_x1_m.load(Ordering::SeqCst) + script_stats.total_megapixels_x1_m.load(Ordering::SeqCst)) as f64 / 1_000_000.0);
     
     let _ = writeln!(&mut log_out, "[ 1 ] WYRENDEROWANE ZDJĘCIA (Przeszły test dekodowania bez szarych pasków):");
-    let _ = writeln!(&mut log_out, "   -> Poprawnie wyrenderowano {} zdjęć", ufs_stats.ok.load(Ordering::SeqCst) + script_stats.ok.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "   -> Poprawnie wyrenderowano {} zdjęć", ufs_stats.ok_common.load(Ordering::SeqCst) + ufs_stats.ok_unique.load(Ordering::SeqCst) + script_stats.ok_common.load(Ordering::SeqCst) + script_stats.ok_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> Procesor obliczył łącznie: {}", sum_mp);
     let _ = writeln!(&mut log_out, "   -> Ekstremalne proporcje boków (>{:.0}:1): {}", EXTREME_ASPECT_RATIO_THRESHOLD, ufs_stats.extreme_ratio_common.load(Ordering::SeqCst) + ufs_stats.extreme_ratio_unique.load(Ordering::SeqCst) + script_stats.extreme_ratio_common.load(Ordering::SeqCst) + script_stats.extreme_ratio_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "   -> Zawartość jednolita w próbce (orientacyjnie): {}\n", ufs_stats.uniform_common.load(Ordering::SeqCst) + ufs_stats.uniform_unique.load(Ordering::SeqCst) + script_stats.uniform_common.load(Ordering::SeqCst) + script_stats.uniform_unique.load(Ordering::SeqCst));
@@ -1172,6 +1214,38 @@ mod tests {
     fn test_classify_decode_error_glitch_default() {
         let (cat, _) = classify_decode_error("unexpected end of stream while parsing scanline");
         assert_eq!(cat, "glitch");
+    }
+
+    // ------------------------------------------------------------------
+    // classify_color_bucket
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_color_bucket_rgb_and_rgba() {
+        assert_eq!(classify_color_bucket("RGB"), "rgb");
+        assert_eq!(classify_color_bucket("RGBA"), "rgba");
+    }
+
+    #[test]
+    fn test_classify_color_bucket_true_grayscale() {
+        assert_eq!(classify_color_bucket("Grayscale"), "gray");
+    }
+
+    #[test]
+    fn test_classify_color_bucket_raw_dng_not_grayscale() {
+        // REGRESJA: przed naprawą to trafiało do "Szare" przez gałąź domyślną.
+        assert_eq!(classify_color_bucket("RAW Bayer (1 składowa)"), "raw");
+    }
+
+    #[test]
+    fn test_classify_color_bucket_heic_variants_not_grayscale() {
+        assert_eq!(classify_color_bucket("HEIC z alfą (8-bit)"), "heic");
+        assert_eq!(classify_color_bucket("HEIC bez alfy (10-bit)"), "heic");
+    }
+
+    #[test]
+    fn test_classify_color_bucket_truly_unmatched_is_other() {
+        assert_eq!(classify_color_bucket("Inny/Mieszany"), "other");
     }
 
     // ------------------------------------------------------------------
@@ -1459,6 +1533,48 @@ mod tests {
     }
 
     #[test]
+    fn test_build_source_block_splits_zdrowe_common_and_unique() {
+        // REGRESJA: mirror Fazy 11/12 - "Zdrowe" był jedynym licznikiem
+        // panelu bez podziału wspólne/unikalne.
+        let stats = LiveStats::new(4);
+        stats.ok_common.store(7, Ordering::Relaxed);
+        stats.ok_unique.store(3, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Zdrowe: 7 wspólne / 3 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_average_megapixels() {
+        let stats = LiveStats::new(4);
+        stats.ok_common.store(2, Ordering::Relaxed);
+        stats.total_megapixels_x1_m.store(20_000_000, Ordering::Relaxed); // 20.0 MP łącznie / 2 pliki = 10.0 MP
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Śr. megapikseli (zdrowe): 10.00 MP"));
+    }
+
+    #[test]
+    fn test_build_source_block_average_megapixels_zero_when_nothing_ok() {
+        let stats = LiveStats::new(4);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Śr. megapikseli (zdrowe): 0.00 MP"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_raw_heic_and_other_color_buckets() {
+        // REGRESJA: DNG/HEIC wcześniej wpadały do "Szare" przez gałąź domyślną.
+        let stats = LiveStats::new(4);
+        stats.col_gray.store(1, Ordering::Relaxed);
+        stats.col_raw.store(2, Ordering::Relaxed);
+        stats.col_heic.store(3, Ordering::Relaxed);
+        stats.col_other.store(4, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Przestrzenie kolorów: RGB: 0, RGBA: 0, Szare: 1, RAW: 2, HEIC: 3, Inne: 4"));
+    }
+
+    #[test]
     fn test_build_source_block_shows_thread_activity_markup() {
         use std::time::Duration;
         let stats = LiveStats::new(2);
@@ -1476,6 +1592,35 @@ mod tests {
     fn test_compute_half_threads() {
         assert_eq!(compute_half_threads(8), 4);
         assert_eq!(compute_half_threads(1), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // opisy_anomalii: każda REALNA etykieta wiersza panelu (poza
+    // generycznymi) musi mieć zarejestrowane wyjaśnienie — inaczej Enter na
+    // tym wierszu w prawdziwym UI nie pokaże nakładki. Mirror wzorca z Fazy
+    // 5-12.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki dekodowania (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(2);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta \"{}\" z panelu Fazy 13 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 8, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza13_dekodowanie.rs");
     }
 
     // ------------------------------------------------------------------
