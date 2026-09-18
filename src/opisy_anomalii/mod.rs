@@ -16,6 +16,7 @@
 //! `scanner_panel.rs`/`menu/actions.rs` — one znają tylko [`znajdz_opis`].
 
 mod faza3_anomalie_klastra;
+mod faza5_metadane_inode;
 
 /// Jedno wyjaśnienie: dokładna etykieta wiersza (musi bajt-w-bajt zgadzać
 /// się z tym, co wysyła dana faza przez `PhaseEvent::UpdateSideText`) +
@@ -31,6 +32,7 @@ pub struct OpisAnomalii {
 pub fn znajdz_opis(etykieta: &str) -> Option<&'static str> {
     faza3_anomalie_klastra::opisy()
         .into_iter()
+        .chain(faza5_metadane_inode::opisy())
         .find(|o| o.etykieta == etykieta)
         .map(|o| o.wyjasnienie)
 }

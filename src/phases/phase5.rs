@@ -1191,4 +1191,34 @@ mod tests {
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Dowiązania miękkie: 42"));
     }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 5 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) ALBO być jawnie
+    /// na liście generycznych etykiet, które go celowo nie potrzebują (ten
+    /// sam wybór co w Fazie 3 dla "Top format"/"Prędkość"/"Błędy I/O") — bez
+    /// tego popup po Enter pokazałby pustkę dla wiersza, o którym operator
+    /// faktycznie chce wiedzieć więcej, a nikt by tego nie zauważył aż do
+    /// ręcznego sprawdzenia w UI.
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki lstat (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(1);
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 5 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 9, "panel powinien mieć dokładnie 9 etykiet wymagających wyjaśnienia");
+    }
 }
