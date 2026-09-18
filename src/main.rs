@@ -9,6 +9,7 @@ mod generic_image;
 mod video_image;
 mod ts_stream;
 mod mkv_container;
+mod asf_container;
 mod mp3_stream;
 mod riff_container;
 mod flv_stream;

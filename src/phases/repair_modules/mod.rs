@@ -35,6 +35,7 @@ mod heic;
 mod jpeg;
 mod mkv;
 mod riff;
+mod asf;
 mod mp4;
 mod mp4_autopilot;
 mod png;
@@ -665,6 +666,7 @@ pub fn all_modules() -> Vec<Box<dyn RepairModule>> {
         // MUSI stać przed nim: silnik świadomy struktury RIFF dostaje
         // pierwszeństwo przed ślepym bajtowym zszyciem.
         Box::new(riff::RiffCloneModule),
+        Box::new(asf::AsfCloneModule),
         Box::new(splice::SpliceModule),
         Box::new(sqlite::SqliteModule),
         Box::new(trailer_trim::TrailerTrimModule),
