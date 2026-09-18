@@ -46,6 +46,113 @@ pub fn is_riff_extension(path_str: &str) -> bool {
     lower.ends_with(".wav") || lower.ends_with(".avi")
 }
 
+/// Informacje o poprawnie odczytanym kontenerze RIFF (Faza 19).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RiffInfo {
+    pub form_type: [u8; 4],
+    /// Liczba fragmentów NAJWYŻSZEGO poziomu (patrz dokumentacja modułu) —
+    /// NIE liczba ścieżek audio/wideo, których ten płytki rozbiór nagłówków
+    /// nie ustala (wymagałoby zejścia w `LIST "hdrl"`).
+    pub fragment_count: usize,
+}
+
+/// Kategoria uszkodzenia kontenera RIFF, wywiedziona przez [`read_riff_file`].
+/// Ten sam podział co [`crate::mkv_container::MkvDamage`], bez wariantu
+/// odpowiadającego "InvalidStructure z powodu nierozpoznanych elementów" —
+/// RIFF nie ma zamkniętego słownika identyfikatorów fragmentów do
+/// zwalidowania, więc jedyne dwie odróżnialne kategorie to "nie ma nagłówka
+/// RIFF w ogóle" i "urywa się w trakcie".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiffDamage {
+    /// Brak czytelnego nagłówka `"RIFF"`, albo plik parsuje się na zero
+    /// fragmentów — w tym fałszywe rozszerzenie (plik `.wav`/`.avi`, który w
+    /// rzeczywistości jest innym formatem).
+    InvalidStructure,
+    /// Zadeklarowany koniec fragmentu wykracza poza plik, albo odczyt
+    /// nagłówka fragmentu urywa się w trakcie — klasyczny objaw ucięcia.
+    Truncated,
+    /// Błąd odczytu pliku z dysku. Rozmyślnie NIE rozstrzyga "plik nie
+    /// istnieje" — to sprawdza wywołujący (Faza 19) przez `full_path.exists()`,
+    /// dokładnie tak jak przy [`crate::mkv_container::read_mkv_file`].
+    Other,
+}
+
+/// Opis kategorii po polsku — do zapisania w bazie i pokazania użytkownikowi.
+pub fn damage_description(damage: RiffDamage) -> &'static str {
+    match damage {
+        RiffDamage::Truncated => "Plik ucięty - struktura RIFF urywa się przed zadeklarowanym końcem",
+        RiffDamage::InvalidStructure => "Niespójna struktura RIFF - uszkodzenie lub fałszywe rozszerzenie (plik nie jest WAV/AVI)",
+        RiffDamage::Other => "Błąd odczytu pliku RIFF z dysku",
+    }
+}
+
+/// Wariant [`dzieci_riff`] czytający z DYSKU zamiast z bufora w pamięci —
+/// główna ścieżka Fazy 19 (diagnostyka całego korpusu, łącznie z dużymi
+/// plikami AVI, które mogą ważyć gigabajty).
+///
+/// Przechodzi WYŁĄCZNIE po 8-bajtowych nagłówkach fragmentów (`seek` +
+/// `read_exact`), nigdy nie wczytuje ich treści do pamięci — ten sam
+/// kompromis co [`crate::mkv_container::read_mkv_file`] (patrz jej
+/// dokumentacja: `matroska::open` też czyta tylko konkretne elementy przez
+/// `BufReader`, nigdy całego pliku). Dlatego, w odróżnieniu od
+/// [`dzieci_riff`]/[`splice_riff`] (operujących na buforze już w RAM, bo
+/// Faza 17 działa na już-wybranych kandydatach do naprawy), ta funkcja NIE
+/// potrzebuje żadnego limitu rozmiaru pliku.
+pub fn read_riff_file(path: &std::path::Path) -> std::result::Result<RiffInfo, RiffDamage> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).map_err(|_| RiffDamage::Other)?;
+    let file_len = f.metadata().map(|m| m.len()).map_err(|_| RiffDamage::Other)?;
+
+    let mut naglowek = [0u8; 12];
+    if f.read_exact(&mut naglowek).is_err() {
+        return Err(RiffDamage::InvalidStructure);
+    }
+    if &naglowek[0..4] != b"RIFF" {
+        return Err(RiffDamage::InvalidStructure);
+    }
+    let rozmiar_naglowka = u32::from_le_bytes(naglowek[4..8].try_into().unwrap());
+    let forma: [u8; 4] = naglowek[8..12].try_into().unwrap();
+
+    let Some(deklarowany_koniec) = 8u64.checked_add(rozmiar_naglowka as u64) else {
+        return Err(RiffDamage::Truncated);
+    };
+
+    let mut p: u64 = 12;
+    let mut fragment_count = 0usize;
+
+    while p < deklarowany_koniec {
+        if f.seek(SeekFrom::Start(p)).is_err() {
+            return Err(RiffDamage::Truncated);
+        }
+        let mut naglowek_fragmentu = [0u8; 8];
+        if f.read_exact(&mut naglowek_fragmentu).is_err() {
+            return Err(RiffDamage::Truncated);
+        }
+        let rozmiar = u32::from_le_bytes(naglowek_fragmentu[4..8].try_into().unwrap()) as u64;
+        let dopelnienie = rozmiar % 2;
+
+        let Some(dlugosc_calkowita) = 8u64.checked_add(rozmiar).and_then(|d| d.checked_add(dopelnienie)) else {
+            return Err(RiffDamage::Truncated);
+        };
+        let Some(koniec) = p.checked_add(dlugosc_calkowita) else {
+            return Err(RiffDamage::Truncated);
+        };
+        if koniec > file_len {
+            return Err(RiffDamage::Truncated);
+        }
+
+        fragment_count += 1;
+        p = koniec;
+    }
+
+    if fragment_count == 0 {
+        return Err(RiffDamage::InvalidStructure);
+    }
+
+    Ok(RiffInfo { form_type: forma, fragment_count })
+}
+
 /// Jeden fragment RIFF najwyższego poziomu.
 #[derive(Debug, Clone, Copy)]
 pub struct FragmentRiff {
@@ -474,6 +581,73 @@ mod tests {
     #[test]
     fn test_wszystkie_fragmenty_spojne_na_smieciach_daje_none() {
         assert_eq!(wszystkie_fragmenty_spojne(b"to nie jest RIFF"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // read_riff_file (ścieżka dyskowa, Faza 19)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_read_riff_file_na_zdrowym_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("zdrowy.wav");
+        std::fs::write(&sciezka, zbuduj_wav(&[1, 2, 3, 4, 5])).unwrap();
+
+        let info = read_riff_file(&sciezka).expect("zdrowy WAV musi się odczytać");
+        assert_eq!(&info.form_type, b"WAVE");
+        assert_eq!(info.fragment_count, 2, "fmt + data");
+    }
+
+    #[test]
+    fn test_read_riff_file_na_smieciach() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("smieci.wav");
+        std::fs::write(&sciezka, b"to nie jest RIFF").unwrap();
+
+        assert_eq!(read_riff_file(&sciezka), Err(RiffDamage::InvalidStructure));
+    }
+
+    #[test]
+    fn test_read_riff_file_ucieta_w_srodku_fragmentu() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = zbuduj_wav(&[1, 2, 3, 4, 5]);
+        let sciezka = dir.path().join("ucieta.wav");
+        std::fs::write(&sciezka, &wav[..wav.len() - 3]).unwrap();
+
+        assert_eq!(read_riff_file(&sciezka), Err(RiffDamage::Truncated));
+    }
+
+    #[test]
+    fn test_read_riff_file_ucieta_dokladnie_na_granicy_fragmentu() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = zbuduj_wav(&[1, 2, 3, 4, 5]);
+        let (_, _, _, fragmenty) = dzieci_riff(&wav).unwrap();
+        let data = &fragmenty[1];
+        let sciezka = dir.path().join("ucieta_na_granicy.wav");
+        std::fs::write(&sciezka, &wav[..data.offset]).unwrap();
+
+        assert_eq!(read_riff_file(&sciezka), Err(RiffDamage::Truncated));
+    }
+
+    #[test]
+    fn test_read_riff_file_nieistniejacy_plik_to_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("nie_ma.wav");
+        assert_eq!(read_riff_file(&sciezka), Err(RiffDamage::Other));
+    }
+
+    #[test]
+    fn test_read_riff_file_pusta_tresc_to_invalid_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let sciezka = dir.path().join("puste.wav");
+        // Nagłówek RIFF/WAVE bez ŻADNEGO fragmentu (rozmiar = 4, tylko typ formy).
+        let mut dane = Vec::new();
+        dane.extend_from_slice(b"RIFF");
+        dane.extend_from_slice(&4u32.to_le_bytes());
+        dane.extend_from_slice(b"WAVE");
+        std::fs::write(&sciezka, dane).unwrap();
+
+        assert_eq!(read_riff_file(&sciezka), Err(RiffDamage::InvalidStructure));
     }
 }
 

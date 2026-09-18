@@ -13,15 +13,18 @@
 //! odróżnieniu od `mkv_clone`, jest ZAWSZE gwarancją SŁABĄ i dlatego MUSI
 //! nadpisać `verify()` — nie ma szansy na etykietę MOCNĄ.
 //!
-//! ## Skąd sygnał kwalifikacji, skoro nie ma diagnostyki z wcześniejszej fazy
+//! ## Skąd sygnał kwalifikacji
 //!
-//! Faza 19 (diagnostyka kontenerów wideo) obejmuje WYŁĄCZNIE MP4/MOV/M4V,
-//! MKV/WebM/MKA, FLV i TS/M2TS/MTS — WAV i AVI nie są objęte żadną
-//! dedykowaną fazą. Jedyny dostępny sygnał to `match_type ==
-//! Some("PARTIAL")` z korelacji Fazy 14 — DOKŁADNIE ten sam warunek, którego
-//! używa [`super::splice::SpliceModule`] dla DOWOLNEGO rozszerzenia. Ten
-//! moduł musi więc stać PRZED `splice` w rejestrze — ten sam sygnał, ale
-//! świadomy struktury RIFF zamiast ślepego zszycia bajt po bajcie.
+//! Faza 19 (diagnostyka kontenerów wideo) TERAZ obejmuje też WAV/AVI (przez
+//! [`crate::riff_container::read_riff_file`]), więc `ctx.video_ok ==
+//! Some(false)` jest podstawowym, najsilniejszym dostępnym sygnałem —
+//! dokładnie tak jak dla Matroski (`mkv_clone`). Warunkiem ZAPASOWYM
+//! zostaje `match_type == Some("PARTIAL")` z korelacji Fazy 14 — DOKŁADNIE
+//! ten sam warunek, którego używa [`super::splice::SpliceModule`] dla
+//! DOWOLNEGO rozszerzenia — dla baz, gdzie Faza 19 jeszcze nie przebiegła
+//! (albo przebiegła przed tą aktualizacją). Ten moduł musi więc stać PRZED
+//! `splice` w rejestrze — ten sam sygnał zapasowy, ale świadomy struktury
+//! RIFF zamiast ślepego zszycia bajt po bajcie.
 //!
 //! ## Co to realnie ratuje
 //!
@@ -41,7 +44,8 @@ const LIMIT_W_RAM: u64 = 512 * 1024 * 1024; // 512 MB
 pub struct RiffCloneModule;
 
 fn jest_kandydatem_do_skladania(ctx: &RepairContext) -> bool {
-    riff_container::is_riff_extension(&format!(".{}", ctx.ext)) && ctx.match_type == Some("PARTIAL")
+    riff_container::is_riff_extension(&format!(".{}", ctx.ext))
+        && (ctx.video_ok == Some(false) || ctx.match_type == Some("PARTIAL"))
 }
 
 impl RepairModule for RiffCloneModule {
@@ -174,10 +178,31 @@ mod tests {
     }
 
     #[test]
-    fn test_kwalifikacja_wylacznie_po_match_type_partial() {
+    fn test_kwalifikacja_przez_match_type_partial() {
         assert!(RiffCloneModule.applies_to(&ctx("wav", Some("PARTIAL"))));
         assert!(!RiffCloneModule.applies_to(&ctx("wav", Some("FULL"))), "inny match_type nie kwalifikuje");
-        assert!(!RiffCloneModule.applies_to(&ctx("wav", None)), "brak match_type nie kwalifikuje");
+        assert!(!RiffCloneModule.applies_to(&ctx("wav", None)), "brak żadnego sygnału nie kwalifikuje");
+    }
+
+    /// `video_ok == Some(false)` z Fazy 19 jest podstawowym sygnałem — musi
+    /// kwalifikować NIEZALEŻNIE od `match_type` (ten sam wzorzec co
+    /// `mkv_clone`, gdzie `video_ok` jest jedynym/pierwszym sprawdzanym
+    /// warunkiem).
+    #[test]
+    fn test_kwalifikacja_przez_video_ok_niezaleznie_od_match_type() {
+        let mut kontekst = ctx("wav", None);
+        kontekst.video_ok = Some(false);
+        assert!(
+            RiffCloneModule.applies_to(&kontekst),
+            "Faza 19 zgłasza uszkodzony kontener RIFF - to musi wystarczyć do kwalifikacji"
+        );
+
+        let mut zdrowy = ctx("wav", None);
+        zdrowy.video_ok = Some(true);
+        assert!(
+            !RiffCloneModule.applies_to(&zdrowy),
+            "Faza 19 zgłasza SPRAWNY kontener - moduł nie powinien go ruszać bez innego sygnału uszkodzenia"
+        );
     }
 
     #[test]

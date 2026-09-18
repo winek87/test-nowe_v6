@@ -2,14 +2,20 @@
 
 //! # Faza 19: Diagnostyka Kontenerów i Strumieni Wideo
 //!
-//! Obsługuje CZTERY różne rodziny formatów, każdą własną ścieżką analizy:
+//! Obsługuje PIĘĆ różnych rodzin formatów, każdą własną ścieżką analizy:
 //! - **MP4/MOV/M4V** → `video_image` (kontener ISOBMFF z tablicami indeksowymi),
 //! - **MKV/WebM/MKA** → `mkv_container` (kontener EBML/Matroska),
 //! - **FLV** → `flv_stream` (łańcuch tagów z polem PreviousTagSize
 //!   działającym jak suma kontrolna struktury),
 //! - **TS/M2TS/MTS** → `ts_stream` (ciągły strumień pakietów 188 B, gdzie
 //!   liczniki ciągłości ujawniają DOKŁADNIE ile pakietów zginęło - to
-//!   znacznie dokładniejsza diagnostyka niż samo "otwiera się / nie otwiera").
+//!   znacznie dokładniejsza diagnostyka niż samo "otwiera się / nie otwiera"),
+//! - **WAV/AVI** → `riff_container` (kontener RIFF, fragmenty najwyższego
+//!   poziomu identyfikator+rozmiar+treść). RIFF, w odróżnieniu od Matroski,
+//!   nigdy nie ma sumy kontrolnej per fragment - diagnoza sprawdza tylko, czy
+//!   wszystkie fragmenty najwyższego poziomu mieszczą się w pliku, więc jest
+//!   SŁABSZYM sygnałem niż CRC-32 z MKV, ale wciąż dużo silniejszym niż
+//!   dotychczasowe sprawdzenie samych 12 bajtów nagłówka w Fazie 17.
 //!
 //! Odczytuje strukturę kontenerów ISOBMFF przez `video_image` (crate `mp4`,
 //! czysty Rust — zero zależności systemowych) i klasyfikuje rodzaj
@@ -100,7 +106,8 @@ const SQL_FINALIZACJA: &str =
              OR LOWER(relative_path) LIKE '%.m4v' OR LOWER(relative_path) LIKE '%.ts'
              OR LOWER(relative_path) LIKE '%.m2ts' OR LOWER(relative_path) LIKE '%.mts'
              OR LOWER(relative_path) LIKE '%.mkv' OR LOWER(relative_path) LIKE '%.webm'
-             OR LOWER(relative_path) LIKE '%.mka' OR LOWER(relative_path) LIKE '%.flv')";
+             OR LOWER(relative_path) LIKE '%.mka' OR LOWER(relative_path) LIKE '%.flv'
+             OR LOWER(relative_path) LIKE '%.wav' OR LOWER(relative_path) LIKE '%.avi')";
 
 // ============================================================================
 // STRUKTURY DANYCH
@@ -408,6 +415,44 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         }
                     }
                 }
+            } else if crate::riff_container::is_riff_extension(&task.rel_path) {
+                match stats.thread_activity.track_current(|| crate::riff_container::read_riff_file(&full_path)) {
+                    Ok(info) => {
+                        stats.ok.fetch_add(1, Ordering::Relaxed);
+                        SideVideoResult {
+                            id: task.id, ok: Some(true),
+                            // duration_ms/track_count celowo `None` - ten płytki
+                            // rozbiór czyta tylko nagłówki fragmentów najwyższego
+                            // poziomu (patrz dokumentacja modułu), nigdy nie
+                            // zagląda do treści `fmt `/`hdrl`, więc nie ma z
+                            // czego uczciwie policzyć czasu trwania ani liczby
+                            // ścieżek - liczba fragmentów trafia tylko do opisu.
+                            reason: Some(format!("Kontener RIFF spójny: {} fragmentów najwyższego poziomu, typ formy {}",
+                                info.fragment_count, String::from_utf8_lossy(&info.form_type))),
+                            duration_ms: None, track_count: None,
+                            io_error: Some(false), created_unix: None
+                        }
+                    }
+                    Err(damage) => {
+                        if !full_path.exists() {
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                            warn!(path = %task.rel_path, side = side_label, "Błąd I/O - plik niedostępny");
+                            SideVideoResult { id: task.id, ok: None, reason: None, duration_ms: None, track_count: None, io_error: Some(true) , created_unix: None }
+                        } else {
+                            let mapped = match damage {
+                                crate::riff_container::RiffDamage::Truncated => VideoDamage::TruncatedBox,
+                                crate::riff_container::RiffDamage::InvalidStructure => VideoDamage::MissingFtyp,
+                                crate::riff_container::RiffDamage::Other => VideoDamage::Other,
+                            };
+                            bump_damage_counter(stats, mapped, task.is_common);
+                            SideVideoResult {
+                                id: task.id, ok: Some(false),
+                                reason: Some(crate::riff_container::damage_description(damage).to_string()),
+                                duration_ms: None, track_count: None, io_error: Some(false), created_unix: None
+                            }
+                        }
+                    }
+                }
             } else {
                 match stats.thread_activity.track_current(|| video_image::read_video_file(&full_path)) {
                     Ok(info) => {
@@ -574,7 +619,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let supported = video_image::is_video_extension(&rel)
             || crate::ts_stream::is_ts_extension(&rel)
             || crate::mkv_container::is_mkv_extension(&rel)
-            || crate::flv_stream::is_flv_extension(&rel);
+            || crate::flv_stream::is_flv_extension(&rel)
+            || crate::riff_container::is_riff_extension(&rel);
         if !supported { continue; }
         let is_common = in_ufs && in_scr;
         if in_ufs {
@@ -917,12 +963,13 @@ mod tests {
     }
 
     /// Czy faza w ogóle obsługuje to rozszerzenie — replika bramki `supported`
-    /// z [`run`], złożona z tych samych czterech predykatów.
+    /// z [`run`], złożona z tych samych pięciu predykatów.
     fn obslugiwane(nazwa: &str) -> bool {
         video_image::is_video_extension(nazwa)
             || crate::ts_stream::is_ts_extension(nazwa)
             || crate::mkv_container::is_mkv_extension(nazwa)
             || crate::flv_stream::is_flv_extension(nazwa)
+            || crate::riff_container::is_riff_extension(nazwa)
     }
 
     /// NAJWAŻNIEJSZY test spójności tej fazy.
@@ -934,7 +981,7 @@ mod tests {
     #[test]
     fn test_lista_rozszerzen_w_sql_pokrywa_sie_z_bramka_w_rust() {
         let z_sql = rozszerzenia_z_sql();
-        assert_eq!(z_sql.len(), 10, "spodziewamy się 10 rozszerzeń, SQL ma: {:?}", z_sql);
+        assert_eq!(z_sql.len(), 12, "spodziewamy się 12 rozszerzeń, SQL ma: {:?}", z_sql);
 
         for ext in &z_sql {
             let nazwa = format!("plik.{}", ext);
@@ -949,7 +996,7 @@ mod tests {
     #[test]
     fn test_kazde_obslugiwane_rozszerzenie_jest_w_liscie_sql() {
         let z_sql = rozszerzenia_z_sql();
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv"] {
+        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi"] {
             assert!(
                 z_sql.iter().any(|e| e == ext),
                 "rozszerzenie .{} jest obsługiwane w Ruście, ale brak go w liście SQL - plik byłby analizowany przy KAŻDYM uruchomieniu",
@@ -960,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_formaty_poza_zakresem_nie_sa_obslugiwane() {
-        for nazwa in ["film.avi", "film.wmv", "film.mpg", "zdjecie.jpg", "dokument.pdf", "bez_rozszerzenia"] {
+        for nazwa in ["film.wmv", "film.mpg", "zdjecie.jpg", "dokument.pdf", "bez_rozszerzenia"] {
             assert!(!obslugiwane(nazwa), "'{}' nie należy do zakresu Fazy 19", nazwa);
         }
     }
@@ -971,13 +1018,14 @@ mod tests {
     /// parsera Matroski.
     #[test]
     fn test_predykaty_analizatorow_sa_rozlaczne() {
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv"] {
+        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi"] {
             let nazwa = format!("plik.{}", ext);
             let trafienia = [
                 video_image::is_video_extension(&nazwa),
                 crate::ts_stream::is_ts_extension(&nazwa),
                 crate::mkv_container::is_mkv_extension(&nazwa),
                 crate::flv_stream::is_flv_extension(&nazwa),
+                crate::riff_container::is_riff_extension(&nazwa),
             ].iter().filter(|t| **t).count();
 
             assert_eq!(trafienia, 1, "rozszerzenie .{} musi pasować do DOKŁADNIE jednego analizatora, pasuje do {}", ext, trafienia);
@@ -1056,7 +1104,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let smieci = b"to nie jest zaden kontener wideo, tylko zwykly tekst";
 
-        for (i, nazwa) in ["a.ts", "b.flv", "c.mkv", "d.mp4"].iter().enumerate() {
+        for (i, nazwa) in ["a.ts", "b.flv", "c.mkv", "d.mp4", "e.wav"].iter().enumerate() {
             utworz(&dir.path().join(nazwa), smieci);
             let (stats, wyniki) = uruchom(dir.path(), &[zadanie(i as i32, nazwa, true)], true);
 
@@ -1081,7 +1129,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let smieci = b"nie kontener";
 
-        for (nazwa, fragment) in [("a.ts", "TS"), ("b.flv", "FLV")] {
+        for (nazwa, fragment) in [("a.ts", "TS"), ("b.flv", "FLV"), ("c.wav", "RIFF")] {
             utworz(&dir.path().join(nazwa), smieci);
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
             let powod = wyniki[0].reason.clone().unwrap();
@@ -1107,6 +1155,65 @@ mod tests {
         assert_eq!(stats.err_ftyp_unique.load(Ordering::Relaxed), 1, "plik unikalny do koszyka unikalnych");
     }
 
+    // ------------------------------------------------------------------
+    // Ścieżka analizy RIFF (WAV/AVI)
+    // ------------------------------------------------------------------
+
+    /// Buduje minimalny, poprawny plik WAV: nagłówek RIFF/WAVE, chunk `fmt `
+    /// i chunk `data`. Powielone celowo z `riff_container::tests::zbuduj_wav`
+    /// zamiast importowane - ten sam wzorzec co w `repair_modules/riff.rs`
+    /// (nieimportowanie prywatnych helperów testowych między modułami).
+    fn zbuduj_wav(probki: &[u8]) -> Vec<u8> {
+        let fmt_body: [u8; 16] = [1, 0, 1, 0, 0x44, 0xAC, 0, 0, 0x44, 0xAC, 0, 0, 1, 0, 8, 0];
+
+        let mut data_chunk = Vec::new();
+        data_chunk.extend_from_slice(b"data");
+        data_chunk.extend_from_slice(&(probki.len() as u32).to_le_bytes());
+        data_chunk.extend_from_slice(probki);
+        if probki.len() % 2 == 1 { data_chunk.push(0); }
+
+        let mut fmt_chunk = Vec::new();
+        fmt_chunk.extend_from_slice(b"fmt ");
+        fmt_chunk.extend_from_slice(&(fmt_body.len() as u32).to_le_bytes());
+        fmt_chunk.extend_from_slice(&fmt_body);
+
+        let tresc_po_formie = 4 + fmt_chunk.len() + data_chunk.len();
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(tresc_po_formie as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&fmt_chunk);
+        wav.extend_from_slice(&data_chunk);
+        wav
+    }
+
+    #[test]
+    fn test_riff_zdrowy_wav_jest_uznany_za_sprawny() {
+        let dir = tempfile::tempdir().unwrap();
+        utworz(&dir.path().join("zdrowy.wav"), &zbuduj_wav(&[1, 2, 3, 4, 5]));
+
+        let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "zdrowy.wav", true)], true);
+
+        assert_eq!(wyniki.len(), 1);
+        assert_eq!(wyniki[0].ok, Some(true), "zdrowy WAV musi zostać uznany za sprawny");
+        assert_eq!(wyniki[0].io_error, Some(false));
+        assert!(wyniki[0].reason.as_deref().unwrap().contains("RIFF"));
+        assert_eq!(stats.ok.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_riff_uciety_wav_jest_uszkodzeniem_typu_trunc() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = zbuduj_wav(&[1, 2, 3, 4, 5]);
+        utworz(&dir.path().join("uciety.wav"), &wav[..wav.len() - 3]);
+
+        let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "uciety.wav", true)], true);
+
+        assert_eq!(wyniki[0].ok, Some(false), "ucięty WAV musi zostać uznany za uszkodzony");
+        assert_eq!(stats.err_trunc_common.load(Ordering::Relaxed), 1, "ucięcie musi trafić do koszyka 'plik ucięty'");
+    }
+
     #[test]
     fn test_wagi_rozszerzen_licza_bajty_i_normalizuja_wielkosc_liter() {
         let dir = tempfile::tempdir().unwrap();
@@ -1124,12 +1231,12 @@ mod tests {
     }
 
     /// Czas utworzenia nagrania pochodzi z atomu `mvhd`, więc istnieje TYLKO w
-    /// kontenerach ISOBMFF. Dla TS/FLV/MKV musi pozostać `None` — wpisanie tam
-    /// czegokolwiek byłoby wymyślonym dowodem.
+    /// kontenerach ISOBMFF. Dla TS/FLV/MKV/RIFF musi pozostać `None` —
+    /// wpisanie tam czegokolwiek byłoby wymyślonym dowodem.
     #[test]
     fn test_czas_utworzenia_tylko_dla_isobmff() {
         let dir = tempfile::tempdir().unwrap();
-        for nazwa in ["a.ts", "b.flv", "c.mkv"] {
+        for nazwa in ["a.ts", "b.flv", "c.mkv", "d.wav"] {
             utworz(&dir.path().join(nazwa), b"smieci");
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
             assert!(
@@ -1447,7 +1554,7 @@ mod tests {
 
     #[test]
     fn test_finalizacja_obejmuje_kazde_obslugiwane_rozszerzenie() {
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv"] {
+        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi"] {
             let nazwa = format!("film.{}", ext);
             assert_eq!(
                 finalizuj(&nazwa, true, false, Some(true), None, Some(false), None), Some(true),
