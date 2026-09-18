@@ -8,11 +8,18 @@
 //! a komunikacja wizualna opiera się na Ratatui PhaseEvent.
 //!
 //! UWAGA ARCHITEKTONICZNA (UI): Pasek postępu pokazuje wyłącznie % i bieżący plik.
-//! Liczniki live (prędkość, sygnatury, anomalie) trafiają do panelu bocznego jako
-//! JEDEN, samodzielny blok PER ŹRÓDŁO (`[UFS Explorer]` / `[Skrypt Autorski]`) —
-//! patrz [`build_source_block`]. W odróżnieniu od Fazy 3 (pliki WSPÓLNE, sumowane
-//! Wariantem B), Faza 4 hashuje pliki UNIKALNE — zbiory UFS i Skrypt są tu
-//! rozłączne z definicji, więc nie sumujemy ich liczników krzyżowo.
+//! Liczniki live trafiają do panelu bocznego jako DWA tematyczne bloki, sumujące
+//! OBIE strony (Wariant B) — `[Kryptografia i sygnatury (Resztki)]` (prędkość,
+//! top format, sygnatury, spoofing, błędy I/O) i `[Anomalie nagłówka (Resztki)]`
+//! (10 kategorii anomalii z osobna) — patrz [`build_crypto_block`]/
+//! [`build_anomaly_block`]. IDENTYCZNY układ jak w Fazie 3 (patrz jej
+//! dokumentacja `build_crypto_block`/`build_anomaly_block`) — świadomie ujednolicone
+//! na życzenie użytkownika, mimo że zbiory plików UFS/Skrypt są tu rozłączne z
+//! definicji (pliki UNIKALNE, nie wspólne jak w Fazie 3): sumowanie LICZNIKÓW
+//! progresu obu równoległych stron jest sensowne niezależnie od tego, czy same
+//! ZBIORY PLIKÓW się pokrywają. Dziennik końcowy (`run`) nadal rozbija wyniki
+//! PER STRONA osobno — to podsumowanie kryminalistyczne, nie panel live, i tej
+//! separacji nie dotyczy.
 //!
 //! UWAGA ARCHITEKTONICZNA (WĄTKOWANIE): W trybie `io_mode = "CONCURRENT"` obie
 //! strony skanują jednocześnie, każda na własnej, tymczasowej puli Rayon o
@@ -80,9 +87,10 @@ pub(crate) enum ScanMsg {
     ScriptChunk(Vec<ScanResult>),
 }
 
-/// Liczniki live dla JEDNEJ strony. W przeciwieństwie do Fazy 3 — nigdy nie są
-/// łączone z licznikami drugiej strony (brak `other_stats`), bo zbiory plików
-/// unikalnych UFS i Skrypt są rozłączne z definicji (patrz [`build_source_block`]).
+/// Liczniki live dla JEDNEJ strony. Panel boczny sumuje je z licznikami drugiej
+/// strony (`other_stats` w [`StreamCtx`]) — patrz [`build_crypto_block`]/
+/// [`build_anomaly_block`] — a raport końcowy (`run`) dodatkowo rozbija je
+/// PER STRONA, niezależnie od tego łączenia.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
@@ -147,47 +155,60 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
     if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
 }
 
-/// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (UFS albo Skrypt) —
-/// prędkość transferu, top 3 formaty wagowo, sygnatury, spoofing, suma 9
-/// kategorii anomalii nagłówka i błędy I/O. Bez sumowania z drugą stroną
-/// (patrz uzasadnienie w dokumentacji modułu i [`LiveStats`]).
-fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
-    let bytes = stats.processed_bytes.load(Ordering::Relaxed);
+/// Buduje zbiorczy blok `[Kryptografia i sygnatury (Resztki)]` sumując
+/// prędkość, top 3 formaty wagowo, sygnatury, spoofing i błędy I/O z OBU
+/// stron — mirror `phase3::build_crypto_block` (Wariant B), patrz
+/// dokumentacja modułu.
+fn build_crypto_block(own: &LiveStats, other: &LiveStats, start_time: Instant) -> String {
+    let combined_bytes = own.processed_bytes.load(Ordering::Relaxed) + other.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
-    let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
+    let speed_mb = (combined_bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_exts_str = {
-        let map = stats.ext_weights.lock().unwrap();
-        let mut sorted: Vec<_> = map.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        let mut merged: HashMap<String, u64> = HashMap::new();
+        for (k, v) in own.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
+        for (k, v) in other.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
+        let mut sorted: Vec<_> = merged.into_iter().collect();
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
         sorted.into_iter().take(3).map(|(ext, w)| {
             let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
+            format!("{} ({})", e, format_bytes(w))
         }).collect::<Vec<_>>().join(", ")
     };
     let display_top = if top_exts_str.is_empty() { "Analiza danych...".to_string() } else { top_exts_str };
 
-    let anomalies_total = stats.offset_anomalies.load(Ordering::Relaxed)
-        + stats.null_padding.load(Ordering::Relaxed)
-        + stats.ascii_trash.load(Ordering::Relaxed)
-        + stats.micro_files.load(Ordering::Relaxed)
-        + stats.sub_magic_errors.load(Ordering::Relaxed)
-        + stats.slack_space_contam.load(Ordering::Relaxed)
-        + stats.parasitic_injections.load(Ordering::Relaxed)
-        + stats.endian_conflicts.load(Ordering::Relaxed)
-        + stats.boundary_drops.load(Ordering::Relaxed)
-        + stats.high_volatility.load(Ordering::Relaxed);
+    let combined_valid = own.valid_signatures.load(Ordering::Relaxed) + other.valid_signatures.load(Ordering::Relaxed);
+    let combined_io_err = own.hash_errors.load(Ordering::Relaxed) + other.hash_errors.load(Ordering::Relaxed);
+    let combined_magic_err = own.magic_errors.load(Ordering::Relaxed) + other.magic_errors.load(Ordering::Relaxed);
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup = crate::thread_activity::format_activity_markup(&own.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nPoprawne sygnatury: {}\nSpoofing (magic): {}\nAnomalie nagłówka (suma): {}\nWątki BLAKE3 (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb, display_top,
-        stats.valid_signatures.load(Ordering::Relaxed),
-        stats.magic_errors.load(Ordering::Relaxed),
-        anomalies_total,
-        activity_markup,
-        stats.hash_errors.load(Ordering::Relaxed),
+        "[Kryptografia i sygnatury (Resztki)]\nPrędkość: {:.2} MB/s\nTop format: {}\nPoprawne sygnatury: {}\nBłędy I/O: {}\nSpoofing (magic): {}\nWątki BLAKE3 (Wariant A): {}",
+        speed_mb, display_top, combined_valid, combined_io_err, combined_magic_err, activity_markup
+    )
+}
+
+/// Buduje zbiorczy blok `[Anomalie nagłówka (Resztki)]` sumując 10 kategorii
+/// anomalii nagłówka z OBU stron — mirror `phase3::build_anomaly_block`
+/// (Wariant B). W odróżnieniu od poprzedniej wersji tego panelu (jedna
+/// zbiorcza liczba "Anomalie nagłówka (suma)") rozpisuje każdą kategorię
+/// osobno, dokładnie tak jak Faza 3.
+fn build_anomaly_block(own: &LiveStats, other: &LiveStats) -> String {
+    let sum = |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
+
+    format!(
+        "[Anomalie nagłówka (Resztki)]\nPrzesunięty nagłówek: {}\nNull-padding: {}\nŚmieci ASCII: {}\nMikro-plik <32B: {}\nZła pod-sygnatura: {}\nSkażony slack space: {}\nIniekcja pasożytnicza: {}\nKonflikt endian: {}\nUrwana granica sektora: {}\nWysoka wolatywność: {}",
+        sum(&own.offset_anomalies, &other.offset_anomalies),
+        sum(&own.null_padding, &other.null_padding),
+        sum(&own.ascii_trash, &other.ascii_trash),
+        sum(&own.micro_files, &other.micro_files),
+        sum(&own.sub_magic_errors, &other.sub_magic_errors),
+        sum(&own.slack_space_contam, &other.slack_space_contam),
+        sum(&own.parasitic_injections, &other.parasitic_injections),
+        sum(&own.endian_conflicts, &other.endian_conflicts),
+        sum(&own.boundary_drops, &other.boundary_drops),
+        sum(&own.high_volatility, &other.high_volatility),
     )
 }
 
@@ -289,6 +310,10 @@ pub struct StreamCtx<'a> {
     pub tasks: &'a [Task],
     pub side_label: &'a str,
     pub stats: &'a LiveStats,
+    /// Liczniki DRUGIEJ strony — patrz [`build_crypto_block`]/[`build_anomaly_block`]
+    /// (Wariant B: panel boczny sumuje obie strony niezależnie od tego, która
+    /// z nich wywołała aktualizację).
+    pub other_stats: &'a LiveStats,
     pub tx_db: mpsc::SyncSender<ScanMsg>,
     pub is_ufs: bool,
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
@@ -301,7 +326,7 @@ pub struct StreamCtx<'a> {
 
 #[allow(clippy::match_like_matches_macro)]
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log, start_time } = ctx;
+    let StreamCtx { base_path, tasks, side_label, stats, other_stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log, start_time } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_init(
         || (tx_db.clone(), Instant::now(), Vec::new()),
@@ -454,8 +479,12 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
 
                     let _ = tx_ui.send(PhaseEvent::UpdateSideText {
-                        idx: bar_idx,
-                        text: build_source_block(side_label, stats, start_time),
+                        idx: 0,
+                        text: build_crypto_block(stats, other_stats, start_time),
+                    });
+                    let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+                        idx: 1,
+                        text: build_anomaly_block(stats, other_stats),
                     });
                 }
 
@@ -759,7 +788,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 if !ufs_tasks.is_empty() {
                     let pool = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build().unwrap();
                     pool.install(|| {
-                        process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                        process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, other_stats: stat_s, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
                     });
                     let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku UFS zakończone.".to_string()));
                 }
@@ -769,7 +798,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 if !script_tasks.is_empty() {
                     let pool = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build().unwrap();
                     pool.install(|| {
-                        process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                        process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, other_stats: stat_u, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
                     });
                     let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string()));
                 }
@@ -781,12 +810,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let log_s = opr_log.clone();
             
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, other_stats: &script_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
                 let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku UFS zakończone.".to_string()));
             }
             
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, other_stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
                 let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string()));
             }
             drop(tx_db);
@@ -1124,73 +1153,82 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // build_source_block
+    // build_crypto_block / build_anomaly_block (Wariant B — mirror Fazy 3)
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_build_source_block_reports_own_stats_only() {
-        let stats = LiveStats::new(4);
-        stats.processed_bytes.store(2_097_152, Ordering::Relaxed); // 2 MB
-        stats.valid_signatures.store(7, Ordering::Relaxed);
-        stats.magic_errors.store(2, Ordering::Relaxed);
-        stats.hash_errors.store(1, Ordering::Relaxed);
+    fn test_build_crypto_block_sums_both_sides() {
+        let own = LiveStats::new(4);
+        own.processed_bytes.store(1_048_576, Ordering::Relaxed); // 1 MB
+        own.valid_signatures.store(5, Ordering::Relaxed);
+        own.magic_errors.store(1, Ordering::Relaxed);
+        own.hash_errors.store(1, Ordering::Relaxed);
+
+        let other = LiveStats::new(4);
+        other.processed_bytes.store(1_048_576, Ordering::Relaxed); // 1 MB
+        other.valid_signatures.store(2, Ordering::Relaxed);
+        other.magic_errors.store(3, Ordering::Relaxed);
+        other.hash_errors.store(4, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
-        let block = build_source_block("UFS Explorer", &stats, start_time);
+        let block = build_crypto_block(&own, &other, start_time);
 
-        assert!(block.starts_with("[UFS Explorer]"));
-        assert!(block.contains("Poprawne sygnatury: 7"));
-        assert!(block.contains("Spoofing (magic): 2"));
-        assert!(block.contains("Błędy I/O: 1"));
+        assert!(block.starts_with("[Kryptografia i sygnatury (Resztki)]"));
+        assert!(block.contains("Poprawne sygnatury: 7"), "5 (own) + 2 (other): {}", block);
+        assert!(block.contains("Błędy I/O: 5"), "1 (own) + 4 (other): {}", block);
+        assert!(block.contains("Spoofing (magic): 4"), "1 (own) + 3 (other): {}", block);
     }
 
     #[test]
-    fn test_build_source_block_empty_ext_weights_shows_placeholder() {
-        let stats = LiveStats::new(4);
+    fn test_build_crypto_block_empty_ext_weights_shows_placeholder() {
+        let own = LiveStats::new(4);
+        let other = LiveStats::new(4);
         let start_time = Instant::now() - Duration::from_millis(500);
-        let block = build_source_block("Skrypt Autorski", &stats, start_time);
+        let block = build_crypto_block(&own, &other, start_time);
         assert!(block.contains("Top format: Analiza danych..."));
     }
 
     #[test]
-    fn test_build_source_block_sums_nine_anomaly_categories() {
-        let stats = LiveStats::new(4);
-        stats.offset_anomalies.store(2, Ordering::Relaxed);
-        stats.null_padding.store(3, Ordering::Relaxed);
-        stats.high_volatility.store(1, Ordering::Relaxed);
+    fn test_build_crypto_block_shows_own_thread_activity_not_others() {
+        let own = LiveStats::new(3);
+        own.thread_activity.mark_busy(0);
+        let other = LiveStats::new(3);
+        other.thread_activity.mark_busy(0);
+        other.thread_activity.mark_busy(1);
+        other.thread_activity.mark_busy(2);
 
         let start_time = Instant::now() - Duration::from_millis(500);
-        let block = build_source_block("UFS Explorer", &stats, start_time);
-
-        // 2 + 3 + 1 = 6, reszta kategorii to zera
-        assert!(block.contains("Anomalie nagłówka (suma): 6"));
-    }
-
-    #[test]
-    fn test_build_source_block_shows_thread_activity_markup() {
-        let stats = LiveStats::new(3);
-        stats.thread_activity.mark_busy(0);
-        stats.thread_activity.mark_busy(1);
-
-        let start_time = Instant::now() - Duration::from_millis(500);
-        let block = build_source_block("UFS Explorer", &stats, start_time);
+        let block = build_crypto_block(&own, &other, start_time);
 
         let line = block.lines().find(|l| l.starts_with("Wątki BLAKE3")).expect("powinna istnieć linia Wariantu A");
-        assert_eq!(line, "Wątki BLAKE3 (Wariant A): {G:1} {G:2} {R:3}");
+        assert_eq!(line, "Wątki BLAKE3 (Wariant A): {G:1} {R:2} {R:3}", "aktywność musi pochodzić z `own`, nie z `other`: {}", block);
     }
 
     #[test]
-    fn test_build_source_block_does_not_leak_other_side_data() {
-        // Kontrolny test architektoniczny: build_source_block przyjmuje TYLKO
-        // jeden LiveStats - nie ma możliwości przypadkowego wmieszania drugiej
-        // strony, w przeciwieństwie do Fazy 3. Ten test dokumentuje ten kontrakt
-        // przez sam fakt kompilacji (sygnatura nie przyjmuje `other`).
-        let stats_ufs = LiveStats::new(4);
-        stats_ufs.valid_signatures.store(100, Ordering::Relaxed);
+    fn test_build_anomaly_block_sums_all_ten_categories() {
+        let own = LiveStats::new(4);
+        own.offset_anomalies.store(2, Ordering::Relaxed);
+        own.null_padding.store(1, Ordering::Relaxed);
 
-        let start_time = Instant::now() - Duration::from_millis(500);
-        let block = build_source_block("UFS Explorer", &stats_ufs, start_time);
-        assert!(block.contains("Poprawne sygnatury: 100"));
+        let other = LiveStats::new(4);
+        other.offset_anomalies.store(3, Ordering::Relaxed);
+        other.high_volatility.store(1, Ordering::Relaxed);
+
+        let block = build_anomaly_block(&own, &other);
+
+        assert!(block.starts_with("[Anomalie nagłówka (Resztki)]"));
+        assert!(block.contains("Przesunięty nagłówek: 5"), "2 (own) + 3 (other): {}", block);
+        assert!(block.contains("Null-padding: 1"));
+        assert!(block.contains("Wysoka wolatywność: 1"));
+        assert!(block.contains("Śmieci ASCII: 0"), "kategorie bez aktywności muszą dalej się pojawiać, jako 0: {}", block);
+    }
+
+    #[test]
+    fn test_build_anomaly_block_all_zero_when_no_activity() {
+        let own = LiveStats::new(4);
+        let other = LiveStats::new(4);
+        let block = build_anomaly_block(&own, &other);
+        assert!(!block.contains("suma"), "nowy panel rozpisuje kategorie, nie pokazuje już jednej sumy: {}", block);
     }
 
     // ------------------------------------------------------------------
