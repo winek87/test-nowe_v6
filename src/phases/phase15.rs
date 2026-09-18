@@ -102,6 +102,59 @@ fn is_large_xattr(total_bytes: u64) -> bool {
     total_bytes > LARGE_XATTR_THRESHOLD_BYTES
 }
 
+/// Tabela nazw uprawnień Linuksa indeksowana numerem bitu — stabilne ABI
+/// jądra (`linux/capability.h`), numeracja nigdy nie jest zmieniana wstecz
+/// (nowe uprawnienia tylko DOPISYWANE na końcu). Używana przez
+/// [`parse_capability_names`] do przetłumaczenia surowej maski bitowej
+/// `security.capability` na czytelne nazwy — plik wykonywalny z ustawionym
+/// np. `CAP_SYS_ADMIN`/`CAP_SETUID` odzyskany z dysku to istotny sygnał
+/// (mechanizm eskalacji uprawnień przetrwał poza standardowym SUID).
+const CAPABILITY_NAMES: &[&str] = &[
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_FSETID",
+    "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_LINUX_IMMUTABLE",
+    "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK",
+    "CAP_IPC_OWNER", "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
+    "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE", "CAP_SYS_RESOURCE",
+    "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD", "CAP_LEASE", "CAP_AUDIT_WRITE",
+    "CAP_AUDIT_CONTROL", "CAP_SETFCAP", "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG",
+    "CAP_WAKE_ALARM", "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
+    "CAP_CHECKPOINT_RESTORE",
+];
+
+/// Dekoduje maskę bitową "permitted" ze struktury binarnej `vfs_cap_data`
+/// (dokładny format jądra Linux dla xattr `security.capability`) na listę
+/// nazw z [`CAPABILITY_NAMES`]. Format: 4 B `magic_etc` (little-endian u32,
+/// górny bajt = numer rewizji), potem 1 lub 2 pary (permitted, inheritable)
+/// po 4 B każde — rewizja 1 (`0x01000000`) niesie 32-bitową maskę w jednym
+/// słowie (długość całości 12 B), rewizje 2/3 (`0x02000000`/`0x03000000`,
+/// V3 to bieżący standard) niosą 64-bitową maskę w dwóch słowach (długość
+/// co najmniej 20 B — rewizja 3 dokleja 4 B `rootid`, nieistotne tutaj).
+/// Interesuje nas WYŁĄCZNIE zestaw "permitted" (co plik MOŻE wykonać po
+/// uruchomieniu) — "inheritable" pomijane celowo, bo samo dziedziczenie bez
+/// odpowiadającego bitu w `permitted` procesu nadrzędnego i tak nic nie daje.
+/// Wejście zbyt krótkie/nierozpoznanej rewizji zwraca pustą listę (nigdy nie
+/// panikuje) — dane xattr na uszkodzonym/odzyskanym dysku mogą być ucięte.
+fn parse_capability_names(raw: &[u8]) -> Vec<&'static str> {
+    if raw.len() < 8 { return Vec::new(); }
+    let magic_etc = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let revision = magic_etc & 0xFF000000;
+
+    let permitted_low = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let permitted_high: u32 = if (revision == 0x02000000 || revision == 0x03000000) && raw.len() >= 20 {
+        u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
+    } else if revision == 0x01000000 {
+        0
+    } else {
+        return Vec::new();
+    };
+
+    let mask = (permitted_low as u64) | ((permitted_high as u64) << 32);
+    (0..CAPABILITY_NAMES.len())
+        .filter(|bit| mask & (1u64 << bit) != 0)
+        .map(|bit| CAPABILITY_NAMES[bit])
+        .collect()
+}
+
 /// Formatuje sekcję `[4] ROZKŁAD PRZESTRZENI NAZW XATTR` Dziennika
 /// Końcowego z połączonego (obie strony) rozkładu przestrzeni nazw. `None`,
 /// gdy żadna strona nie znalazła ani jednego klucza xattr — wtedy sekcja
@@ -138,6 +191,7 @@ fn format_namespace_section(ufs: &HashMap<String, usize>, script: &HashMap<Strin
 pub(crate) struct Task {
     id: i32,
     rel_path: String,
+    is_common: bool,
 }
 
 /// Wynik ekstrakcji metadanych jednego pliku. W przeciwieństwie do innych
@@ -163,6 +217,13 @@ struct MetadataAnalysis {
     /// Zliczenia kluczy per przestrzeń nazw ([`xattr_namespace`]) DLA TEGO
     /// JEDNEGO pliku — scalane do globalnej mapy w [`process_side_stream`].
     namespace_counts: HashMap<String, usize>,
+    /// Klucz `security.capability` obecny (niezależnie od tego, czy udało
+    /// się zdekodować choć jedno uprawnienie z jego binarnej wartości).
+    has_capability: bool,
+    /// Nazwy uprawnień zdekodowane przez [`parse_capability_names`] z
+    /// wartości `security.capability` DLA TEGO JEDNEGO pliku — puste, gdy
+    /// klucz nieobecny LUB wartość nie rozpoznana (rewizja/długość).
+    capability_names: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,28 +238,36 @@ pub(crate) enum ScanMsg {
     ScriptChunk(Vec<SideXattrResult>),
 }
 
-/// Liczniki live dla JEDNEJ strony. `found_attrs`/`found_urls` — zbiorcze
-/// (bez podziału common/unique, bo [`Task`] w tej fazie nie niesie tej
-/// informacji — podział wspólne/unikalne jest liczony dopiero w Etapie 5
-/// z zapytania SQL po zakończeniu skanowania). Cztery nowe liczniki
-/// (`zone_identifier_count`/`quarantine_count`/`wherefroms_count`/
-/// `large_xattr_count`) i mapa `namespace_counts` to rozszerzenie tej
-/// samej, prostej architektury.
+/// Liczniki live dla JEDNEJ strony. `found_attrs`/`found_urls` i cztery
+/// sygnały URL (`zone_identifier`/`quarantine`/`wherefroms`/`large_xattr`)
+/// są rozbite wspólne/unikalne — `Task::is_common` niesie tę informację od
+/// razu przy budowaniu zadań (dostępna w tym samym zapytaniu SQL co reszta
+/// pól `Task`, patrz `run()`), mirror wzorca z Fazy 11-14. `xattr_total_bytes`/
+/// `extensions`/`top_owners`/`namespace_counts`/`capability_names_counts`
+/// pozostają zbiorcze — to agregaty wagowe/opisowe, nie liczniki anomalii
+/// (ten sam podział co np. `ext_weights` w innych fazach).
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
-    found_attrs: AtomicUsize,
-    found_urls: AtomicUsize,
+    found_attrs_common: AtomicUsize, found_attrs_unique: AtomicUsize,
+    found_urls_common: AtomicUsize, found_urls_unique: AtomicUsize,
     xattr_total_bytes: AtomicU64,
     errors: AtomicUsize,
     extensions: Mutex<HashMap<String, usize>>,
     top_owners: Mutex<HashMap<String, usize>>,
 
-    zone_identifier_count: AtomicUsize,
-    quarantine_count: AtomicUsize,
-    wherefroms_count: AtomicUsize,
-    large_xattr_count: AtomicUsize,
+    zone_identifier_common: AtomicUsize, zone_identifier_unique: AtomicUsize,
+    quarantine_common: AtomicUsize, quarantine_unique: AtomicUsize,
+    wherefroms_common: AtomicUsize, wherefroms_unique: AtomicUsize,
+    large_xattr_common: AtomicUsize, large_xattr_unique: AtomicUsize,
     namespace_counts: Mutex<HashMap<String, usize>>,
+
+    /// Pliki z kluczem `security.capability` obecnym, wspólne/unikalne.
+    capability_common: AtomicUsize, capability_unique: AtomicUsize,
+    /// Zliczenia WYSTĄPIEŃ każdej nazwy uprawnienia ([`parse_capability_names`])
+    /// w całej puli tej strony — zbiorcze (jak `namespace_counts`), bo to
+    /// rozkład opisowy, nie licznik anomalii per-plik.
+    capability_names_counts: Mutex<HashMap<String, usize>>,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas odczytu xattr (`extract_metadata`) — patrz moduł
@@ -211,17 +280,19 @@ impl LiveStats {
         Self {
             processed_files: AtomicUsize::new(0),
             processed_bytes: AtomicU64::new(0),
-            found_attrs: AtomicUsize::new(0),
-            found_urls: AtomicUsize::new(0),
+            found_attrs_common: AtomicUsize::new(0), found_attrs_unique: AtomicUsize::new(0),
+            found_urls_common: AtomicUsize::new(0), found_urls_unique: AtomicUsize::new(0),
             xattr_total_bytes: AtomicU64::new(0),
             errors: AtomicUsize::new(0),
             extensions: Mutex::new(HashMap::new()),
             top_owners: Mutex::new(HashMap::new()),
-            zone_identifier_count: AtomicUsize::new(0),
-            quarantine_count: AtomicUsize::new(0),
-            wherefroms_count: AtomicUsize::new(0),
-            large_xattr_count: AtomicUsize::new(0),
+            zone_identifier_common: AtomicUsize::new(0), zone_identifier_unique: AtomicUsize::new(0),
+            quarantine_common: AtomicUsize::new(0), quarantine_unique: AtomicUsize::new(0),
+            wherefroms_common: AtomicUsize::new(0), wherefroms_unique: AtomicUsize::new(0),
+            large_xattr_common: AtomicUsize::new(0), large_xattr_unique: AtomicUsize::new(0),
             namespace_counts: Mutex::new(HashMap::new()),
+            capability_common: AtomicUsize::new(0), capability_unique: AtomicUsize::new(0),
+            capability_names_counts: Mutex::new(HashMap::new()),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -267,18 +338,35 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     };
     let display_ns = if ns_str.is_empty() { "-".to_string() } else { ns_str };
 
+    let cap_str = {
+        let map = stats.capability_names_counts.lock().unwrap();
+        let mut s: Vec<_> = map.iter().collect();
+        s.sort_by(|a, b| b.1.cmp(a.1));
+        s.into_iter().take(5).map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+    };
+    let display_cap = if cap_str.is_empty() { "-".to_string() } else { cap_str };
+
+    let found_attrs_common = stats.found_attrs_common.load(Ordering::Relaxed);
+    let found_attrs_unique = stats.found_attrs_unique.load(Ordering::Relaxed);
+    let found_attrs_total = found_attrs_common + found_attrs_unique;
+    let avg_xattr_bytes = if found_attrs_total > 0 {
+        stats.xattr_total_bytes.load(Ordering::Relaxed) / found_attrs_total as u64
+    } else { 0 };
+
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.0} plików/s\nXATTR znalezione: {} ({})\nTop rozszerzenia (xattr): {}\nTop właściciele (UID:GID): {}\nPrzestrzenie nazw xattr: {}\nZone.Identifier (Windows): {}\nQuarantine (macOS): {}\nWhereFroms (macOS): {}\nURL ogólne: {}\nAnomalia rozmiaru (>64KB): {}\nWątki odczytu xattr (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.0} plików/s\nXATTR znalezione: {} wspólne / {} unikalne ({})\nŚr. rozmiar xattr (pliki z atrybutami): {}\nTop rozszerzenia (xattr): {}\nTop właściciele (UID:GID): {}\nPrzestrzenie nazw xattr: {}\nZone.Identifier (Windows): {} wspólne / {} unikalne\nQuarantine (macOS): {} wspólne / {} unikalne\nWhereFroms (macOS): {} wspólne / {} unikalne\nURL ogólne: {} wspólne / {} unikalne\nAnomalia rozmiaru (>64KB): {} wspólne / {} unikalne\nLinux Capabilities (security.capability): {} wspólne / {} unikalne ({})\nWątki odczytu xattr (Wariant A): {}\nBłędy I/O: {}",
         label, speed_files,
-        stats.found_attrs.load(Ordering::Relaxed), format_bytes(stats.xattr_total_bytes.load(Ordering::Relaxed)),
+        found_attrs_common, found_attrs_unique, format_bytes(stats.xattr_total_bytes.load(Ordering::Relaxed)),
+        format_bytes(avg_xattr_bytes),
         display_ext, display_own, display_ns,
-        stats.zone_identifier_count.load(Ordering::Relaxed),
-        stats.quarantine_count.load(Ordering::Relaxed),
-        stats.wherefroms_count.load(Ordering::Relaxed),
-        stats.found_urls.load(Ordering::Relaxed),
-        stats.large_xattr_count.load(Ordering::Relaxed),
+        stats.zone_identifier_common.load(Ordering::Relaxed), stats.zone_identifier_unique.load(Ordering::Relaxed),
+        stats.quarantine_common.load(Ordering::Relaxed), stats.quarantine_unique.load(Ordering::Relaxed),
+        stats.wherefroms_common.load(Ordering::Relaxed), stats.wherefroms_unique.load(Ordering::Relaxed),
+        stats.found_urls_common.load(Ordering::Relaxed), stats.found_urls_unique.load(Ordering::Relaxed),
+        stats.large_xattr_common.load(Ordering::Relaxed), stats.large_xattr_unique.load(Ordering::Relaxed),
+        stats.capability_common.load(Ordering::Relaxed), stats.capability_unique.load(Ordering::Relaxed), display_cap,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -324,7 +412,10 @@ impl DummyUnixMeta for std::fs::Metadata {}
 
 /// Odczytuje UID/GID i pełną listę rozszerzonych atrybutów pliku. Dla
 /// każdego klucza: klasyfikuje przestrzeń nazw ([`xattr_namespace`]) i
-/// sprawdza, czy pasuje do znanego markera URL ([`classify_url_marker`]).
+/// sprawdza, czy pasuje do znanego markera URL ([`classify_url_marker`]);
+/// dla `security.capability` (dokładne dopasowanie klucza — to JEDNA
+/// konkretna, znana nazwa, nie rodzina wariantów jak przy URL) dekoduje
+/// wprost binarną wartość na nazwy uprawnień ([`parse_capability_names`]).
 /// Po zebraniu wszystkich kluczy sprawdza łączny rozmiar pod kątem anomalii
 /// ([`is_large_xattr`]). Brak atrybutów (lub błąd `xattr::list`) nie jest
 /// traktowany jako błąd funkcji — po prostu zwraca zerowe liczniki.
@@ -341,6 +432,8 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
     let mut has_quarantine = false;
     let mut has_wherefroms = false;
     let mut namespace_counts: HashMap<String, usize> = HashMap::new();
+    let mut has_capability = false;
+    let mut capability_names: Vec<&'static str> = Vec::new();
 
     if let Ok(iter) = xattr::list(path) {
         for key in iter {
@@ -359,9 +452,14 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
             }
 
             keys_vec.push(key_str.clone());
-            
+
             if let Ok(Some(val)) = xattr::get(path, &key) {
                 xattr_size_bytes += val.len() as u64;
+
+                if k_lower == "security.capability" {
+                    has_capability = true;
+                    capability_names = parse_capability_names(&val);
+                }
             }
         }
     }
@@ -372,7 +470,7 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
         uid, gid, xattr_count, xattr_size_bytes,
         xattr_keys: keys_vec.join(", "),
         has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr,
-        namespace_counts,
+        namespace_counts, has_capability, capability_names,
     })
 }
 
@@ -440,6 +538,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         let mut local_exts: HashMap<String, usize> = HashMap::new();
         let mut local_owners: HashMap<String, usize> = HashMap::new();
         let mut local_namespaces: HashMap<String, usize> = HashMap::new();
+        let mut local_capabilities: HashMap<String, usize> = HashMap::new();
 
         for task in chunk {
             if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
@@ -455,7 +554,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     *local_owners.entry(owner_key).or_insert(0) += 1;
 
                     if meta.xattr_count > 0 {
-                        stats.found_attrs.fetch_add(1, Ordering::Relaxed);
+                        if task.is_common { stats.found_attrs_common.fetch_add(1, Ordering::Relaxed); } else { stats.found_attrs_unique.fetch_add(1, Ordering::Relaxed); }
                         stats.xattr_total_bytes.fetch_add(meta.xattr_size_bytes, Ordering::Relaxed);
                         *local_exts.entry(ext.clone()).or_insert(0) += 1;
 
@@ -463,16 +562,24 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                             *local_namespaces.entry(ns.clone()).or_insert(0) += count;
                         }
 
-                        if meta.has_url { stats.found_urls.fetch_add(1, Ordering::Relaxed); }
-                        if meta.has_zone_identifier { stats.zone_identifier_count.fetch_add(1, Ordering::Relaxed); }
-                        if meta.has_quarantine { stats.quarantine_count.fetch_add(1, Ordering::Relaxed); }
-                        if meta.has_wherefroms { stats.wherefroms_count.fetch_add(1, Ordering::Relaxed); }
-                        if meta.has_large_xattr { stats.large_xattr_count.fetch_add(1, Ordering::Relaxed); }
+                        if meta.has_url { if task.is_common { stats.found_urls_common.fetch_add(1, Ordering::Relaxed); } else { stats.found_urls_unique.fetch_add(1, Ordering::Relaxed); } }
+                        if meta.has_zone_identifier { if task.is_common { stats.zone_identifier_common.fetch_add(1, Ordering::Relaxed); } else { stats.zone_identifier_unique.fetch_add(1, Ordering::Relaxed); } }
+                        if meta.has_quarantine { if task.is_common { stats.quarantine_common.fetch_add(1, Ordering::Relaxed); } else { stats.quarantine_unique.fetch_add(1, Ordering::Relaxed); } }
+                        if meta.has_wherefroms { if task.is_common { stats.wherefroms_common.fetch_add(1, Ordering::Relaxed); } else { stats.wherefroms_unique.fetch_add(1, Ordering::Relaxed); } }
+                        if meta.has_large_xattr { if task.is_common { stats.large_xattr_common.fetch_add(1, Ordering::Relaxed); } else { stats.large_xattr_unique.fetch_add(1, Ordering::Relaxed); } }
+                        if meta.has_capability {
+                            if task.is_common { stats.capability_common.fetch_add(1, Ordering::Relaxed); } else { stats.capability_unique.fetch_add(1, Ordering::Relaxed); }
+                            for name in &meta.capability_names {
+                                *local_capabilities.entry(name.to_string()).or_insert(0) += 1;
+                            }
+                        }
 
                         if let Ok(mut f) = opr_log.lock() {
                             let url_flag = if meta.has_url { "[ 🌐 URL!]" } else { "" };
                             let large_flag = if meta.has_large_xattr { "[ ⚠️ DUŻY XATTR!]" } else { "" };
-                            let _ = writeln!(f, "[{kategoria:<6}] [Rozsz: .{ext:<4}] [UID: {:<4} | GID: {:<4}] [Rozmiar XATTR: {:<6}] {url_flag}{large_flag} [Klucze: {}] -> \"{}\"", 
+                            let cap_flag = if meta.has_capability { "[ 🛡️ CAPABILITY!]" } else { "" };
+                            let cap_suffix = if meta.capability_names.is_empty() { String::new() } else { format!(" [Uprawnienia: {}]", meta.capability_names.join(", ")) };
+                            let _ = writeln!(f, "[{kategoria:<6}] [Rozsz: .{ext:<4}] [UID: {:<4} | GID: {:<4}] [Rozmiar XATTR: {:<6}] {url_flag}{large_flag}{cap_flag} [Klucze: {}]{cap_suffix} -> \"{}\"",
                                 meta.uid, meta.gid, format_bytes(meta.xattr_size_bytes), meta.xattr_keys, task.rel_path);
                         }
                     }
@@ -507,6 +614,10 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         let mut g_ns = stats.namespace_counts.lock().unwrap();
                         for (k, v) in local_namespaces.drain() { *g_ns.entry(k).or_insert(0) += v; }
                     }
+                    if !local_capabilities.is_empty() {
+                        let mut g_cap = stats.capability_names_counts.lock().unwrap();
+                        for (k, v) in local_capabilities.drain() { *g_cap.entry(k).or_insert(0) += v; }
+                    }
 
                     // PASEK: wyłącznie postęp + bieżący plik (bez liczników)
                     let _ = tx_ui.send(PhaseEvent::UpdateBar {
@@ -540,6 +651,10 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         if !local_namespaces.is_empty() {
             let mut g_ns = stats.namespace_counts.lock().unwrap();
             for (k, v) in local_namespaces.drain() { *g_ns.entry(k).or_insert(0) += v; }
+        }
+        if !local_capabilities.is_empty() {
+            let mut g_cap = stats.capability_names_counts.lock().unwrap();
+            for (k, v) in local_capabilities.drain() { *g_cap.entry(k).or_insert(0) += v; }
         }
 
         if !results.is_empty() {
@@ -715,8 +830,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_scr, x_ufs, x_scr) = r;
-        if in_ufs && x_ufs.is_none() { ufs_tasks.push(Task { id, rel_path: rel.clone() }); }
-        if in_scr && x_scr.is_none() { script_tasks.push(Task { id, rel_path: rel.clone() }); }
+        let is_common = in_ufs && in_scr;
+        if in_ufs && x_ufs.is_none() { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); }
+        if in_scr && x_scr.is_none() { script_tasks.push(Task { id, rel_path: rel.clone(), is_common }); }
         if (in_ufs && x_ufs.is_some()) || (in_scr && x_scr.is_some()) { skipped += 1; }
     }
     drop(stmt);
@@ -992,22 +1108,40 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let sum_bytes = stats_common.total_xattr_bytes + stats_unique_ufs.total_xattr_bytes + stats_unique_scr.total_xattr_bytes;
     let sum_urls = stats_common.url_count + stats_unique_ufs.url_count + stats_unique_scr.url_count;
 
+    let avg_xattr_bytes_sum = if sum_attrs > 0 { sum_bytes / sum_attrs as u64 } else { 0 };
+
     let _ = writeln!(&mut log_out, "[ 1 ] NISKOPOZIOMOWA INSPEKCJA METADANYCH (Extended Attributes):");
-    let _ = writeln!(&mut log_out, "   -> Ocalono atrybuty z {} plików (Całkowita waga xattr: {})", sum_attrs, format_bytes(sum_bytes));
+    let _ = writeln!(&mut log_out, "   -> Ocalono atrybuty z {} plików (Całkowita waga xattr: {}, średnio {} / plik)", sum_attrs, format_bytes(sum_bytes), format_bytes(avg_xattr_bytes_sum));
     let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Algorytm odzyskał metadane systemowe (niewchodzące w skład rozmiaru pliku). Służą one często jako flagi kwarantanny lub systemowe informacje użytkownika.\n");
-    
+
     let _ = writeln!(&mut log_out, "[ 2 ] ŚLADY SIECIOWE (Web Forensics):");
     let _ = writeln!(&mut log_out, "   -> Wykryto ślady pobrania w {} plikach", sum_urls);
-    let _ = writeln!(&mut log_out, "      -> Windows Zone.Identifier: {}", ufs_stats.zone_identifier_count.load(Ordering::SeqCst) + script_stats.zone_identifier_count.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      -> macOS Quarantine:        {}", ufs_stats.quarantine_count.load(Ordering::SeqCst) + script_stats.quarantine_count.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      -> macOS WhereFroms:        {}", ufs_stats.wherefroms_count.load(Ordering::SeqCst) + script_stats.wherefroms_count.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "      -> Windows Zone.Identifier: {}", ufs_stats.zone_identifier_common.load(Ordering::SeqCst) + ufs_stats.zone_identifier_unique.load(Ordering::SeqCst) + script_stats.zone_identifier_common.load(Ordering::SeqCst) + script_stats.zone_identifier_unique.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "      -> macOS Quarantine:        {}", ufs_stats.quarantine_common.load(Ordering::SeqCst) + ufs_stats.quarantine_unique.load(Ordering::SeqCst) + script_stats.quarantine_common.load(Ordering::SeqCst) + script_stats.quarantine_unique.load(Ordering::SeqCst));
+    let _ = writeln!(&mut log_out, "      -> macOS WhereFroms:        {}", ufs_stats.wherefroms_common.load(Ordering::SeqCst) + ufs_stats.wherefroms_unique.load(Ordering::SeqCst) + script_stats.wherefroms_common.load(Ordering::SeqCst) + script_stats.wherefroms_unique.load(Ordering::SeqCst));
     let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki te posiadają specjalne tagi, które zawierają oryginalny adres URL przeglądarki lub datę pobrania. Ekstremalnie cenne znalezisko.\n");
 
-    let sum_large = ufs_stats.large_xattr_count.load(Ordering::SeqCst) + script_stats.large_xattr_count.load(Ordering::SeqCst);
+    let sum_large = ufs_stats.large_xattr_common.load(Ordering::SeqCst) + ufs_stats.large_xattr_unique.load(Ordering::SeqCst) + script_stats.large_xattr_common.load(Ordering::SeqCst) + script_stats.large_xattr_unique.load(Ordering::SeqCst);
     if sum_large > 0 {
         let _ = writeln!(&mut log_out, "[ 3 ] ANOMALIA ROZMIARU XATTR (>64KB):");
         let _ = writeln!(&mut log_out, "   -> Pliki z nietypowo dużym blobem xattr: {}", sum_large);
         let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Normalne metadane systemowe to zwykle pojedyncze bajty/kilobajty. Znacznie większy blob może wskazywać na przemycone dane w rozszerzonym atrybucie.\n");
+    }
+
+    let sum_capability = ufs_stats.capability_common.load(Ordering::SeqCst) + ufs_stats.capability_unique.load(Ordering::SeqCst) + script_stats.capability_common.load(Ordering::SeqCst) + script_stats.capability_unique.load(Ordering::SeqCst);
+    if sum_capability > 0 {
+        let _ = writeln!(&mut log_out, "[ 3b ] UPRAWNIENIA LINUX (security.capability):");
+        let _ = writeln!(&mut log_out, "   -> Pliki z ustawionymi uprawnieniami: {}", sum_capability);
+        let mut merged_caps: HashMap<String, usize> = HashMap::new();
+        for (k, v) in ufs_stats.capability_names_counts.lock().unwrap().iter().chain(script_stats.capability_names_counts.lock().unwrap().iter()) {
+            *merged_caps.entry(k.clone()).or_insert(0) += v;
+        }
+        let mut sorted_caps: Vec<_> = merged_caps.iter().collect();
+        sorted_caps.sort_by(|a, b| b.1.cmp(a.1));
+        for (name, count) in sorted_caps.into_iter().take(10) {
+            let _ = writeln!(&mut log_out, "      -> {:<22} {} wystąpień", name, count);
+        }
+        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Plik wykonywalny z ustawionymi uprawnieniami (np. CAP_SYS_ADMIN/CAP_SETUID/CAP_NET_RAW) przetrwał odzysk z tym mechanizmem eskalacji uprawnień nienaruszonym - wart priorytetowej analizy bezpieczeństwa.\n");
     }
 
     // REGRESJA (todo.faza15.md, Znalezisko 2): rozkład przestrzeni nazw
@@ -1176,6 +1310,80 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // parse_capability_names - syntetyczne bloki binarne `vfs_cap_data`
+    // (dokładny format jądra Linux dla xattr security.capability), bez
+    // potrzeby prawdziwego pliku z ustawionymi uprawnieniami na dysku.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_capability_v1_single_bit() {
+        // Rewizja 1 (0x01000000, LE): 32-bitowa maska w jednym słowie.
+        // Bit 13 = CAP_NET_RAW (1 << 13 = 0x2000).
+        let raw: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x01, // magic_etc: rewizja 1
+            0x00, 0x20, 0x00, 0x00, // permitted: bit 13
+            0x00, 0x00, 0x00, 0x00, // inheritable (pomijane)
+        ];
+        assert_eq!(parse_capability_names(&raw), vec!["CAP_NET_RAW"]);
+    }
+
+    #[test]
+    fn test_parse_capability_v3_combines_low_and_high_words() {
+        // Rewizja 3 (0x03000000, LE): 64-bitowa maska w dwóch słowach.
+        // Bit 21 (słowo niskie) = CAP_SYS_ADMIN (1 << 21 = 0x200000).
+        // Bit 35 = bit 3 słowa wysokiego (35-32=3) = CAP_WAKE_ALARM (1 << 3 = 0x08).
+        let raw: [u8; 24] = [
+            0x00, 0x00, 0x00, 0x03, // magic_etc: rewizja 3
+            0x00, 0x00, 0x20, 0x00, // data[0].permitted: bit 21 (CAP_SYS_ADMIN)
+            0x00, 0x00, 0x00, 0x00, // data[0].inheritable
+            0x08, 0x00, 0x00, 0x00, // data[1].permitted: bit 3 = bit 35 (CAP_WAKE_ALARM)
+            0x00, 0x00, 0x00, 0x00, // data[1].inheritable
+            0x00, 0x00, 0x00, 0x00, // rootid (V3, nieużywane przez parser)
+        ];
+        let mut names = parse_capability_names(&raw);
+        names.sort_unstable();
+        assert_eq!(names, vec!["CAP_SYS_ADMIN", "CAP_WAKE_ALARM"]);
+    }
+
+    #[test]
+    fn test_parse_capability_v2_revision_also_recognized() {
+        let raw: [u8; 20] = [
+            0x00, 0x00, 0x00, 0x02, // magic_etc: rewizja 2
+            0x00, 0x00, 0x00, 0x00, // data[0].permitted: brak bitów
+            0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, // data[1].permitted: bit 0 = bit 32 (CAP_MAC_OVERRIDE)
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(parse_capability_names(&raw), vec!["CAP_MAC_OVERRIDE"]);
+    }
+
+    #[test]
+    fn test_parse_capability_too_short_is_empty() {
+        assert_eq!(parse_capability_names(&[0x01, 0x00, 0x00]), Vec::<&str>::new());
+        assert_eq!(parse_capability_names(&[]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_parse_capability_unrecognized_revision_is_empty() {
+        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x99, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_parse_capability_v3_too_short_for_high_word_is_empty() {
+        // Rewizja 3 zadeklarowana, ale bufor ucięty przed słowem wysokim
+        // (poniżej 20 B) - typowy ślad uszkodzonego/odzyskanego xattr.
+        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_parse_capability_zero_mask_is_empty() {
+        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
+    }
+
+    // ------------------------------------------------------------------
     // format_namespace_section (Znalezisko 2, todo.faza15.md)
     // ------------------------------------------------------------------
 
@@ -1250,24 +1458,94 @@ mod tests {
         assert_eq!(compute_half_threads(1), 1);
     }
 
+    // ------------------------------------------------------------------
+    // opisy_anomalii: każda REALNA etykieta wiersza panelu (poza
+    // generycznymi) musi mieć zarejestrowane wyjaśnienie — inaczej Enter na
+    // tym wierszu w prawdziwym UI nie pokaże nakładki. Mirror wzorca z Fazy
+    // 5-14.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Wątki odczytu xattr (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(2);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta \"{}\" z panelu Fazy 15 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 11, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza15_xattr.rs");
+    }
+
     #[test]
     fn test_build_source_block_reports_new_counters() {
         use std::time::Duration;
         let stats = LiveStats::new(4);
-        stats.zone_identifier_count.store(3, Ordering::Relaxed);
-        stats.quarantine_count.store(2, Ordering::Relaxed);
-        stats.wherefroms_count.store(1, Ordering::Relaxed);
-        stats.large_xattr_count.store(4, Ordering::Relaxed);
+        stats.zone_identifier_common.store(3, Ordering::Relaxed);
+        stats.quarantine_common.store(2, Ordering::Relaxed);
+        stats.wherefroms_common.store(1, Ordering::Relaxed);
+        stats.large_xattr_common.store(4, Ordering::Relaxed);
         stats.namespace_counts.lock().unwrap().insert("user".to_string(), 10);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        assert!(block.contains("Zone.Identifier (Windows): 3"));
-        assert!(block.contains("Quarantine (macOS): 2"));
-        assert!(block.contains("WhereFroms (macOS): 1"));
-        assert!(block.contains("Anomalia rozmiaru (>64KB): 4"));
+        assert!(block.contains("Zone.Identifier (Windows): 3 wspólne / 0 unikalne"));
+        assert!(block.contains("Quarantine (macOS): 2 wspólne / 0 unikalne"));
+        assert!(block.contains("WhereFroms (macOS): 1 wspólne / 0 unikalne"));
+        assert!(block.contains("Anomalia rozmiaru (>64KB): 4 wspólne / 0 unikalne"));
         assert!(block.contains("Przestrzenie nazw xattr: user: 10"));
+    }
+
+    #[test]
+    fn test_build_source_block_splits_found_attrs_and_urls_common_unique() {
+        let stats = LiveStats::new(4);
+        stats.found_attrs_common.store(5, Ordering::Relaxed);
+        stats.found_attrs_unique.store(3, Ordering::Relaxed);
+        stats.found_urls_common.store(2, Ordering::Relaxed);
+        stats.found_urls_unique.store(1, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("XATTR znalezione: 5 wspólne / 3 unikalne"));
+        assert!(block.contains("URL ogólne: 2 wspólne / 1 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_average_xattr_size() {
+        let stats = LiveStats::new(4);
+        stats.found_attrs_common.store(2, Ordering::Relaxed);
+        stats.xattr_total_bytes.store(2048, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Śr. rozmiar xattr (pliki z atrybutami): 1.00 KB"));
+    }
+
+    #[test]
+    fn test_build_source_block_average_xattr_size_zero_when_nothing_found() {
+        let stats = LiveStats::new(4);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Śr. rozmiar xattr (pliki z atrybutami): 0 B"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_capability_counts_and_names() {
+        let stats = LiveStats::new(4);
+        stats.capability_common.store(1, Ordering::Relaxed);
+        stats.capability_unique.store(2, Ordering::Relaxed);
+        stats.capability_names_counts.lock().unwrap().insert("CAP_NET_RAW".to_string(), 3);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Linux Capabilities (security.capability): 1 wspólne / 2 unikalne (CAP_NET_RAW: 3)"));
     }
 
     #[test]

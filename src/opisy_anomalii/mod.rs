@@ -26,6 +26,7 @@ mod faza11_archiwa;
 mod faza12_multimedia;
 mod faza13_dekodowanie;
 mod faza14_hashowanie;
+mod faza15_xattr;
 
 /// Jedno wyjaśnienie: dokładna etykieta wiersza (musi bajt-w-bajt zgadzać
 /// się z tym, co wysyła dana faza przez `PhaseEvent::UpdateSideText`) +
@@ -51,6 +52,7 @@ pub fn znajdz_opis(etykieta: &str) -> Option<&'static str> {
         .chain(faza12_multimedia::opisy())
         .chain(faza13_dekodowanie::opisy())
         .chain(faza14_hashowanie::opisy())
+        .chain(faza15_xattr::opisy())
         .find(|o| o.etykieta == etykieta)
         .map(|o| o.wyjasnienie)
 }
