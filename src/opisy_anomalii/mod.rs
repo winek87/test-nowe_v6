@@ -21,6 +21,7 @@ mod faza6_wydmuszki_i_eof;
 mod faza7_entropia;
 mod faza8_decyzje;
 mod faza9_smart_merge;
+mod faza10_walidacja_tekstu;
 
 /// Jedno wyjaśnienie: dokładna etykieta wiersza (musi bajt-w-bajt zgadzać
 /// się z tym, co wysyła dana faza przez `PhaseEvent::UpdateSideText`) +
@@ -41,6 +42,7 @@ pub fn znajdz_opis(etykieta: &str) -> Option<&'static str> {
         .chain(faza7_entropia::opisy())
         .chain(faza8_decyzje::opisy())
         .chain(faza9_smart_merge::opisy())
+        .chain(faza10_walidacja_tekstu::opisy())
         .find(|o| o.etykieta == etykieta)
         .map(|o| o.wyjasnienie)
 }

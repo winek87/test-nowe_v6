@@ -50,18 +50,34 @@ const CHUNK_SIZE: usize = 100;
 // STRUKTURY DANYCH
 // ============================================================================
 
+/// Rozszerzenia rozpoznawane jako kandydaci do analizy tekstowej — jedno
+/// źródło prawdy dla [`is_text_extension`] (ten sam wzorzec co
+/// `FORMATY_SKOMPRESOWANE` w Fazie 7).
+///
+/// REGRESJA: poprzednia, krótsza lista pomijała mnóstwo powszechnych
+/// rozszerzeń kodu źródłowego i konfiguracji (c/cpp/h/java/go/rb/conf/env i
+/// inne) — pliki tych formatów w ogóle NIE trafiały do analizy Fazy 10, mimo
+/// że są tekstowe. Fałszywie dopasowane rozszerzenie jest tu niskiego
+/// ryzyka: `analyze_text_file` i tak samodzielnie weryfikuje TREŚĆ
+/// (zupa binarna, kodowanie), więc plik binarny z przypadkowo pasującym
+/// rozszerzeniem zostanie poprawnie odrzucony, a nie fałszywie zaakceptowany.
+const TEXT_EXTS: &[&str] = &[
+    "py", "txt", "csv", "tsv", "json", "xml", "html", "htm", "svg",
+    "md", "rst", "tex", "rs", "js", "jsx", "ts", "tsx", "vue", "css",
+    "sh", "bash", "zsh", "fish", "bat", "ps1", "ini", "cfg", "conf", "env", "properties", "log",
+    "yaml", "yml", "toml", "sql", "php",
+    "c", "cpp", "cc", "cxx", "h", "hpp", "hxx", "java", "kt", "kts",
+    "go", "rb", "pl", "lua", "cs", "swift", "dart", "scala", "r", "m", "asm", "s", "vb",
+];
+
 /// Rozstrzyga, czy dany plik (po ścieżce) jest kandydatem do analizy tekstowej
 /// — dopasowanie WYŁĄCZNIE po rozszerzeniu (bez zaglądania do zawartości; to
 /// robi dopiero [`analyze_text_file`]), niewrażliwe na wielkość liter.
 fn is_text_extension(path_str: &str) -> bool {
-    let text_exts = [
-        ".py", ".txt", ".csv", ".json", ".xml", ".html", ".htm", 
-        ".md", ".rs", ".js", ".css", ".sh", ".bat", ".ps1", ".ini", ".cfg", ".log",
-        ".yaml", ".yml", ".toml", ".sql", ".php"
-    ];
-
-    let lower_path = path_str.to_lowercase();
-    text_exts.iter().any(|&ext| lower_path.ends_with(ext))
+    Path::new(path_str)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| TEXT_EXTS.contains(&e.to_lowercase().as_str()))
 }
 
 /// Pojedyncze zadanie: plik tekstowy oczekujący na walidację kodowania po JEDNEJ stronie.
@@ -92,6 +108,12 @@ struct TextAnalysis {
     /// Wynik Metody 3: `true` gdy plik >10KB nie zawiera ani jednego `\n`
     /// w pierwszych 64KB — typowy ślad kodu zminifikowanego lub payloadu Base64.
     is_oneliner: bool,
+    /// `true`, gdy odsetek znaków kontrolnych mieści się w paśmie 4-6%
+    /// wokół progu zupy binarnej (>5%, patrz [`analyze_text_file`]) —
+    /// niezależnie od tego, po której stronie progu plik ostatecznie
+    /// wylądował. Graniczny przypadek wart ręcznej weryfikacji: o włos od
+    /// przeciwnej klasyfikacji.
+    near_threshold: bool,
 }
 
 /// Wynik przetworzenia jednego zadania, przekazywany przez MPSC do wątku zapisu SQLite.
@@ -125,10 +147,21 @@ pub(crate) struct LiveStats {
     /// Metoda 1 (Architektura EOL): zliczenia per dokładna wartość (np.
     /// "CRLF (Windows)", "Mieszane (CRLF+LF)") — pełne pokrycie.
     eol_counts: Mutex<HashMap<String, usize>>,
+    /// Zliczenia wystąpień per DOKŁADNY tekst powodu odrzucenia (`ana.reason`)
+    /// — trzy możliwe wartości (Twardy Bajt NULL, >5% znaków kontrolnych,
+    /// fałszywy BOM UTF-16), pełne pokrycie jak `encoding_counts`/`eol_counts`.
+    /// Bez tego `junk_common`/`junk_unique` mówiły TYLE, że plik jest
+    /// odrzucony, ale nie KTÓRA z trzech niezależnych metod detekcji go złapała.
+    junk_reason_counts: Mutex<HashMap<String, usize>>,
 
     /// Metoda "zupa binarna" (`is_valid == false`) w plikach WSPÓLNYCH.
     junk_common: AtomicUsize,
     junk_unique: AtomicUsize,
+    /// Pliki NIE odrzucone, ale z odsetkiem znaków kontrolnych blisko progu
+    /// zupy binarnej (4-6%, próg to >5%) — graniczne przypadki warte ręcznej
+    /// weryfikacji: o włos od klasyfikacji jako uszkodzone.
+    near_threshold_common: AtomicUsize,
+    near_threshold_unique: AtomicUsize,
     /// Metoda 3 (One-Liner) w plikach WSPÓLNYCH.
     oneliner_common: AtomicUsize,
     oneliner_unique: AtomicUsize,
@@ -145,7 +178,9 @@ impl LiveStats {
             ext_weights: Mutex::new(HashMap::new()),
             encoding_counts: Mutex::new(HashMap::new()),
             eol_counts: Mutex::new(HashMap::new()),
+            junk_reason_counts: Mutex::new(HashMap::new()),
             junk_common: AtomicUsize::new(0), junk_unique: AtomicUsize::new(0),
+            near_threshold_common: AtomicUsize::new(0), near_threshold_unique: AtomicUsize::new(0),
             oneliner_common: AtomicUsize::new(0), oneliner_unique: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
@@ -163,7 +198,10 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 /// top 3 rozszerzenia wagowo, PEŁNY rozkład Metody 1 (EOL) i Metody 2
 /// (kodowanie) — wszystkie wykryte wartości, bez ograniczenia do "top" (na
 /// wyraźne życzenie: to mają być liczniki informujące "co się dzieje", nie
-/// tylko dominująca kategoria) — oraz zupa binarna i one-linery, wspólne/unikalne.
+/// tylko dominująca kategoria) — oraz zupa binarna (z pełnym rozkładem PO
+/// KONKRETNYM POWODZIE odrzucenia, tą samą zasadą pełnego pokrycia) i
+/// one-linery, wspólne/unikalne, plus pliki blisko progu zupy binarnej
+/// (graniczne przypadki warte ręcznej weryfikacji).
 fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
@@ -192,11 +230,13 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nArchitektura EOL: {}\nKodowanie: {}\nZupa binarna: {} wspólne / {} unikalne\nOne-Liner (>10KB): {} wspólne / {} unikalne\nWątki analizy (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nArchitektura EOL: {}\nKodowanie: {}\nZupa binarna: {} wspólne / {} unikalne\nPowody zupy binarnej: {}\nBlisko progu zupy binarnej (4-6% kontrolnych): {} wspólne / {} unikalne\nOne-Liner (>10KB): {} wspólne / {} unikalne\nWątki analizy (Wariant A): {}\nBłędy I/O: {}",
         label, speed_mb, display_ext,
         full_breakdown(&stats.eol_counts),
         full_breakdown(&stats.encoding_counts),
         stats.junk_common.load(Ordering::Relaxed), stats.junk_unique.load(Ordering::Relaxed),
+        full_breakdown(&stats.junk_reason_counts),
+        stats.near_threshold_common.load(Ordering::Relaxed), stats.near_threshold_unique.load(Ordering::Relaxed),
         stats.oneliner_common.load(Ordering::Relaxed), stats.oneliner_unique.load(Ordering::Relaxed),
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
@@ -266,7 +306,7 @@ fn analyze_text_file(path: &Path, file_size: u64) -> std::result::Result<TextAna
     let n = file.read(&mut buffer)?;
     
     if n == 0 { 
-        return Ok(TextAnalysis { is_valid: true, reason: None, encoding: "ASCII".into(), eol: "Brak".into(), is_oneliner: false });
+        return Ok(TextAnalysis { is_valid: true, reason: None, encoding: "ASCII".into(), eol: "Brak".into(), is_oneliner: false, near_threshold: false });
     }
 
     let slice = &buffer[..n];
@@ -275,6 +315,7 @@ fn analyze_text_file(path: &Path, file_size: u64) -> std::result::Result<TextAna
     let mut encoding = "UTF-8";
     let mut eol = "Mieszane/Inne";
     let mut is_oneliner = false;
+    let mut near_threshold = false;
 
     // METODA 2: Profil Kodowania (Detekcja BOM)
     // UWAGA BEZPIECZEŃSTWA: BOM to tylko 2 pierwsze bajty pliku - łatwo je
@@ -351,19 +392,24 @@ fn analyze_text_file(path: &Path, file_size: u64) -> std::result::Result<TextAna
                 Err(e) => {
                     if e.valid_up_to() < n.saturating_sub(4) {
                         let ctrl = slice.iter().filter(|&&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t').count();
-                        if (ctrl as f64 / n as f64) > 0.05 {
+                        let ctrl_ratio = ctrl as f64 / n as f64;
+                        if ctrl_ratio > 0.05 {
                             is_valid = false;
                             reason = Some("Zupa Binarna (>5% znaków kontrolnych)".to_string());
                         } else {
                             encoding = "Lokalne (Win-1250/ISO)";
                         }
+                        // Pasmo graniczne wokół progu >5% - niezależnie od tego,
+                        // po której stronie plik wylądował (patrz dokumentacja
+                        // `TextAnalysis::near_threshold`).
+                        near_threshold = (0.04..=0.06).contains(&ctrl_ratio);
                     }
                 }
             }
         }
     }
 
-    Ok(TextAnalysis { is_valid, reason, encoding: encoding.into(), eol: eol.into(), is_oneliner })
+    Ok(TextAnalysis { is_valid, reason, encoding: encoding.into(), eol: eol.into(), is_oneliner, near_threshold })
 }
 
 /// Skanuje wszystkie zadania (`tasks`) dla JEDNEJ strony: dla każdego pliku
@@ -399,6 +445,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
         let mut local_encoding_counts: HashMap<String, usize> = HashMap::new();
         let mut local_eol_counts: HashMap<String, usize> = HashMap::new();
+        let mut local_junk_reason_counts: HashMap<String, usize> = HashMap::new();
         let mut last_ui_update = Instant::now();
 
         for task in chunk {
@@ -424,14 +471,21 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                                 side_label, kategoria, ana.encoding, ana.eol, ext, full_path.display());
                         }
                     } else {
-                        if task.is_common { stats.junk_common.fetch_add(1, Ordering::Relaxed); } 
+                        if task.is_common { stats.junk_common.fetch_add(1, Ordering::Relaxed); }
                         else { stats.junk_unique.fetch_add(1, Ordering::Relaxed); }
-                        
+
+                        let reason = ana.reason.as_deref().unwrap_or("Nieznany błąd");
+                        *local_junk_reason_counts.entry(reason.to_string()).or_insert(0) += 1;
+
                         if let Ok(mut f) = log_anom.lock() {
-                            let reason = ana.reason.as_deref().unwrap_or("Nieznany błąd");
-                            let _ = writeln!(f, "[{:<15}] [{:<7}] [{}] Format: .{:<4} | Ścieżka: \"{}\"", 
+                            let _ = writeln!(f, "[{:<15}] [{:<7}] [{}] Format: .{:<4} | Ścieżka: \"{}\"",
                                 side_label, kategoria, reason, ext, full_path.display());
                         }
+                    }
+
+                    if ana.near_threshold {
+                        if task.is_common { stats.near_threshold_common.fetch_add(1, Ordering::Relaxed); }
+                        else { stats.near_threshold_unique.fetch_add(1, Ordering::Relaxed); }
                     }
 
                     if ana.is_oneliner {
@@ -478,6 +532,10 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 if !local_eol_counts.is_empty() {
                     let mut global_map = stats.eol_counts.lock().unwrap();
                     for (k, v) in local_eol_counts.drain() { *global_map.entry(k).or_insert(0) += v; }
+                }
+                if !local_junk_reason_counts.is_empty() {
+                    let mut global_map = stats.junk_reason_counts.lock().unwrap();
+                    for (k, v) in local_junk_reason_counts.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
 
                 // PASEK: wyłącznie postęp + bieżący plik (bez liczników)
@@ -1011,6 +1069,16 @@ mod tests {
         assert!(is_text_extension("/sciezka/do/pliku.RS"));
     }
 
+    /// REGRESJA: formaty kodu źródłowego/konfiguracji dawniej brakujące na
+    /// liście - patrz dokumentacja `TEXT_EXTS`.
+    #[test]
+    fn test_is_text_extension_rozszerzone_formaty_kodu_i_konfiguracji() {
+        for nazwa in ["main.c", "app.cpp", "Nagłówek.h", "Main.java", "main.go", "skrypt.rb", "app.conf", "zmienne.env"] {
+            assert!(is_text_extension(nazwa), "'{}' powinno być rozpoznane jako tekstowe", nazwa);
+        }
+        assert!(is_text_extension("plik.CONF"));
+    }
+
     #[test]
     fn test_is_text_extension_unknown_extension() {
         assert!(!is_text_extension("obraz.jpg"));
@@ -1174,6 +1242,30 @@ mod tests {
         assert!(a.reason.unwrap().contains("Zupa Binarna"));
     }
 
+    /// REGRESJA: plik z odsetkiem kontrolnych POD progiem >5% (więc dalej
+    /// uznany za ważny), ale w paśmie granicznym 4-6%, musi zostać
+    /// oznaczony `near_threshold` - graniczny przypadek wart ręcznej
+    /// weryfikacji, nawet gdy formalnie przechodzi.
+    #[test]
+    fn test_analyze_near_threshold_flagged_even_when_still_valid() {
+        let mut content: Vec<u8> = vec![0xFF]; // niepoprawny start UTF-8 - szybka porażka dekodowania
+        content.extend(vec![0x01u8; 5]); // 5 bajtów kontrolnych
+        content.extend(vec![b'a'; 104]); // wypełniacz - razem 110 bajtów, 5/110 = 4.545%
+        let f = make_temp_file(&content);
+        let a = analyze_text_file(f.path(), content.len() as u64).unwrap();
+        assert!(a.is_valid, "4.545% kontrolnych jest poniżej progu >5% - plik NIE powinien być odrzucony");
+        assert!(a.near_threshold, "4.545% mieści się w paśmie granicznym 4-6% wokół progu");
+    }
+
+    #[test]
+    fn test_analyze_far_from_threshold_not_flagged() {
+        let content = b"zwykly tekst bez zadnych bajtow kontrolnych ani problemow z kodowaniem wcale";
+        let f = make_temp_file(content);
+        let a = analyze_text_file(f.path(), content.len() as u64).unwrap();
+        assert!(a.is_valid);
+        assert!(!a.near_threshold, "zwykły czysty tekst nie ma żadnego ryzyka granicznego");
+    }
+
     #[test]
     fn test_analyze_empty_file_is_valid() {
         let f = make_temp_file(b"");
@@ -1213,6 +1305,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_source_block_junk_reason_full_breakdown() {
+        let stats = LiveStats::new(4);
+        stats.junk_reason_counts.lock().unwrap().insert("Twardy Bajt NULL (0x00) - Slack Space lub fałszywy odzysk".to_string(), 7);
+        stats.junk_reason_counts.lock().unwrap().insert("Zupa Binarna (>5% znaków kontrolnych)".to_string(), 3);
+
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let line = block.lines().find(|l| l.starts_with("Powody zupy binarnej:")).unwrap();
+        assert!(line.contains("Twardy Bajt NULL (0x00) - Slack Space lub fałszywy odzysk: 7"));
+        assert!(line.contains("Zupa Binarna (>5% znaków kontrolnych): 3"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_near_threshold_counts() {
+        let stats = LiveStats::new(4);
+        stats.near_threshold_common.store(6, Ordering::Relaxed);
+        stats.near_threshold_unique.store(2, Ordering::Relaxed);
+
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        assert!(block.contains("Blisko progu zupy binarnej (4-6% kontrolnych): 6 wspólne / 2 unikalne"));
+    }
+
+    #[test]
     fn test_build_source_block_shows_thread_activity_markup() {
         let stats = LiveStats::new(2);
         stats.thread_activity.mark_busy(0);
@@ -1248,6 +1366,33 @@ mod tests {
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Architektura EOL: -"));
         assert!(block.contains("Kodowanie: -"));
+    }
+
+    /// REGRESJA: każda etykieta wiersza w panelu Fazy 10 musi mieć
+    /// zarejestrowane wyjaśnienie (`crate::opisy_anomalii`) ALBO być jawnie
+    /// na liście generycznych etykiet, które go celowo nie potrzebują — ten
+    /// sam wzorzec co w Fazach 5-9.
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki analizy (Wariant A)", "Błędy I/O"];
+
+        let stats = LiveStats::new(1);
+        let start_time = Instant::now() - Duration::from_millis(500);
+        let block = build_source_block("UFS Explorer", &stats, start_time);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta '{}' z panelu Fazy 10 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 6, "panel powinien mieć dokładnie 6 etykiet wymagających wyjaśnienia");
     }
 
     // ------------------------------------------------------------------
