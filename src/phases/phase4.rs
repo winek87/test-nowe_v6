@@ -1231,6 +1231,35 @@ mod tests {
         assert!(!block.contains("suma"), "nowy panel rozpisuje kategorie, nie pokazuje już jednej sumy: {}", block);
     }
 
+    /// REGRESJA: `[Anomalie nagłówka (Resztki)]` Fazy 4 używa TYCH SAMYCH
+    /// etykiet wierszy co `[Anomalie pierwszego klastra]` Fazy 3 (celowo
+    /// skopiowany format) — dzięki temu popup z wyjaśnieniem po Enter,
+    /// zbudowany dla Fazy 3 (`crate::opisy_anomalii`, rejestr dopasowujący
+    /// PO SAMYM TEKŚCIE etykiety, niezależnie od fazy), działa automatycznie
+    /// też dla Fazy 4 — bez żadnego dodatkowego kodu. Ten test to udowadnia
+    /// (nie tylko zakłada) i chroni przed przyszłym dryfem: gdyby etykieta w
+    /// jednej z dwóch faz się zmieniła, ten test zaczerwieniłby się od razu,
+    /// zamiast ciszej ciszy - użytkownik naciskający Enter dostałby "brak
+    /// wyjaśnienia" bez żadnego śladu w testach.
+    #[test]
+    fn test_etykiety_anomalii_maja_zarejestrowane_wyjasnienia_jak_w_fazie_3() {
+        let own = LiveStats::new(4);
+        let other = LiveStats::new(4);
+        let block = build_anomaly_block(&own, &other);
+
+        let mut sprawdzonych = 0;
+        for line in block.lines() {
+            if let Some((etykieta, _)) = line.split_once(": ") {
+                assert!(
+                    crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                    "etykieta '{}' z panelu Fazy 4 nie ma zarejestrowanego wyjaśnienia - popup po Enter pokazałby pustkę", etykieta
+                );
+                sprawdzonych += 1;
+            }
+        }
+        assert_eq!(sprawdzonych, 10, "panel powinien mieć dokładnie 10 wierszy kategorii anomalii");
+    }
+
     // ------------------------------------------------------------------
     // Regresja: pliki z domeny Fazy 3 (size_match = 1) NIE MOGĄ być liczone
     // podwójnie przez finalizację/raport Fazy 4
