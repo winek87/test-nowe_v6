@@ -4,6 +4,8 @@
 //!
 //! Skanuje wnętrza plików w poszukiwaniu "wydmuszek HDD" (zera), "wydmuszek SSD" (0xFF po TRIM)
 //! oraz weryfikuje znaczniki End-Of-File dla JPG, PDF, PNG oraz archiwów (ZIP/DOCX/XLSX).
+//! Dla PDF sprawdzenie wykracza poza sam tekst `%%EOF` — potwierdza też, że
+//! `startxref` wskazuje na wiarygodną tablicę xref (patrz [`pdf_xref_wyglada_na_spojny`]).
 //! Działa w pełni asynchronicznie, komunikując się z Ratatui przez PhaseEvent.
 //! Obsługuje system Dual-Logging dla anomalii strumieniowych.
 //!
@@ -181,7 +183,11 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
 /// Fazy 3/4): liczy procent bajtów `0x00` i `0xFF` w całym strumieniu, oraz
 /// weryfikuje znacznik końca pliku (EOF/EOCD) dla rozpoznanych formatów:
 /// - JPG/JPEG: ostatnie 2 bajty muszą być `FF D9`,
-/// - PDF: ostatni 1 KB musi zawierać tekst `%%EOF`,
+/// - PDF: ostatni 1 KB musi zawierać tekst `%%EOF` ORAZ `startxref` musi
+///   wskazywać na offset w pliku, pod którym faktycznie leży wiarygodna
+///   tablica xref (patrz [`pdf_xref_wyglada_na_spojny`]) — samo `%%EOF` bez
+///   struktury za nim (np. plik ucięty przed xref, z ocalałym/doklejonym
+///   `%%EOF` w ogonie) już NIE wystarcza,
 /// - PNG: ostatnie 12 bajtów musi być kanonicznym chunkiem `IEND`,
 /// - archiwa ZIP-podobne (docx/xlsx/pptx/odt/ods/odp/epub/apk/jar/zip):
 ///   ostatnie do 65557 bajtów (maks. rozmiar End-Of-Central-Directory + komentarz)
@@ -240,7 +246,7 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
         let mut tail = vec![0u8; read_len as usize];
         if file.seek(SeekFrom::End(-read_len)).is_ok() && file.read_exact(&mut tail).is_ok() {
             let tail_str = String::from_utf8_lossy(&tail);
-            eof_ok = Some(tail_str.contains("%%EOF")); 
+            eof_ok = Some(tail_str.contains("%%EOF") && pdf_xref_wyglada_na_spojny(&mut file, file_len, &tail_str));
         } else { eof_ok = Some(false); }
     } else if ext == "png" {
         if file_len >= 12 {
@@ -260,6 +266,49 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
     }
 
     Ok(AdvancedAnalysis { zeros_pct, ffs_pct, eof_ok })
+}
+
+/// Sprawdza, czy `startxref` z ogona pliku PDF wskazuje na wiarygodną
+/// tablicę xref — klasyczną (`xref` + wpisy przesunięć) albo strumień xref
+/// PDF 1.5+ (nagłówek obiektu `N G obj` ze słownikiem zawierającym
+/// `/XRef`). NIE dekompresuje strumieni (dane strumienia bywają
+/// `FlateDecode`, ale sam słownik obiektu nigdy nie jest skompresowany, więc
+/// `/XRef` jest zawsze czytelne wprost) i NIE waliduje KAŻDEGO wpisu tablicy
+/// — to ograniczony, ale realny sygnał: potwierdza, że offset ze
+/// `startxref` w ogóle mieści się w pliku i trafia w strukturę o kształcie
+/// prawdziwego xref, a nie w przypadkowe bajty albo pustkę po ucięciu.
+///
+/// Znacznie silniejszy test niż samo "gdzieś w ostatnim KB jest tekst
+/// %%EOF" — wykrywa typowe uszkodzenie odzysku: plik ucięty PRZED tablicą
+/// xref, gdzie sam tekst `%%EOF` przetrwał (np. doklejony z innego miejsca
+/// albo pozostałość po nadpisanym trailerze).
+fn pdf_xref_wyglada_na_spojny(file: &mut File, file_len: u64, tail_str: &str) -> bool {
+    let Some(poz) = tail_str.rfind("startxref") else { return false; };
+    let po = &tail_str[poz + "startxref".len()..];
+    let cyfry: String = po.chars().skip_while(|c| c.is_whitespace()).take_while(|c| c.is_ascii_digit()).collect();
+    let Ok(offset) = cyfry.parse::<u64>() else { return false; };
+    if offset >= file_len {
+        return false;
+    }
+
+    let okno_len = std::cmp::min(file_len - offset, 256) as usize;
+    let mut okno = vec![0u8; okno_len];
+    if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut okno).is_err() {
+        return false;
+    }
+
+    if okno.starts_with(b"xref") {
+        return true;
+    }
+
+    let tekst = String::from_utf8_lossy(&okno);
+    let slowa: Vec<&str> = tekst.split_whitespace().take(3).collect();
+    let wyglada_na_naglowek_obiektu = slowa.len() == 3
+        && !slowa[0].is_empty() && slowa[0].chars().all(|c| c.is_ascii_digit())
+        && !slowa[1].is_empty() && slowa[1].chars().all(|c| c.is_ascii_digit())
+        && slowa[2] == "obj";
+
+    wyglada_na_naglowek_obiektu && tekst.contains("/XRef")
 }
 
 /// Skanuje wszystkie zadania (`tasks`) dla JEDNEJ strony: dla każdego pliku
@@ -1036,14 +1085,19 @@ mod tests {
         assert_eq!(result.eof_ok, Some(false));
     }
 
+    /// REGRESJA (świadoma zmiana zachowania, nie luka): to dawny
+    /// `test_analyze_file_pdf_contains_eof_marker` — fixture ma tekst
+    /// `%%EOF`, ale ZERO struktury xref za nim. Dokładnie to jest luka,
+    /// którą `pdf_xref_wyglada_na_spojny` zamyka: sam tekst `%%EOF` już nie
+    /// wystarcza, żeby uznać PDF za zdrowy.
     #[test]
-    fn test_analyze_file_pdf_contains_eof_marker() {
+    fn test_analyze_file_pdf_samo_eof_bez_xref_juz_nie_wystarcza() {
         let mut content = b"%PDF-1.4\n".to_vec();
         content.extend(vec![0x41u8; 100]);
         content.extend_from_slice(b"\n%%EOF");
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
         let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(true));
+        assert_eq!(result.eof_ok, Some(false), "%%EOF bez wiarygodnego startxref/xref nie może dawać Some(true)");
     }
 
     #[test]
@@ -1053,6 +1107,69 @@ mod tests {
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
         let result = analyze_file(&path, "test.pdf").unwrap();
         assert_eq!(result.eof_ok, Some(false));
+    }
+
+    /// Buduje minimalny, ale STRUKTURALNIE poprawny PDF z klasyczną tablicą
+    /// `xref` — offset w `startxref` wyliczony programowo (pozycja bajtu,
+    /// gdzie faktycznie zaczyna się `xref`), nie ręcznie policzona stała.
+    fn zbuduj_pdf_z_klasycznym_xref() -> Vec<u8> {
+        let mut tresc = Vec::new();
+        tresc.extend_from_slice(b"%PDF-1.4\n");
+        tresc.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_offset = tresc.len();
+        tresc.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+        tresc.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
+        tresc.extend_from_slice(format!("startxref\n{}\n%%EOF", xref_offset).as_bytes());
+        tresc
+    }
+
+    #[test]
+    fn test_analyze_file_pdf_z_wiarygodnym_xref_klasycznym_przechodzi() {
+        let content = zbuduj_pdf_z_klasycznym_xref();
+        let (_guard, path) = temp_file_with_ext(&content, "pdf");
+        let result = analyze_file(&path, "test.pdf").unwrap();
+        assert_eq!(result.eof_ok, Some(true), "startxref wskazuje na prawdziwą tablicę xref - musi przejść");
+    }
+
+    #[test]
+    fn test_analyze_file_pdf_ze_strumieniem_xref_przechodzi() {
+        let mut tresc = Vec::new();
+        tresc.extend_from_slice(b"%PDF-1.7\n");
+        tresc.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_offset = tresc.len();
+        tresc.extend_from_slice(b"2 0 obj\n<< /Type /XRef /Size 2 /Filter /FlateDecode /Length 4 >>\nstream\n");
+        tresc.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // tresc strumienia - dowolne bajty, bez dekompresji
+        tresc.extend_from_slice(b"\nendstream\nendobj\n");
+        tresc.extend_from_slice(format!("startxref\n{}\n%%EOF", xref_offset).as_bytes());
+
+        let (_guard, path) = temp_file_with_ext(&tresc, "pdf");
+        let result = analyze_file(&path, "test.pdf").unwrap();
+        assert_eq!(result.eof_ok, Some(true), "startxref wskazuje na obiekt-strumień xref (/XRef) - musi przejść");
+    }
+
+    /// Typowe uszkodzenie odzysku: liczba w `startxref` przetrwała (bo leży
+    /// w ogonie pliku razem z `%%EOF`), ale to, na co wskazuje, zostało
+    /// ucięte razem z resztą pliku.
+    #[test]
+    fn test_analyze_file_pdf_startxref_wskazuje_poza_plik_jest_odrzucany() {
+        let mut content = b"%PDF-1.4\n".to_vec();
+        content.extend(vec![0x41u8; 50]);
+        content.extend_from_slice(b"\nstartxref\n999999\n%%EOF");
+        let (_guard, path) = temp_file_with_ext(&content, "pdf");
+        let result = analyze_file(&path, "test.pdf").unwrap();
+        assert_eq!(result.eof_ok, Some(false), "startxref poza granicami pliku nie może dawać Some(true)");
+    }
+
+    #[test]
+    fn test_analyze_file_pdf_startxref_wskazuje_na_smieci_jest_odrzucany() {
+        let mut content = b"%PDF-1.4\n".to_vec();
+        content.extend(vec![0x41u8; 50]); // offset 9 wskaże w te smieci, nie w xref
+        content.extend_from_slice(b"\nstartxref\n9\n%%EOF");
+        let (_guard, path) = temp_file_with_ext(&content, "pdf");
+        let result = analyze_file(&path, "test.pdf").unwrap();
+        assert_eq!(result.eof_ok, Some(false), "startxref wskazujący w przypadkowe bajty nie może dawać Some(true)");
     }
 
     #[test]
