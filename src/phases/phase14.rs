@@ -83,10 +83,20 @@ fn get_file_category(ext: &str) -> &'static str {
 
 /// Klasyfikuje wynik porównania ssdeep DWÓCH WERSJI TEGO SAMEGO pliku (ta
 /// sama ścieżka względna, obecna po obu stronach — UFS vs Skrypt). W tym
-/// kontekście `0%` dopasowania JEST anomalią ("Frankenstein" — zlepek
-/// śmieci), bo oczekujemy wysokiego podobieństwa dla pliku o tej samej
-/// nazwie/ścieżce odzyskanego dwoma niezależnymi programami. Próg `HIGH`
-/// (≥90%) nie jest osobno raportowany jako anomalia — to oczekiwany, zdrowy wynik.
+/// kontekście `0%` dopasowania JEST anomalią (zlepek śmieci — dwa
+/// niepowiązane fragmenty danych pod tą samą nazwą), bo oczekujemy wysokiego
+/// podobieństwa dla pliku o tej samej nazwie/ścieżce odzyskanego dwoma
+/// niezależnymi programami. Próg `HIGH` (≥90%) nie jest osobno raportowany
+/// jako anomalia — to oczekiwany, zdrowy wynik.
+///
+/// UWAGA NAZEWNICTWA: wartość `"FRANKENSTEIN"` zwracana stąd i zapisywana w
+/// `phase14_analysis.match_type` NIE ZMIENIŁA SIĘ (stabilny identyfikator
+/// techniczny, czytany też przez `write_category_block`/raport końcowy) —
+/// w UI/Dzienniku Końcowym/panelu bocznym wyświetlana jest pod czytelniejszą
+/// nazwą "Zlepek Binarny"/"Zlepki Binarne". Żeby odnaleźć te wpisy wprost:
+/// `SELECT * FROM phase14_analysis WHERE match_type = 'FRANKENSTEIN'`, albo
+/// plik `raport_operacyjny_faza14_frankensteiny.txt` (nazwa pliku również
+/// celowo niezmieniona, dla łatwego grep).
 fn classify_common_match_score(score: u32) -> &'static str {
     if score == 0 { "FRANKENSTEIN" }
     else if score < 90 { "PARTIAL" }
@@ -183,18 +193,28 @@ pub(crate) enum ScanMsg {
 }
 
 /// Liczniki live dla JEDNEJ strony w Etapie 1 (hashowanie CTPH). `computed`
-/// = udane hashe, `too_small` = pliki puste lub zbyt małe dla sensownego
-/// CTPH (ssdeep odrzuca bardzo małe wejścia), `too_large_fallback` = pliki,
-/// dla których `mmap` zawiódł ORAZ rozmiar przekroczył
-/// `config.fuzzy_hash_fallback_max_mb` (pominięte, nie wczytane do RAM w całości).
+/// = udane hashe. Dwie ODRĘBNE kategorie zamiast dawnego wspólnego
+/// "zbyt małe": `empty_files` = plik dosłownie pusty (0 B, nie ma czego
+/// hashować), `too_small_nonempty` = plik NIEPUSTY, ale ssdeep i tak go
+/// odrzucił jako zbyt mały dla sensownego CTPH — inna przyczyna dowodowa
+/// (0 B to np. ślad wydmuszki/placeholdera, kilkanaście bajtów to zwykle
+/// fragment za mały na rolling hash). `too_large_fallback` = pliki, dla
+/// których `mmap` zawiódł ORAZ rozmiar przekroczył
+/// `config.fuzzy_hash_fallback_max_mb` (pominięte, nie wczytane do RAM w
+/// całości). `mmap_fallback_used` = pliki, dla których `mmap` zawiódł, ale
+/// zmieściły się w limicie i zostały skutecznie zhashowane przez wolniejszy
+/// bufor `fs::read_to_end` — licznik zdrowia warstwy I/O: częste użycie
+/// sygnalizuje np. filesystem sieciowy/FUSE, na którym `mmap` jest zawodny.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
     computed: AtomicUsize,
-    too_small: AtomicUsize,
+    empty_files: AtomicUsize,
+    too_small_nonempty: AtomicUsize,
     too_large_fallback: AtomicUsize,
+    mmap_fallback_used: AtomicUsize,
     errors: AtomicUsize,
-    extensions: Mutex<HashMap<String, usize>>, 
+    extensions: Mutex<HashMap<String, usize>>,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas liczenia sygnatury CTPH (`ssdeep::hash`) — patrz
@@ -209,8 +229,10 @@ impl LiveStats {
             processed_files: AtomicUsize::new(0),
             processed_bytes: AtomicU64::new(0),
             computed: AtomicUsize::new(0),
-            too_small: AtomicUsize::new(0),
+            empty_files: AtomicUsize::new(0),
+            too_small_nonempty: AtomicUsize::new(0),
             too_large_fallback: AtomicUsize::new(0),
+            mmap_fallback_used: AtomicUsize::new(0),
             errors: AtomicUsize::new(0),
             extensions: Mutex::new(HashMap::new()),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
@@ -247,20 +269,70 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nTop formaty: {}\nSygnatury CTPH obliczone: {}\nZbyt małe (<4KB): {}\nPominięte (fallback RAM): {}\nWątki CTPH (Wariant A): {}\nBłędy I/O: {}",
+        "[{}]\nPrędkość: {:.2} MB/s\nTop formaty: {}\nSygnatury CTPH obliczone: {}\nPuste (0 B): {}\nZbyt małe dla CTPH (niepuste): {}\nPominięte (fallback RAM): {}\nUżyto fallbacku RAM (mmap zawiódł): {}\nWątki CTPH (Wariant A): {}\nBłędy I/O: {}",
         label, speed_mb, display_top,
         stats.computed.load(Ordering::Relaxed),
-        stats.too_small.load(Ordering::Relaxed),
+        stats.empty_files.load(Ordering::Relaxed),
+        stats.too_small_nonempty.load(Ordering::Relaxed),
         stats.too_large_fallback.load(Ordering::Relaxed),
+        stats.mmap_fallback_used.load(Ordering::Relaxed),
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
 }
 
-// Struktury dla Raportu Hierarchicznego (Korelacja)
-type ExtMap = HashMap<String, Vec<(String, i64, bool)>>; 
+/// Liczniki live dla Etapu 4 (korelacja krzyżowa). W odróżnieniu od Etapu 1
+/// ([`LiveStats`]) NIE ma podziału UFS/Skrypt — pętla po plikach wspólnych i
+/// porównanie "każdy z każdym" dla unikalnych działają na JEDNEJ, wspólnej
+/// puli wyników, więc to jeden zestaw liczników dla całego etapu.
+/// `zlepki_binarne` pochodzi WYŁĄCZNIE z pętli plików wspólnych
+/// ([`classify_common_match_score`]) — dla porównań unikalnych "każdy z
+/// każdym" wynik 0%/szumowy jest klasyfikowany jako zwykły brak dopasowania
+/// ([`classify_unique_match_score`]), nie jako anomalia.
+pub(crate) struct CorrelationStats {
+    twins: AtomicUsize,
+    partial: AtomicUsize,
+    zlepki_binarne: AtomicUsize,
+    ext_mismatches: AtomicUsize,
+    total_delta_abs: AtomicI64,
+}
 
-/// Agreguje statystyki jednej kategorii dopasowania (Bliźniaki/Frankensteiny/
+impl CorrelationStats {
+    fn new() -> Self {
+        Self {
+            twins: AtomicUsize::new(0),
+            partial: AtomicUsize::new(0),
+            zlepki_binarne: AtomicUsize::new(0),
+            ext_mismatches: AtomicUsize::new(0),
+            total_delta_abs: AtomicI64::new(0),
+        }
+    }
+}
+
+/// Buduje pełny, samodzielny blok live dla Etapu 4 (korelacja krzyżowa) —
+/// analogiczny do [`build_source_block`] Etapu 1, ale bez rozróżnienia UFS/
+/// Skrypt (patrz dokumentacja [`CorrelationStats`]). Wysyłany przez
+/// `PhaseEvent::UpdateSideText` na pasek nr 3, z tą samą częstotliwością co
+/// dotychczasowa linia paska postępu — wcześniej TYLKO ta jedna linia niosła
+/// jakąkolwiek statystykę live tego etapu (liczby Bliźniaków i Złych Typów),
+/// a liczby Częściowych/Zlepków Binarnych nie były widoczne na żywo wcale,
+/// tylko w Dzienniku Końcowym PO zakończeniu całej fazy.
+fn build_correlation_block(stats: &CorrelationStats, processed: usize, total: usize) -> String {
+    format!(
+        "[Korelacja Krzyżowa]\nPrzetworzono porównań: {} / {}\nBliźniaki (≥90% dla tej samej lub innej ścieżki): {}\nCzęściowe dopasowanie: {}\nZlepki Binarne (0%, ta sama ścieżka UFS/Skrypt): {}\nBłędne rozszerzenia (bliźniak pod inną nazwą formatu): {}\nSuma bezwzględnej różnicy wag (Δ): {}",
+        processed, total,
+        stats.twins.load(Ordering::Relaxed),
+        stats.partial.load(Ordering::Relaxed),
+        stats.zlepki_binarne.load(Ordering::Relaxed),
+        stats.ext_mismatches.load(Ordering::Relaxed),
+        format_bytes(stats.total_delta_abs.load(Ordering::Relaxed).unsigned_abs()),
+    )
+}
+
+// Struktury dla Raportu Hierarchicznego (Korelacja)
+type ExtMap = HashMap<String, Vec<(String, i64, bool)>>;
+
+/// Agreguje statystyki jednej kategorii dopasowania (Bliźniaki/Zlepki Binarne/
 /// Częściowe) do Dziennika Końcowego: liczba plików, suma różnic wag,
 /// liczba pomyłek rozszerzenia, oraz mapa rozszerzenie -> lista przykładów
 /// (ścieżka, delta, czy_pomylone_rozszerzenie).
@@ -332,7 +404,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let mut io_err = Some(false);
 
             if file_size == 0 {
-                stats.too_small.fetch_add(1, Ordering::Relaxed);
+                stats.empty_files.fetch_add(1, Ordering::Relaxed);
             } else {
                 let file_res = std::fs::File::open(&full_path);
                 if let Ok(mut file) = file_res {
@@ -343,7 +415,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                                 hash_opt = Some(h);
                                 stats.computed.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(_) => { stats.too_small.fetch_add(1, Ordering::Relaxed); }
+                            Err(_) => { stats.too_small_nonempty.fetch_add(1, Ordering::Relaxed); }
                         }
                     } else {
                         if file_size > fallback_max_bytes {
@@ -354,8 +426,9 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                                 if let Ok(h) = stats.thread_activity.track_current(|| ssdeep::hash(&buffer)) {
                                     hash_opt = Some(h);
                                     stats.computed.fetch_add(1, Ordering::Relaxed);
+                                    stats.mmap_fallback_used.fetch_add(1, Ordering::Relaxed);
                                 } else {
-                                    stats.too_small.fetch_add(1, Ordering::Relaxed);
+                                    stats.too_small_nonempty.fetch_add(1, Ordering::Relaxed);
                                 }
                             } else {
                                 stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -416,7 +489,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
     });
 }
 
-/// Formatuje jedną kategorię dopasowania (Bliźniaki/Frankensteiny/Częściowe)
+/// Formatuje jedną kategorię dopasowania (Bliźniaki/Zlepki Binarne/Częściowe)
 /// do Dziennika Końcowego: nagłówek + top 5 rozszerzeń z przykładową ścieżką
 /// i deltą wagi per rozszerzenie.
 fn write_category_block(out: &mut String, stats: &CategoryStats, icon: &str) {
@@ -513,7 +586,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     {
         let _ = writeln!(log_twins.lock().unwrap(), "=== FAZA 14: ZAGINIONE BLIŹNIAKI (Cross-Korelacja Plików Unikalnych) ===\nOdnalezione pliki posiadające różne ścieżki i nazwy, ale w ponad 90% identyczne wnętrze.\nZawierają informacje o różnicy wag (Delta) i potencjalnych błędach odzyskanego rozszerzenia.\n");
-        let _ = writeln!(log_franks.lock().unwrap(), "=== FAZA 14: FRANKENSTEINY (Zlepki binarne) ===\nPliki mające identyczną ścieżkę w UFS i Skrypcie, lecz wykazujące 0% podobieństwa wewnątrz (Całkowicie zniszczone przez File Carvera).\n");
+        let _ = writeln!(log_franks.lock().unwrap(), "=== FAZA 14: ZLEPKI BINARNE (dawniej \"Frankensteiny\") ===\nPliki mające identyczną ścieżkę w UFS i Skrypcie, lecz wykazujące 0% podobieństwa wewnątrz (Całkowicie zniszczone przez File Carvera).\nSzukasz tych wpisów programowo? Nazwa techniczna w bazie danych pozostaje bez zmian: phase14_analysis.match_type = 'FRANKENSTEIN'.\n");
         let _ = writeln!(log_partial.lock().unwrap(), "=== FAZA 14: CZĘŚCIOWE USZKODZENIA (Przesunięcia Sektorowe) ===\nPliki, których wnętrze jest podobne tylko w 1% - 89% (Częściowo ucięte / zmieszane).\n");
     }
 
@@ -736,11 +809,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let total_correlations = common_rows.len() + unique_ufs.len();
     let _ = tx_ui.send(PhaseEvent::SetBar { idx: 3, label: "Korelacja Krzyżowa RAM".to_string(), total: total_correlations as u64, color: Color::Yellow });
 
-    let live_twins = Arc::new(AtomicUsize::new(0));
-    let live_franks = Arc::new(AtomicUsize::new(0));
-    let live_partial = Arc::new(AtomicUsize::new(0));
-    let live_mismatches = Arc::new(AtomicUsize::new(0));
-    let live_total_delta = Arc::new(AtomicI64::new(0));
+    let corr_stats = CorrelationStats::new();
     let progress_counter = Arc::new(AtomicUsize::new(0));
 
     let mut db_updates: Vec<(i32, String, f64, Option<String>, i64, bool)> = Vec::new();
@@ -764,18 +833,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 pct = score as f64;
                 let w_ufs = std::fs::metadata(ufs_b.join(&row.rel_path)).map(|m| m.len() as i64).unwrap_or(0);
                 let w_scr = std::fs::metadata(scr_b.join(&row.rel_path)).map(|m| m.len() as i64).unwrap_or(0);
-                delta = w_ufs - w_scr; 
-                
-                live_total_delta.fetch_add(delta.abs(), Ordering::Relaxed);
+                delta = w_ufs - w_scr;
+
+                corr_stats.total_delta_abs.fetch_add(delta.abs(), Ordering::Relaxed);
 
                 m_type = classify_common_match_score(score as u32).to_string();
                 match m_type.as_str() {
                     "FRANKENSTEIN" => {
-                        live_franks.fetch_add(1, Ordering::Relaxed);
+                        corr_stats.zlepki_binarne.fetch_add(1, Ordering::Relaxed);
                         let _ = writeln!(log_franks.lock().unwrap(), "[Typ: .{:<4}] Ścieżka (0% match, zlepek): \"{}\"", ext, row.rel_path);
                     }
                     "PARTIAL" => {
-                        live_partial.fetch_add(1, Ordering::Relaxed);
+                        corr_stats.partial.fetch_add(1, Ordering::Relaxed);
                         let delta_s = format_delta(delta);
                         let _ = writeln!(log_partial.lock().unwrap(), "[Typ: .{:<4}] [{:>3}% match] [Δ: {}] Ścieżka: \"{}\"", ext, score, delta_s, row.rel_path);
                     }
@@ -784,15 +853,19 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
         db_updates_mtx.lock().unwrap().push((row.id, m_type, pct, None, delta, false));
         let c = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        
-        // Zestawienie wyników korelacji w locie na pasku nr 3
+
+        // Zestawienie wyników korelacji w locie na pasku nr 3 + pełny panel boczny
         if c.is_multiple_of(50) {
-            let m = live_mismatches.load(Ordering::Relaxed);
-            let d_total = format_bytes(live_total_delta.load(Ordering::Relaxed) as u64);
+            let m = corr_stats.ext_mismatches.load(Ordering::Relaxed);
+            let d_total = format_bytes(corr_stats.total_delta_abs.load(Ordering::Relaxed).unsigned_abs());
             let _ = tx_ui.send(PhaseEvent::UpdateBar {
                 idx: 3,
                 current: c as u64,
-                message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", live_twins.load(Ordering::Relaxed), m, d_total),
+                message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", corr_stats.twins.load(Ordering::Relaxed), m, d_total),
+            });
+            let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+                idx: 3,
+                text: build_correlation_block(&corr_stats, c, total_correlations),
             });
         }
     }
@@ -859,12 +932,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
             if now_ms - last_ms > 80
                 && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    let m = live_mismatches.load(Ordering::Relaxed);
-                    let d_total = format_bytes(live_total_delta.load(Ordering::Relaxed) as u64);
+                    let m = corr_stats.ext_mismatches.load(Ordering::Relaxed);
+                    let d_total = format_bytes(corr_stats.total_delta_abs.load(Ordering::Relaxed).unsigned_abs());
                     let _ = tx_ui.send(PhaseEvent::UpdateBar {
                         idx: 3,
                         current: current as u64,
-                        message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", live_twins.load(Ordering::Relaxed), m, d_total),
+                        message: format!("👯‍♂️ Bliźniaki: {} | 🔄 Złe Typy: {} | ⚖️ Suma Δ: {}", corr_stats.twins.load(Ordering::Relaxed), m, d_total),
+                    });
+                    let _ = tx_ui.send(PhaseEvent::UpdateSideText {
+                        idx: 3,
+                        text: build_correlation_block(&corr_stats, current, total_correlations),
                     });
                 }
 
@@ -890,7 +967,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut scr_best: HashMap<i32, (u32, String, i64, bool)> = HashMap::new();
 
     for (u_id, u_path, score, best_id, best_path, delta, ext_mismatch, ext_ufs) in cross_results {
-        if score > 0 { live_total_delta.fetch_add(delta.abs(), Ordering::Relaxed); }
+        if score > 0 { corr_stats.total_delta_abs.fetch_add(delta.abs(), Ordering::Relaxed); }
 
         let m_type = classify_unique_match_score(score as u32).to_string();
         let ma_zaliczone_dopasowanie = m_type != "NONE";
@@ -902,8 +979,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
         match m_type.as_str() {
             "TWIN" => {
-                live_twins.fetch_add(1, Ordering::Relaxed);
-                if ext_mismatch { live_mismatches.fetch_add(1, Ordering::Relaxed); }
+                corr_stats.twins.fetch_add(1, Ordering::Relaxed);
+                if ext_mismatch { corr_stats.ext_mismatches.fetch_add(1, Ordering::Relaxed); }
 
                 let p = best_path.clone().unwrap_or_default();
                 let d_str = format_delta(delta);
@@ -911,7 +988,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let _ = writeln!(log_twins.lock().unwrap(), "[{:<4}] [{:>3}%] [Δ: {:>10}]{} UFS: \"{}\" <---> Skrypt: \"{}\"",
                     ext_ufs, score, d_str, bad_ext_flag, u_path, p);
             }
-            "PARTIAL" => { live_partial.fetch_add(1, Ordering::Relaxed); }
+            "PARTIAL" => { corr_stats.partial.fetch_add(1, Ordering::Relaxed); }
             _ => {}
         }
         db_updates.push((u_id, m_type, score as f64, zapisywana_sciezka, delta, ext_mismatch));
@@ -1023,7 +1100,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki posiadają tę samą nazwę i wspólną bazę bitową, ale zauważalnie różnią się objętością. Wymagają ewentualnej, ostrożnej weryfikacji.");
     write_category_block(&mut log_out, &stats_partial, "🩹");
 
-    let _ = writeln!(&mut log_out, "[ 3 ] ŁOWCA FRANKENSTEINÓW (Zlepki Binarne):");
+    let _ = writeln!(&mut log_out, "[ 3 ] ZLEPKI BINARNE (dawniej \"Frankensteiny\", techniczna nazwa w bazie: match_type = 'FRANKENSTEIN'):");
     let _ = writeln!(&mut log_out, "   -> Całkowity brak podobieństwa (0% match): {}", stats_franks.count);
     let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: OBA programy zrzuciły pliki o identycznej nazwie i zbliżonej wadze, lecz ich struktura wewnątrz jest całkowicie inna. Są to zlepki śmieci z dysku, mylnie uznane za plik.\n");
     write_category_block(&mut log_out, &stats_franks, "🧟‍♂️");
@@ -1312,8 +1389,10 @@ mod tests {
         use std::time::Duration;
         let stats = LiveStats::new(4);
         stats.computed.store(100, Ordering::Relaxed);
-        stats.too_small.store(5, Ordering::Relaxed);
+        stats.empty_files.store(3, Ordering::Relaxed);
+        stats.too_small_nonempty.store(5, Ordering::Relaxed);
         stats.too_large_fallback.store(2, Ordering::Relaxed);
+        stats.mmap_fallback_used.store(7, Ordering::Relaxed);
         stats.errors.store(1, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -1321,8 +1400,10 @@ mod tests {
 
         assert!(block.starts_with("[UFS Explorer]"));
         assert!(block.contains("Sygnatury CTPH obliczone: 100"));
-        assert!(block.contains("Zbyt małe (<4KB): 5"));
+        assert!(block.contains("Puste (0 B): 3"));
+        assert!(block.contains("Zbyt małe dla CTPH (niepuste): 5"));
         assert!(block.contains("Pominięte (fallback RAM): 2"));
+        assert!(block.contains("Użyto fallbacku RAM (mmap zawiódł): 7"));
         assert!(block.contains("Błędy I/O: 1"));
     }
 
@@ -1346,5 +1427,69 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
         assert!(block.contains("Top formaty: Analiza danych..."));
+    }
+
+    // ------------------------------------------------------------------
+    // CorrelationStats / build_correlation_block (Etap 4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_build_correlation_block_reports_progress_and_counts() {
+        let stats = CorrelationStats::new();
+        stats.twins.store(4, Ordering::Relaxed);
+        stats.partial.store(2, Ordering::Relaxed);
+        stats.zlepki_binarne.store(1, Ordering::Relaxed);
+        stats.ext_mismatches.store(3, Ordering::Relaxed);
+        stats.total_delta_abs.store(2048, Ordering::Relaxed);
+
+        let block = build_correlation_block(&stats, 50, 200);
+
+        assert!(block.starts_with("[Korelacja Krzyżowa]"));
+        assert!(block.contains("Przetworzono porównań: 50 / 200"));
+        assert!(block.contains("Bliźniaki (≥90% dla tej samej lub innej ścieżki): 4"));
+        assert!(block.contains("Częściowe dopasowanie: 2"));
+        assert!(block.contains("Zlepki Binarne (0%, ta sama ścieżka UFS/Skrypt): 1"));
+        assert!(block.contains("Błędne rozszerzenia (bliźniak pod inną nazwą formatu): 3"));
+        assert!(block.contains("Suma bezwzględnej różnicy wag (Δ): 2.00 KB"));
+    }
+
+    #[test]
+    fn test_build_correlation_block_zero_counts_at_start() {
+        let stats = CorrelationStats::new();
+        let block = build_correlation_block(&stats, 0, 100);
+        assert!(block.contains("Przetworzono porównań: 0 / 100"));
+        assert!(block.contains("Bliźniaki (≥90% dla tej samej lub innej ścieżki): 0"));
+    }
+
+    // ------------------------------------------------------------------
+    // opisy_anomalii: każda REALNA etykieta z OBU paneli (Etap 1 hashowanie
+    // + Etap 4 korelacja) poza generycznymi musi mieć zarejestrowane
+    // wyjaśnienie — inaczej Enter na tym wierszu w prawdziwym UI nie pokaże
+    // nakładki. Mirror wzorca z Fazy 5-13.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
+        const GENERYCZNE: &[&str] = &["Prędkość", "Top formaty", "Wątki CTPH (Wariant A)", "Błędy I/O"];
+
+        let stats1 = LiveStats::new(2);
+        let block1 = build_source_block("UFS Explorer", &stats1, Instant::now());
+
+        let stats4 = CorrelationStats::new();
+        let block4 = build_correlation_block(&stats4, 0, 10);
+
+        let mut sprawdzonych = 0;
+        for line in block1.lines().chain(block4.lines()) {
+            if line.starts_with('[') { continue; }
+            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
+            if GENERYCZNE.contains(&etykieta) { continue; }
+
+            assert!(
+                crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
+                "etykieta \"{}\" z panelu Fazy 14 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+            );
+            sprawdzonych += 1;
+        }
+        assert_eq!(sprawdzonych, 11, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza14_hashowanie.rs");
     }
 }
