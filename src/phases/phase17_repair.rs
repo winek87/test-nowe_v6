@@ -72,20 +72,20 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_display_path, CANCEL_SIGNAL};
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use crate::utils::{CANCEL_SIGNAL, format_display_path};
+use colored::Colorize;
+use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
-use colored::Colorize;
 
 use super::repair_modules::{self, RepairContext, RepairModule};
 
@@ -115,9 +115,10 @@ fn katalog_naprawy(baza: &Path, strona: &str, rel_path: &str) -> Option<PathBuf>
     let mut katalog = baza.join(strona);
 
     if let Some(rodzic) = Path::new(rel_path).parent()
-        && !rodzic.as_os_str().is_empty() {
-            katalog = katalog.join(rodzic);
-        }
+        && !rodzic.as_os_str().is_empty()
+    {
+        katalog = katalog.join(rodzic);
+    }
 
     fs::create_dir_all(&katalog).ok()?;
     Some(katalog)
@@ -225,7 +226,9 @@ impl LiveStats {
     /// panikę w KOLEJNĄ panikę, i to w wątku Rayon, wywracając całą fazę
     /// zamiast dokończyć pracę i zaraportować wynik.
     fn liczniki(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, usize>> {
-        self.repairs_by_module.lock().unwrap_or_else(|e| e.into_inner())
+        self.repairs_by_module
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -240,13 +243,23 @@ fn build_source_block(stats: &LiveStats, start_time: Instant) -> String {
         let map = stats.liczniki();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n")
+        sorted
+            .into_iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
-    let display_modules = if modules_str.is_empty() { "-".to_string() } else { modules_str };
+    let display_modules = if modules_str.is_empty() {
+        "-".to_string()
+    } else {
+        modules_str
+    };
 
     format!(
         "[Podsumowanie]\nPrędkość: {:.1} plików/s\nPrzetworzone: {}\n{}\nOdrzucone przez weryfikację: {}\nWątki naprawy (Wariant A): {}\nBłędy (żaden moduł nie pomógł): {}",
-        speed, current, display_modules,
+        speed,
+        current,
+        display_modules,
         stats.rejected_by_verification.load(Ordering::Relaxed),
         crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot()),
         stats.errors.load(Ordering::Relaxed),
@@ -275,7 +288,10 @@ struct SledzenieUkonczenia {
 
 impl SledzenieUkonczenia {
     fn new(oczekiwane: HashMap<i32, u8>) -> Self {
-        Self { oczekiwane, otrzymane: HashMap::new() }
+        Self {
+            oczekiwane,
+            otrzymane: HashMap::new(),
+        }
     }
 
     /// Rejestruje kolejny rozliczony wynik dla `id`. Zwraca `true`, gdy PO
@@ -302,12 +318,26 @@ pub struct RepairCtx<'a> {
     pub bar_idx: usize,
     pub start_time: Instant,
     pub opr_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx))]
 
 fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
-    let RepairCtx { ufs_base, script_base, repair_base, active_modules, tasks, stats, tx_db, tx_ui, bar_idx, start_time, opr_log } = ctx;
+    let RepairCtx {
+        ufs_base,
+        script_base,
+        repair_base,
+        active_modules,
+        tasks,
+        stats,
+        tx_db,
+        tx_ui,
+        bar_idx,
+        start_time,
+        opr_log,
+        debug_log,
+    } = ctx;
 
     let last_ui_update = Arc::new(AtomicU64::new(0));
 
@@ -337,6 +367,15 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
             // zadanie wpada w zwykłą ścieżkę błędu niżej.
             let katalog_wyjsciowy = katalog_naprawy(repair_base, task.side, &task.rel_path);
 
+            let side_label = if task.side == "ufs" { "UFS Explorer" } else { "Skrypt Autorski" };
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, "dyspatch modułów naprawy", full_path.display()
+                );
+            }
+            let call_start = debug_log.is_active().then(Instant::now);
             let mut result_opt: Option<(&'static str, PathBuf, String)> = None;
             for module in active_modules {
                 // REGRESJA (Gemini review — druga weryfikacja): `catch_unwind`
@@ -446,6 +485,21 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
                 }
             }
 
+            let (metoda, wynik) = match &result_opt {
+                Some((module_id, _, _)) => (*module_id, "OK (NAPRAWIONO)"),
+                None => ("brak dopasowania (żaden moduł)", "BRAK NAPRAWY"),
+            };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
+
             let current = stats.total_processed.fetch_add(1, Ordering::Relaxed) + 1;
 
             if let Some((module_id, new_p, log_msg)) = result_opt {
@@ -543,7 +597,10 @@ fn process_repair_stream<'a>(ctx: RepairCtx<'a>) {
 /// bezobsługowy, nie ma kto odpowiedzieć na `MultiSelect`) oraz jako
 /// domyślny zestaw "wszystko aktywne".
 pub fn all_module_ids() -> Vec<&'static str> {
-    repair_modules::all_modules().iter().map(|m| m.id()).collect()
+    repair_modules::all_modules()
+        .iter()
+        .map(|m| m.id())
+        .collect()
 }
 
 /// Pokazuje `MultiSelect` z listą dostępnych modułów naprawczych i zwraca
@@ -556,7 +613,10 @@ pub fn all_module_ids() -> Vec<&'static str> {
 /// bez w ogóle wchodzenia w ekran Ratatui.
 pub fn select_active_module_ids() -> Option<Vec<&'static str>> {
     let modules = repair_modules::all_modules();
-    let module_labels: Vec<String> = modules.iter().map(|m| m.display_name().to_string()).collect();
+    let module_labels: Vec<String> = modules
+        .iter()
+        .map(|m| m.display_name().to_string())
+        .collect();
     let defaults = vec![true; modules.len()];
 
     println!("\n{}", "[ 🧰 ] DOSTĘPNE MODUŁY NAPRAWCZE".cyan().bold());
@@ -570,7 +630,10 @@ pub fn select_active_module_ids() -> Option<Vec<&'static str>> {
     let selected_indices = match selections {
         Some(s) if !s.is_empty() => s,
         _ => {
-            println!("{}", "[ ℹ ] Nie wybrano żadnych modułów naprawczych. Pomijam Fazę 17.".bright_black());
+            println!(
+                "{}",
+                "[ ℹ ] Nie wybrano żadnych modułów naprawczych. Pomijam Fazę 17.".bright_black()
+            );
             return None;
         }
     };
@@ -585,7 +648,12 @@ pub fn select_active_module_ids() -> Option<Vec<&'static str>> {
 /// [`select_active_module_ids`]/[`all_module_ids`] wołane przez wywołującego
 /// PRZED wejściem w tryb Raw) — ta funkcja sama nie robi już żadnej
 /// interakcji z użytkownikiem.
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>, active_module_ids: Vec<&'static str>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+    active_module_ids: Vec<&'static str>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // REGRESJA (measure twice — druga weryfikacja Gemini, Faza 18 N3): ta
@@ -601,7 +669,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let ufs_path = Path::new(&config.ufs_path);
     let script_path = Path::new(&config.script_path);
     let target_path_walidacja = Path::new(&config.target_path);
-    if let Err(powod) = super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path) {
+    if let Err(powod) =
+        super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path)
+    {
         let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY: {}", powod)));
         return Ok(());
     }
@@ -612,21 +682,35 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // `mp4_autopilot`) dzielą tę samą globalną pulę dawców pod
     // `target_path/_mp4_doctor`. Jednorazowe (`OnceLock`) — bezpieczne przy
     // powtórnym wejściu w tę fazę w tej samej sesji.
-    mp4_doctor::workspace::ustaw_katalog_przestrzeni(PathBuf::from(&config.target_path).join("_mp4_doctor"));
+    mp4_doctor::workspace::ustaw_katalog_przestrzeni(
+        PathBuf::from(&config.target_path).join("_mp4_doctor"),
+    );
 
     let modules = repair_modules::all_modules();
-    let active_modules: Vec<&dyn RepairModule> = modules.iter()
+    let active_modules: Vec<&dyn RepairModule> = modules
+        .iter()
         .filter(|m| active_module_ids.contains(&m.id()))
         .map(|m| m.as_ref())
         .collect();
 
     if active_modules.is_empty() {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak aktywnych modułów naprawczych. Faza 17 pominięta.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Brak aktywnych modułów naprawczych. Faza 17 pominięta.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 17: Aktywne Moduły Naprawcze (Active Repair).".to_string()));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne moduły: {}", active_modules.iter().map(|m| m.display_name()).collect::<Vec<_>>().join(", "))));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Uruchomiono Fazę 17: Aktywne Moduły Naprawcze (Active Repair).".to_string(),
+    ));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne moduły: {}",
+        active_modules
+            .iter()
+            .map(|m| m.display_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )));
 
     // Stan `ffmpeg` meldowany RAZ, na wejściu — od niego zależy zarówno
     // dostępność przepakowania kontenera, jak i SIŁA weryfikacji napraw wideo.
@@ -654,15 +738,30 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = conn.execute("ALTER TABLE files ADD COLUMN repair_log_script TEXT", []);
 
     // INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 17").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza17.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza17.txt".to_string(),
-    });
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 17")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza17.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza17.txt".to_string(),
+        });
 
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza17.txt", &stamp),
+        &config.log_level,
+    );
 
     // Brak pliku raportu operacyjnego to nie powód do paniki — melduje się go
     // użytkownikowi i przerywa fazę czysto, tym samym wzorcem co niemożliwość
@@ -682,8 +781,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let opr_log = Arc::new(Mutex::new(opr_file));
     if let Ok(mut f_info) = opr_log.lock() {
-        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 17: AKTYWNE MODUŁY NAPRAWCZE ===");
-        let _ = writeln!(f_info, "Ewidencja plików, które zostały fizycznie naprawione przez skrypt (utworzono nowe pliki z sufiksem _repaired/_spliced na dysku).\n");
+        let _ = writeln!(
+            f_info,
+            "=== RAPORT OPERACYJNY - FAZA 17: AKTYWNE MODUŁY NAPRAWCZE ==="
+        );
+        let _ = writeln!(
+            f_info,
+            "Ewidencja plików, które zostały fizycznie naprawione przez skrypt (utworzono nowe pliki z sufiksem _repaired/_spliced na dysku).\n"
+        );
     }
 
     // --- LOGIKA DOBIERANIA ZADAŃ (na podstawie wskaźników z poprzednich faz) ---
@@ -698,50 +803,123 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 a.match_type, a.twin_file_path
          FROM files f
          LEFT JOIN phase14_analysis a ON f.id = a.file_id
-         WHERE f.phase17_done = 0 OR f.phase17_done IS NULL"
+         WHERE f.phase17_done = 0 OR f.phase17_done IS NULL",
     )?;
 
     let mut repair_tasks = Vec::new();
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?,
-            row.get::<_, Option<bool>>(8)?, row.get::<_, Option<bool>>(9)?,
-            row.get::<_, Option<bool>>(10)?, row.get::<_, Option<bool>>(11)?,
-            row.get::<_, Option<bool>>(12)?, row.get::<_, Option<bool>>(13)?,
-            row.get::<_, Option<bool>>(14)?, row.get::<_, Option<bool>>(15)?,
-            row.get::<_, Option<bool>>(16)?, row.get::<_, Option<bool>>(17)?,
-            row.get::<_, Option<String>>(18)?, row.get::<_, Option<String>>(19)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
+            row.get::<_, Option<bool>>(8)?,
+            row.get::<_, Option<bool>>(9)?,
+            row.get::<_, Option<bool>>(10)?,
+            row.get::<_, Option<bool>>(11)?,
+            row.get::<_, Option<bool>>(12)?,
+            row.get::<_, Option<bool>>(13)?,
+            row.get::<_, Option<bool>>(14)?,
+            row.get::<_, Option<bool>>(15)?,
+            row.get::<_, Option<bool>>(16)?,
+            row.get::<_, Option<bool>>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, Option<String>>(19)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel, in_ufs, in_scr, m_rs_u, m_rs_s, utf_u, utf_s, one_u, one_s, eof_u, eof_s, vid_u, vid_s, str_u, str_s, dec_u, dec_s, match_type, twin) = r;
-        let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let (
+            id,
+            rel,
+            in_ufs,
+            in_scr,
+            m_rs_u,
+            m_rs_s,
+            utf_u,
+            utf_s,
+            one_u,
+            one_s,
+            eof_u,
+            eof_s,
+            vid_u,
+            vid_s,
+            str_u,
+            str_s,
+            dec_u,
+            dec_s,
+            match_type,
+            twin,
+        ) = r;
+        let ext = Path::new(&rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
         if in_ufs {
-            let ctx = RepairContext { ext: &ext, media_reason: m_rs_u.as_deref(), utf8_ok: utf_u, is_oneliner: one_u, eof_ok: eof_u, match_type: match_type.as_deref(), video_ok: vid_u, structure_ok: str_u, media_decoded: dec_u };
+            let ctx = RepairContext {
+                ext: &ext,
+                media_reason: m_rs_u.as_deref(),
+                utf8_ok: utf_u,
+                is_oneliner: one_u,
+                eof_ok: eof_u,
+                match_type: match_type.as_deref(),
+                video_ok: vid_u,
+                structure_ok: str_u,
+                media_decoded: dec_u,
+            };
             if active_modules.iter().any(|m| m.applies_to(&ctx)) {
                 repair_tasks.push(RepairTask {
-                    id, rel_path: rel.clone(), side: "ufs", ext: ext.clone(),
-                    media_reason: m_rs_u, utf8_ok: utf_u, is_oneliner: one_u, eof_ok: eof_u,
-                    match_type: match_type.clone(), twin_path: twin.clone(),
-                    video_ok: vid_u, structure_ok: str_u, media_decoded: dec_u,
+                    id,
+                    rel_path: rel.clone(),
+                    side: "ufs",
+                    ext: ext.clone(),
+                    media_reason: m_rs_u,
+                    utf8_ok: utf_u,
+                    is_oneliner: one_u,
+                    eof_ok: eof_u,
+                    match_type: match_type.clone(),
+                    twin_path: twin.clone(),
+                    video_ok: vid_u,
+                    structure_ok: str_u,
+                    media_decoded: dec_u,
                 });
             }
         }
 
         if in_scr {
-            let ctx = RepairContext { ext: &ext, media_reason: m_rs_s.as_deref(), utf8_ok: utf_s, is_oneliner: one_s, eof_ok: eof_s, match_type: match_type.as_deref(), video_ok: vid_s, structure_ok: str_s, media_decoded: dec_s };
+            let ctx = RepairContext {
+                ext: &ext,
+                media_reason: m_rs_s.as_deref(),
+                utf8_ok: utf_s,
+                is_oneliner: one_s,
+                eof_ok: eof_s,
+                match_type: match_type.as_deref(),
+                video_ok: vid_s,
+                structure_ok: str_s,
+                media_decoded: dec_s,
+            };
             if active_modules.iter().any(|m| m.applies_to(&ctx)) {
                 repair_tasks.push(RepairTask {
-                    id, rel_path: rel.clone(), side: "script", ext,
-                    media_reason: m_rs_s, utf8_ok: utf_s, is_oneliner: one_s, eof_ok: eof_s,
-                    match_type, twin_path: twin,
-                    video_ok: vid_s, structure_ok: str_s, media_decoded: dec_s,
+                    id,
+                    rel_path: rel.clone(),
+                    side: "script",
+                    ext,
+                    media_reason: m_rs_s,
+                    utf8_ok: utf_s,
+                    is_oneliner: one_s,
+                    eof_ok: eof_s,
+                    match_type,
+                    twin_path: twin,
+                    video_ok: vid_s,
+                    structure_ok: str_s,
+                    media_decoded: dec_s,
                 });
             }
         }
@@ -749,11 +927,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     drop(stmt);
 
     if repair_tasks.is_empty() {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików kwalifikujących się do fizycznej naprawy. Baza w 100% czysta.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Brak plików kwalifikujących się do fizycznej naprawy. Baza w 100% czysta."
+                .to_string(),
+        ));
+        // 🟢 UWAGA: Świadomie usuwamy `return Ok(());`. Faza przejdzie naturalnie do końca,
+        // bez generowania I/O, ale odrysuje paski na zielono i wygeneruje poprawny Dziennik Końcowy!
     }
 
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "Silnik Rekonstrukcji Danych (I/O)".to_string(), total: repair_tasks.len() as u64, color: Color::Red });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "Silnik Rekonstrukcji Danych (I/O)".to_string(),
+        total: repair_tasks.len() as u64,
+        color: Color::Red,
+    });
 
     let ufs_base = PathBuf::from(&config.ufs_path);
     let script_base = PathBuf::from(&config.script_path);
@@ -763,11 +950,15 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     if let Err(e) = fs::create_dir_all(&repair_base) {
         let _ = tx_ui.send(PhaseEvent::Log(format!(
             "BŁĄD KRYTYCZNY: nie udało się utworzyć katalogu napraw ({}): {}. Faza 17 przerwana.",
-            repair_base.display(), e
+            repair_base.display(),
+            e
         )));
         return Ok(());
     }
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Naprawione pliki będą zapisywane w: {}", repair_base.display())));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Naprawione pliki będą zapisywane w: {}",
+        repair_base.display()
+    )));
 
     let stats = LiveStats::new(rayon::current_num_threads());
 
@@ -834,7 +1025,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             Ok(())
         });
 
-        process_repair_stream(RepairCtx { ufs_base: &ufs_base, script_base: &script_base, repair_base: &repair_base, active_modules: &active_modules, tasks: &repair_tasks, stats: &stats, tx_db, tx_ui: &tx_ui, bar_idx: 0, start_time, opr_log: opr_log.clone(), });
+        process_repair_stream(RepairCtx {
+            ufs_base: &ufs_base,
+            script_base: &script_base,
+            repair_base: &repair_base,
+            active_modules: &active_modules,
+            tasks: &repair_tasks,
+            stats: &stats,
+            tx_db,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            start_time,
+            opr_log: opr_log.clone(),
+            debug_log: debug_log.clone(),
+        });
 
         match db_thread.join() {
             Ok(wynik) => wynik,
@@ -869,12 +1073,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 17 (AKTYWNA REKONSTRUKCJA I INŻYNIERIA)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 17 (AKTYWNA REKONSTRUKCJA I INŻYNIERIA)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let _ = writeln!(&mut log_out, "[ 1 ] ZESTAWIENIE OŻYWIONYCH PLIKÓW (Zostaną wykorzystane przez Złotą Kopię):");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] ZESTAWIENIE OŻYWIONYCH PLIKÓW (Zostaną wykorzystane przez Złotą Kopię):"
+    );
     {
         let map = stats.liczniki();
         let mut sorted: Vec<_> = map.iter().collect();
@@ -883,21 +1099,45 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let _ = writeln!(&mut log_out, "   -> Żaden moduł nie zgłosił naprawy.");
         }
         for (module_id, count) in sorted {
-            let display = active_modules.iter().find(|m| m.id() == *module_id).map(|m| m.display_name()).unwrap_or(module_id);
+            let display = active_modules
+                .iter()
+                .find(|m| m.id() == *module_id)
+                .map(|m| m.display_name())
+                .unwrap_or(module_id);
             let _ = writeln!(&mut log_out, "   -> {:<55} {} plików", display, count);
         }
     }
-    let _ = writeln!(&mut log_out, "   -> Odrzucone przez obowiązkową weryfikację wyniku: {} plików", stats.rejected_by_verification.load(Ordering::Relaxed));
-    let _ = writeln!(&mut log_out, "      (moduł wykonał naprawę, ale wynik nie przeszedł dowodu sprawności - plik usunięty, NIE trafił do bazy)");
-    let _ = writeln!(&mut log_out, "   -> Błędy (żaden aktywny moduł nie pomógł): {} plików\n", stats.errors.load(Ordering::Relaxed));
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Odrzucone przez obowiązkową weryfikację wyniku: {} plików",
+        stats.rejected_by_verification.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      (moduł wykonał naprawę, ale wynik nie przeszedł dowodu sprawności - plik usunięty, NIE trafił do bazy)"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Błędy (żaden aktywny moduł nie pomógł): {} plików\n",
+        stats.errors.load(Ordering::Relaxed)
+    );
 
-    let _ = writeln!(&mut log_out, "[ ℹ ] Wszystkie naprawione wersje zostały oznaczone sufiksem '_repaired'/'_spliced' i zapisane w:");
+    let _ = writeln!(
+        &mut log_out,
+        "[ ℹ ] Wszystkie naprawione wersje zostały oznaczone sufiksem '_repaired'/'_spliced' i zapisane w:"
+    );
     let _ = writeln!(&mut log_out, "      {}", repair_base.display());
-    let _ = writeln!(&mut log_out, "      (struktura: <strona>/<oryginalne katalogi>; korpus źródłowy pozostaje NIETKNIĘTY)");
+    let _ = writeln!(
+        &mut log_out,
+        "      (struktura: <strona>/<oryginalne katalogi>; korpus źródłowy pozostaje NIETKNIĘTY)"
+    );
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -941,12 +1181,19 @@ mod tests {
         let original_len = ids.len();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), original_len, "all_module_ids nie powinno zwracać duplikatów");
+        assert_eq!(
+            ids.len(),
+            original_len,
+            "all_module_ids nie powinno zwracać duplikatów"
+        );
     }
 
     #[test]
     fn test_all_module_ids_nonempty() {
-        assert!(!all_module_ids().is_empty(), "Rejestr modułów naprawczych nie powinien być pusty");
+        assert!(
+            !all_module_ids().is_empty(),
+            "Rejestr modułów naprawczych nie powinien być pusty"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -957,17 +1204,22 @@ mod tests {
 
     #[test]
     fn test_katalog_naprawy_odwzorowuje_strukture_katalogow() {
-        let baza = tempdir().unwrap();
-        let k = katalog_naprawy(baza.path(), "ufs", "foto/2024/wakacje/a.jpg").expect("katalog powinien powstać");
+        let baza = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let k = katalog_naprawy(baza.path(), "ufs", "foto/2024/wakacje/a.jpg")
+            .expect("katalog powinien powstać");
 
         assert_eq!(k, baza.path().join("ufs").join("foto/2024/wakacje"));
-        assert!(k.is_dir(), "Katalog musi zostać fizycznie utworzony przed wywołaniem modułu");
+        assert!(
+            k.is_dir(),
+            "Katalog musi zostać fizycznie utworzony przed wywołaniem modułu"
+        );
     }
 
     #[test]
     fn test_katalog_naprawy_dla_pliku_w_korzeniu() {
-        let baza = tempdir().unwrap();
-        let k = katalog_naprawy(baza.path(), "script", "plik.txt").expect("katalog powinien powstać");
+        let baza = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let k =
+            katalog_naprawy(baza.path(), "script", "plik.txt").expect("katalog powinien powstać");
 
         assert_eq!(k, baza.path().join("script"));
         assert!(k.is_dir());
@@ -979,31 +1231,47 @@ mod tests {
     /// pierwszy, cicho tracąc jedną z napraw.
     #[test]
     fn test_katalog_naprawy_rozdziela_pliki_o_tej_samej_nazwie() {
-        let baza = tempdir().unwrap();
-        let a = katalog_naprawy(baza.path(), "ufs", "foto/a.jpg").unwrap();
-        let b = katalog_naprawy(baza.path(), "ufs", "skany/a.jpg").unwrap();
+        let baza = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let a = katalog_naprawy(baza.path(), "ufs", "foto/a.jpg")
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let b = katalog_naprawy(baza.path(), "ufs", "skany/a.jpg")
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
-        assert_ne!(a, b, "Pliki o tej samej nazwie z różnych katalogów nie mogą kolidować");
+        assert_ne!(
+            a, b,
+            "Pliki o tej samej nazwie z różnych katalogów nie mogą kolidować"
+        );
     }
 
     /// Ten sam `rel_path` istnieje po obu stronach i Faza 17 tworzy dla każdej
     /// osobne zadanie — obie naprawy muszą mieć własne miejsce.
     #[test]
     fn test_katalog_naprawy_rozdziela_strony() {
-        let baza = tempdir().unwrap();
-        let ufs = katalog_naprawy(baza.path(), "ufs", "foto/a.jpg").unwrap();
-        let script = katalog_naprawy(baza.path(), "script", "foto/a.jpg").unwrap();
+        let baza = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let ufs = katalog_naprawy(baza.path(), "ufs", "foto/a.jpg")
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = katalog_naprawy(baza.path(), "script", "foto/a.jpg")
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
-        assert_ne!(ufs, script, "Strona UFS i Skrypt nie mogą dzielić katalogu wyjściowego");
+        assert_ne!(
+            ufs, script,
+            "Strona UFS i Skrypt nie mogą dzielić katalogu wyjściowego"
+        );
     }
 
     #[test]
     fn test_katalog_naprawy_jest_zawsze_pod_baza() {
         // Żadna kombinacja nie może wyprowadzić zapisu poza przestrzeń roboczą.
-        let baza = tempdir().unwrap();
+        let baza = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         for rel in ["a.jpg", "kat/a.jpg", "gleboko/bardzo/gleboko/a.jpg"] {
-            let k = katalog_naprawy(baza.path(), "ufs", rel).unwrap();
-            assert!(k.starts_with(baza.path()), "{} wyszło poza bazę: {}", rel, k.display());
+            let k = katalog_naprawy(baza.path(), "ufs", rel)
+                .expect("Nie można utworzyć katalogu tymczasowego dla testu");
+            assert!(
+                k.starts_with(baza.path()),
+                "{} wyszło poza bazę: {}",
+                rel,
+                k.display()
+            );
         }
     }
 
@@ -1018,12 +1286,18 @@ mod tests {
         // Zatruwamy muteks: wątek panikuje trzymając blokadę.
         let stats_w_watku = Arc::clone(&stats);
         let _ = std::thread::spawn(move || {
-            let _guard = stats_w_watku.repairs_by_module.lock().unwrap();
+            let _guard = stats_w_watku
+                .repairs_by_module
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             panic!("celowa panika testowa trzymając blokadę");
         })
         .join();
 
-        assert!(stats.repairs_by_module.is_poisoned(), "Setup testu: muteks MUSI być zatruty");
+        assert!(
+            stats.repairs_by_module.is_poisoned(),
+            "Setup testu: muteks MUSI być zatruty"
+        );
 
         // Mimo zatrucia liczniki muszą być dostępne do czytania i pisania.
         {
@@ -1049,7 +1323,10 @@ mod tests {
         oczekiwane.insert(1, 1u8);
         let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
 
-        assert!(sledzenie.zarejestruj_wynik(1), "Plik z jedną oczekiwaną stroną musi być ukończony po pierwszym wyniku");
+        assert!(
+            sledzenie.zarejestruj_wynik(1),
+            "Plik z jedną oczekiwaną stroną musi być ukończony po pierwszym wyniku"
+        );
     }
 
     #[test]
@@ -1058,8 +1335,14 @@ mod tests {
         oczekiwane.insert(1, 2u8);
         let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
 
-        assert!(!sledzenie.zarejestruj_wynik(1), "Po pierwszej z dwóch stron plik NIE MOŻE być oznaczony jako ukończony");
-        assert!(sledzenie.zarejestruj_wynik(1), "Po drugiej z dwóch stron plik musi być ukończony");
+        assert!(
+            !sledzenie.zarejestruj_wynik(1),
+            "Po pierwszej z dwóch stron plik NIE MOŻE być oznaczony jako ukończony"
+        );
+        assert!(
+            sledzenie.zarejestruj_wynik(1),
+            "Po drugiej z dwóch stron plik musi być ukończony"
+        );
     }
 
     #[test]
@@ -1070,8 +1353,14 @@ mod tests {
         let mut sledzenie = SledzenieUkonczenia::new(oczekiwane);
 
         assert!(!sledzenie.zarejestruj_wynik(1));
-        assert!(sledzenie.zarejestruj_wynik(2), "id=2 ma tylko jedną oczekiwaną stronę - musi się ukończyć niezależnie od stanu id=1");
-        assert!(sledzenie.zarejestruj_wynik(1), "id=1 dostaje teraz swój drugi wynik i dopiero teraz się kończy");
+        assert!(
+            sledzenie.zarejestruj_wynik(2),
+            "id=2 ma tylko jedną oczekiwaną stronę - musi się ukończyć niezależnie od stanu id=1"
+        );
+        assert!(
+            sledzenie.zarejestruj_wynik(1),
+            "id=1 dostaje teraz swój drugi wynik i dopiero teraz się kończy"
+        );
     }
 
     /// Brak wpisu w `oczekiwane` (id spoza tego przebiegu) nie może zawiesić
@@ -1091,12 +1380,22 @@ mod tests {
 
     struct PanikujacyWApplitesTo;
     impl RepairModule for PanikujacyWApplitesTo {
-        fn id(&self) -> &'static str { "test_panikujacy" }
-        fn display_name(&self) -> &'static str { "Testowy moduł panikujący (applies_to)" }
+        fn id(&self) -> &'static str {
+            "test_panikujacy"
+        }
+        fn display_name(&self) -> &'static str {
+            "Testowy moduł panikujący (applies_to)"
+        }
         fn applies_to(&self, _ctx: &RepairContext) -> bool {
             panic!("celowa panika testowa w applies_to");
         }
-        fn repair(&self, _source: &Path, _ctx: &RepairContext, _twin: Option<&Path>, _katalog_wyjsciowy: &Path) -> Option<(PathBuf, String)> {
+        fn repair(
+            &self,
+            _source: &Path,
+            _ctx: &RepairContext,
+            _twin: Option<&Path>,
+            _katalog_wyjsciowy: &Path,
+        ) -> Option<(PathBuf, String)> {
             None
         }
         fn verify(&self, _repaired: &Path, _ctx: &RepairContext) -> WynikWeryfikacji {
@@ -1109,10 +1408,22 @@ mod tests {
     /// wywraca się" (co dałoby się osiągnąć też przez ciche zatrzymanie).
     struct ZawszeNaprawiaModul;
     impl RepairModule for ZawszeNaprawiaModul {
-        fn id(&self) -> &'static str { "test_zawsze_naprawia" }
-        fn display_name(&self) -> &'static str { "Testowy moduł, który zawsze naprawia" }
-        fn applies_to(&self, _ctx: &RepairContext) -> bool { true }
-        fn repair(&self, source: &Path, _ctx: &RepairContext, _twin: Option<&Path>, katalog_wyjsciowy: &Path) -> Option<(PathBuf, String)> {
+        fn id(&self) -> &'static str {
+            "test_zawsze_naprawia"
+        }
+        fn display_name(&self) -> &'static str {
+            "Testowy moduł, który zawsze naprawia"
+        }
+        fn applies_to(&self, _ctx: &RepairContext) -> bool {
+            true
+        }
+        fn repair(
+            &self,
+            source: &Path,
+            _ctx: &RepairContext,
+            _twin: Option<&Path>,
+            katalog_wyjsciowy: &Path,
+        ) -> Option<(PathBuf, String)> {
             let nazwa = source.file_name()?;
             let cel = katalog_wyjsciowy.join(nazwa);
             std::fs::write(&cel, b"naprawiono").ok()?;
@@ -1125,19 +1436,29 @@ mod tests {
 
     #[test]
     fn test_process_repair_stream_przezywa_panike_w_applies_to_i_probuje_kolejny_modul() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let repair = tempdir().unwrap();
-        std::fs::write(ufs.path().join("a.bin"), b"cokolwiek").unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let repair = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(ufs.path().join("a.bin"), b"cokolwiek")
+            .expect("Nie można zapisać danych do pliku");
 
         let panikujacy = PanikujacyWApplitesTo;
         let naprawiajacy = ZawszeNaprawiaModul;
         let active_modules: Vec<&dyn RepairModule> = vec![&panikujacy, &naprawiajacy];
 
         let task = RepairTask {
-            id: 1, rel_path: "a.bin".to_string(), side: "ufs", ext: "bin".to_string(),
-            media_reason: None, utf8_ok: None, is_oneliner: None, eof_ok: None,
-            match_type: None, twin_path: None, video_ok: None, structure_ok: None,
+            id: 1,
+            rel_path: "a.bin".to_string(),
+            side: "ufs",
+            ext: "bin".to_string(),
+            media_reason: None,
+            utf8_ok: None,
+            is_oneliner: None,
+            eof_ok: None,
+            match_type: None,
+            twin_path: None,
+            video_ok: None,
+            structure_ok: None,
             media_decoded: None,
         };
         let tasks = vec![task];
@@ -1145,19 +1466,42 @@ mod tests {
         let stats = LiveStats::new(1);
         let (tx_db, rx_db) = mpsc::sync_channel(10);
         let (tx_ui, _rx_ui) = mpsc::channel();
-        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let opr_log = Arc::new(Mutex::new(
+            tempfile::tempfile().expect("Nie można utworzyć pliku tymczasowego dla logów"),
+        ));
 
         process_repair_stream(RepairCtx {
-            ufs_base: ufs.path(), script_base: script.path(), repair_base: repair.path(),
-            active_modules: &active_modules, tasks: &tasks, stats: &stats,
-            tx_db, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log: opr_log.clone(),
+            ufs_base: ufs.path(),
+            script_base: script.path(),
+            repair_base: repair.path(),
+            active_modules: &active_modules,
+            tasks: &tasks,
+            stats: &stats,
+            tx_db,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            start_time: Instant::now(),
+            opr_log: opr_log.clone(),
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
-        let ScanMsg::Chunk(wyniki) = rx_db.recv().expect("wątek naprawy musiał wysłać wynik, nie spanikować");
+        let ScanMsg::Chunk(wyniki) = rx_db
+            .recv()
+            .expect("wątek naprawy musiał wysłać wynik, nie spanikować");
         assert_eq!(wyniki.len(), 1);
-        assert!(wyniki[0].repaired_path.is_some(), "Moduł panikujący w applies_to nie może zablokować kolejnego, sprawnego modułu");
-        assert_eq!(stats.liczniki().get("test_zawsze_naprawia").copied(), Some(1));
-        assert_eq!(stats.liczniki().get("test_panikujacy"), None, "Panikujący moduł nie mógł zostać policzony jako ten, który naprawił plik");
+        assert!(
+            wyniki[0].repaired_path.is_some(),
+            "Moduł panikujący w applies_to nie może zablokować kolejnego, sprawnego modułu"
+        );
+        assert_eq!(
+            stats.liczniki().get("test_zawsze_naprawia").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            stats.liczniki().get("test_panikujacy"),
+            None,
+            "Panikujący moduł nie mógł zostać policzony jako ten, który naprawił plik"
+        );
     }
 
     #[test]
@@ -1165,7 +1509,10 @@ mod tests {
         // Faza 18 używa `_smart_splice_repaired`, narzędzie DNG
         // `_dng_structural_review` - podkatalogi przestrzeni roboczej zaczynają
         // się od podkreślenia, żeby nie mieszały się z odzyskaną treścią.
-        assert!(KATALOG_NAPRAW.starts_with('_'), "Katalog techniczny powinien zaczynać się od podkreślenia");
+        assert!(
+            KATALOG_NAPRAW.starts_with('_'),
+            "Katalog techniczny powinien zaczynać się od podkreślenia"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1203,32 +1550,39 @@ mod tests {
     /// w `phase9.rs`).
     #[test]
     fn test_run_odmawia_gdy_target_path_jest_wewnatrz_korpusu() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let logi = tempdir().unwrap();
-        std::fs::write(ufs.path().join("brudny.txt"), b"tekst\x00z zerem").unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let logi = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(ufs.path().join("brudny.txt"), b"tekst\x00z zerem")
+            .expect("Nie można zapisać danych do pliku");
 
         // target_path == ufs_path - dokładnie scenariusz błędnej konfiguracji operatora.
         let config = konfiguracja_testowa(ufs.path(), script.path(), ufs.path(), logi.path());
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, utf8_ok_ufs)
              VALUES ('brudny.txt', 1, 0, 0)",
             [],
-        ).unwrap();
+        )
+        .expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui, all_module_ids()).expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
+        run(&mut conn, &config, tx_ui, all_module_ids())
+            .expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
 
-        assert!(!ufs.path().join(KATALOG_NAPRAW).exists(), "katalog roboczy napraw NIE MOŻE powstać wewnątrz korpusu źródłowego");
+        assert!(
+            !ufs.path().join(KATALOG_NAPRAW).exists(),
+            "katalog roboczy napraw NIE MOŻE powstać wewnątrz korpusu źródłowego"
+        );
     }
 
     #[test]
     fn test_przebieg_oznacza_phase17_done_i_zapisuje_poza_korpus() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        let logi = tempdir().unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let target = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let logi = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         // JPEG bez sygnatury SOI - moduł `header_jpg` wstrzyknie nagłówek.
         // Treść to prawdziwy, minimalny obraz, żeby przeszedł OBOWIĄZKOWĄ
@@ -1237,73 +1591,129 @@ mod tests {
         let mut jpeg = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(obraz)
             .write_to(&mut jpeg, image::ImageFormat::Jpeg)
-            .unwrap();
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let jpeg = jpeg.into_inner();
         // Obcinamy dwubajtowy znacznik SOI - dokładnie ta anomalia, którą
         // moduł naprawia (wstrzyknięcie SOI/JFIF przed resztą danych).
-        std::fs::create_dir_all(ufs.path().join("foto")).unwrap();
-        std::fs::write(ufs.path().join("foto/bez_soi.jpg"), &jpeg[2..]).unwrap();
+        std::fs::create_dir_all(ufs.path().join("foto"))
+            .expect("Nie można utworzyć katalogów nadrzędnych");
+        std::fs::write(ufs.path().join("foto/bez_soi.jpg"), &jpeg[2..])
+            .expect("Nie można zapisać danych do pliku");
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, media_reason_ufs)
              VALUES ('foto/bez_soi.jpg', 1, 0, 'Zniszczony Nagłówek obrazu')",
             [],
-        ).unwrap();
+        )
+        .expect("Inicjalizacja bazy danych nie powiodła się");
 
         let config = konfiguracja_testowa(ufs.path(), script.path(), target.path(), logi.path());
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui, all_module_ids()).expect("Faza 17 powinna zakończyć się bez błędu");
+        run(&mut conn, &config, tx_ui, all_module_ids())
+            .expect("Faza 17 powinna zakończyć się bez błędu");
 
         // 1. Flaga ukończenia ustawiona.
-        let done: i64 = conn.query_row("SELECT phase17_done FROM files WHERE relative_path = 'foto/bez_soi.jpg'", [], |r| r.get(0)).unwrap();
-        assert_eq!(done, 1, "phase17_done musi zostać ustawione dla przetworzonego pliku");
+        let done: i64 = conn
+            .query_row(
+                "SELECT phase17_done FROM files WHERE relative_path = 'foto/bez_soi.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Inicjalizacja bazy danych nie powiodła się");
+        assert_eq!(
+            done, 1,
+            "phase17_done musi zostać ustawione dla przetworzonego pliku"
+        );
 
         // 2. Naprawa zapisana ze ścieżką ABSOLUTNĄ w przestrzeni roboczej.
-        let sciezka: String = conn.query_row("SELECT repaired_path_ufs FROM files WHERE relative_path = 'foto/bez_soi.jpg'", [], |r| r.get(0))
+        let sciezka: String = conn
+            .query_row(
+                "SELECT repaired_path_ufs FROM files WHERE relative_path = 'foto/bez_soi.jpg'",
+                [],
+                |r| r.get(0),
+            )
             .expect("naprawa powinna zostać zapisana");
-        assert!(Path::new(&sciezka).is_absolute(), "ścieżka naprawy musi być absolutna: {}", sciezka);
-        assert!(sciezka.contains(KATALOG_NAPRAW), "naprawa musi leżeć w przestrzeni roboczej: {}", sciezka);
-        assert!(Path::new(&sciezka).exists(), "naprawiony plik musi istnieć na dysku");
+        assert!(
+            Path::new(&sciezka).is_absolute(),
+            "ścieżka naprawy musi być absolutna: {}",
+            sciezka
+        );
+        assert!(
+            sciezka.contains(KATALOG_NAPRAW),
+            "naprawa musi leżeć w przestrzeni roboczej: {}",
+            sciezka
+        );
+        assert!(
+            Path::new(&sciezka).exists(),
+            "naprawiony plik musi istnieć na dysku"
+        );
 
         // 3. Odwzorowana struktura katalogów i podział per strona.
-        assert!(sciezka.contains("ufs"), "brak podziału per strona: {}", sciezka);
-        assert!(sciezka.contains("foto"), "brak odwzorowania katalogów: {}", sciezka);
+        assert!(
+            sciezka.contains("ufs"),
+            "brak podziału per strona: {}",
+            sciezka
+        );
+        assert!(
+            sciezka.contains("foto"),
+            "brak odwzorowania katalogów: {}",
+            sciezka
+        );
 
         // 4. KORPUS ŹRÓDŁOWY NIETKNIĘTY - żadnego pliku `_repaired` obok oryginału.
-        let w_korpusie: Vec<String> = std::fs::read_dir(ufs.path().join("foto")).unwrap()
+        let w_korpusie: Vec<String> = std::fs::read_dir(ufs.path().join("foto"))
+            .expect("Nie można odczytać pliku")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(w_korpusie, vec!["bez_soi.jpg".to_string()], "Korpus musi zostać nietknięty, znalazłem: {:?}", w_korpusie);
+        assert_eq!(
+            w_korpusie,
+            vec!["bez_soi.jpg".to_string()],
+            "Korpus musi zostać nietknięty, znalazłem: {:?}",
+            w_korpusie
+        );
     }
 
     #[test]
     fn test_powtorny_przebieg_pomija_pliki_juz_przetworzone() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        let logi = tempdir().unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let target = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let logi = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
-        std::fs::write(ufs.path().join("brudny.txt"), b"tekst\x00z zerem").unwrap();
+        std::fs::write(ufs.path().join("brudny.txt"), b"tekst\x00z zerem")
+            .expect("Nie można zapisać danych do pliku");
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, utf8_ok_ufs, phase17_done)
              VALUES ('brudny.txt', 1, 0, 0, 1)",
             [],
-        ).unwrap();
+        ).expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         let config = konfiguracja_testowa(ufs.path(), script.path(), target.path(), logi.path());
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui, all_module_ids()).expect("Faza 17 powinna zakończyć się bez błędu");
+        run(&mut conn, &config, tx_ui, all_module_ids())
+            .expect("Faza 17 powinna zakończyć się bez błędu");
 
         // Plik był już oznaczony jako przetworzony, więc nie powstało zadanie
         // i nic się nie naprawiło — to jest sedno wznawialności.
-        let naprawa: Option<String> = conn.query_row("SELECT repaired_path_ufs FROM files WHERE relative_path = 'brudny.txt'", [], |r| r.get(0)).unwrap();
-        assert!(naprawa.is_none(), "Plik z phase17_done = 1 nie może zostać przetworzony ponownie");
+        let naprawa: Option<String> = conn
+            .query_row(
+                "SELECT repaired_path_ufs FROM files WHERE relative_path = 'brudny.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Procedura naprawy pliku wideo nie powiodła się");
+        assert!(
+            naprawa.is_none(),
+            "Plik z phase17_done = 1 nie może zostać przetworzony ponownie"
+        );
     }
 
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
@@ -1324,5 +1734,4 @@ mod tests {
 
         assert_eq!(line, "Wątki naprawy (Wariant A): {R:1} {G:2}");
     }
-
 }

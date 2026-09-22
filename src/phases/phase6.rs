@@ -31,17 +31,17 @@
 //! naprawiony tym samym mechanizmem co Fazy 2-5.
 
 use crate::settings::Ustawienia;
-use crate::tui::state::PhaseEvent; // <--- NAPRAWIONY IMPORT
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::tui::state::PhaseEvent;
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
@@ -98,7 +98,7 @@ pub(crate) struct LiveStats {
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
-    
+
     /// Ucięte znaczniki EOF w plikach WSPÓLNYCH (obecnych po obu stronach).
     eof_common: AtomicUsize,
     /// Ucięte znaczniki EOF w plikach UNIKALNYCH (obecnych tylko po tej stronie).
@@ -173,7 +173,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (UFS albo Skrypt) —
@@ -188,43 +192,93 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
 
     let top_eof_ext = {
-        let map = stats.eof_by_ext.lock().unwrap();
+        let map = stats.eof_by_ext.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, c)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, c)
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, c)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, c)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_eof_ext = if top_eof_ext.is_empty() { "brak".to_string() } else { top_eof_ext };
+
+    let display_eof_ext = if top_eof_ext.is_empty() {
+        "brak".to_string()
+    } else {
+        top_eof_ext
+    };
 
     let analyzed = stats.analyzed_ok.load(Ordering::Relaxed);
-    let avg_zeros_pct = if analyzed > 0 { *stats.zeros_pct_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
-    let avg_ffs_pct = if analyzed > 0 { *stats.ffs_pct_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let avg_zeros_pct = if analyzed > 0 {
+        *stats
+            .zeros_pct_sum
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            / analyzed as f64
+    } else {
+        0.0
+    };
+    let avg_ffs_pct = if analyzed > 0 {
+        *stats.ffs_pct_sum.lock().unwrap_or_else(|e| e.into_inner()) / analyzed as f64
+    } else {
+        0.0
+    };
+
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nWydmuszki HDD (zera): {} wspólne / {} unikalne\nWydmuszki SSD (TRIM/0xFF): {} wspólne / {} unikalne\nCzęściowa wydmuszka (50-99%): {} wspólne / {} unikalne\nPuste pliki (0 B): {} wspólne / {} unikalne\nUcięte EOF: {} wspólne / {} unikalne\nTop formaty uciętego EOF: {}\nŚredni % zer w próbce: {:.1}%\nŚredni % 0xFF w próbce: {:.1}%\nWątki analizy (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb, display_ext,
-        stats.zero_common.load(Ordering::Relaxed), stats.zero_unique.load(Ordering::Relaxed),
-        stats.ffs_common.load(Ordering::Relaxed), stats.ffs_unique.load(Ordering::Relaxed),
-        stats.partial_wydmuszka_common.load(Ordering::Relaxed), stats.partial_wydmuszka_unique.load(Ordering::Relaxed),
-        stats.empty_files_common.load(Ordering::Relaxed), stats.empty_files_unique.load(Ordering::Relaxed),
-        stats.eof_common.load(Ordering::Relaxed), stats.eof_unique.load(Ordering::Relaxed),
+        label,
+        speed_mb,
+        display_ext,
+        stats.zero_common.load(Ordering::Relaxed),
+        stats.zero_unique.load(Ordering::Relaxed),
+        stats.ffs_common.load(Ordering::Relaxed),
+        stats.ffs_unique.load(Ordering::Relaxed),
+        stats.partial_wydmuszka_common.load(Ordering::Relaxed),
+        stats.partial_wydmuszka_unique.load(Ordering::Relaxed),
+        stats.empty_files_common.load(Ordering::Relaxed),
+        stats.empty_files_unique.load(Ordering::Relaxed),
+        stats.eof_common.load(Ordering::Relaxed),
+        stats.eof_unique.load(Ordering::Relaxed),
         display_eof_ext,
-        avg_zeros_pct, avg_ffs_pct,
+        avg_zeros_pct,
+        avg_ffs_pct,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -251,17 +305,24 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
 /// Dla formatów bez zdefiniowanej reguły `eof_ok` pozostaje `None` (nie dotyczy,
 /// nie błąd). Plik o rozmiarze 0 zwraca `eof_ok: Some(false)` — pusty plik nigdy
 /// nie ma poprawnego znacznika końca, niezależnie od rozszerzenia.
-fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnalysis, std::io::Error> {
+fn analyze_file(
+    path: &Path,
+    rel_path: &str,
+) -> std::result::Result<AdvancedAnalysis, std::io::Error> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
 
     if file_len == 0 {
-        return Ok(AdvancedAnalysis { zeros_pct: 0.0, ffs_pct: 0.0, eof_ok: Some(false) });
+        return Ok(AdvancedAnalysis {
+            zeros_pct: 0.0,
+            ffs_pct: 0.0,
+            eof_ok: Some(false),
+        });
     }
 
     let mut zeros_count: u64 = 0;
     let mut ffs_count: u64 = 0;
-    let mut buffer = [0u8; 131_072]; 
+    let mut buffer = [0u8; 131_072];
 
     loop {
         // REGRESJA (Gemini review — druga weryfikacja): wcześniej `break` przy
@@ -274,10 +335,15 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
         // `Err(Interrupted)` — wywołujący (`process_side_stream`) rozróżnia to
         // od prawdziwego błędu I/O i NIE zapisuje żadnego wyniku do bazy.
         if CANCEL_SIGNAL.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Przerwano przez użytkownika"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Przerwano przez użytkownika",
+            ));
         }
         let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let chunk = &buffer[..n];
         zeros_count += chunk.iter().filter(|&&b| b == 0x00).count() as u64;
         ffs_count += chunk.iter().filter(|&&b| b == 0xFF).count() as u64;
@@ -287,40 +353,70 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
     let ffs_pct = (ffs_count as f64 / file_len as f64) * 100.0;
 
     let mut eof_ok = None;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     if matches!(ext.as_str(), "jpg" | "jpeg") {
         if file_len >= 2 {
             let mut tail = [0u8; 2];
             if file.seek(SeekFrom::End(-2)).is_ok() && file.read_exact(&mut tail).is_ok() {
-                eof_ok = Some(tail == [0xFF, 0xD9]); 
-            } else { eof_ok = Some(false); }
-        } else { eof_ok = Some(false); }
+                eof_ok = Some(tail == [0xFF, 0xD9]);
+            } else {
+                eof_ok = Some(false);
+            }
+        } else {
+            eof_ok = Some(false);
+        }
     } else if ext == "pdf" {
         let read_len = std::cmp::min(file_len, 1024) as i64;
         let mut tail = vec![0u8; read_len as usize];
         if file.seek(SeekFrom::End(-read_len)).is_ok() && file.read_exact(&mut tail).is_ok() {
             let tail_str = String::from_utf8_lossy(&tail);
-            eof_ok = Some(tail_str.contains("%%EOF") && pdf_xref_wyglada_na_spojny(&mut file, file_len, &tail_str));
-        } else { eof_ok = Some(false); }
+            eof_ok = Some(
+                tail_str.contains("%%EOF")
+                    && pdf_xref_wyglada_na_spojny(&mut file, file_len, &tail_str),
+            );
+        } else {
+            eof_ok = Some(false);
+        }
     } else if ext == "png" {
         if file_len >= 12 {
             let mut tail = [0u8; 12];
             if file.seek(SeekFrom::End(-12)).is_ok() && file.read_exact(&mut tail).is_ok() {
-                eof_ok = Some(tail == [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
-            } else { eof_ok = Some(false); }
-        } else { eof_ok = Some(false); }
-    } else if matches!(ext.as_str(), "zip" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "epub" | "apk" | "jar") {
+                eof_ok = Some(
+                    tail == [
+                        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
+                );
+            } else {
+                eof_ok = Some(false);
+            }
+        } else {
+            eof_ok = Some(false);
+        }
+    } else if matches!(
+        ext.as_str(),
+        "zip" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "epub" | "apk" | "jar"
+    ) {
         let read_len = std::cmp::min(file_len, 65557) as i64;
         let mut tail = vec![0u8; read_len as usize];
         if file.seek(SeekFrom::End(-read_len)).is_ok() && file.read_exact(&mut tail).is_ok() {
             eof_ok = Some(tail.windows(4).any(|w| w == b"\x50\x4B\x05\x06"));
-        } else { eof_ok = Some(false); }
+        } else {
+            eof_ok = Some(false);
+        }
     } else {
         debug!(path = rel_path, ext = %ext, "brak zdefiniowanej reguły EOF");
     }
 
-    Ok(AdvancedAnalysis { zeros_pct, ffs_pct, eof_ok })
+    Ok(AdvancedAnalysis {
+        zeros_pct,
+        ffs_pct,
+        eof_ok,
+    })
 }
 
 /// Sprawdza, czy `startxref` z ogona pliku PDF wskazuje na wiarygodną
@@ -338,10 +434,18 @@ fn analyze_file(path: &Path, rel_path: &str) -> std::result::Result<AdvancedAnal
 /// xref, gdzie sam tekst `%%EOF` przetrwał (np. doklejony z innego miejsca
 /// albo pozostałość po nadpisanym trailerze).
 fn pdf_xref_wyglada_na_spojny(file: &mut File, file_len: u64, tail_str: &str) -> bool {
-    let Some(poz) = tail_str.rfind("startxref") else { return false; };
+    let Some(poz) = tail_str.rfind("startxref") else {
+        return false;
+    };
     let po = &tail_str[poz + "startxref".len()..];
-    let cyfry: String = po.chars().skip_while(|c| c.is_whitespace()).take_while(|c| c.is_ascii_digit()).collect();
-    let Ok(offset) = cyfry.parse::<u64>() else { return false; };
+    let cyfry: String = po
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let Ok(offset) = cyfry.parse::<u64>() else {
+        return false;
+    };
     if offset >= file_len {
         return false;
     }
@@ -359,8 +463,10 @@ fn pdf_xref_wyglada_na_spojny(file: &mut File, file_len: u64, tail_str: &str) ->
     let tekst = String::from_utf8_lossy(&okno);
     let slowa: Vec<&str> = tekst.split_whitespace().take(3).collect();
     let wyglada_na_naglowek_obiektu = slowa.len() == 3
-        && !slowa[0].is_empty() && slowa[0].chars().all(|c| c.is_ascii_digit())
-        && !slowa[1].is_empty() && slowa[1].chars().all(|c| c.is_ascii_digit())
+        && !slowa[0].is_empty()
+        && slowa[0].chars().all(|c| c.is_ascii_digit())
+        && !slowa[1].is_empty()
+        && slowa[1].chars().all(|c| c.is_ascii_digit())
         && slowa[2] == "obj";
 
     wyglada_na_naglowek_obiektu && tekst.contains("/XRef")
@@ -382,12 +488,26 @@ pub struct StreamCtx<'a> {
     pub bar_idx: usize,
     pub start_time: Instant,
     pub opr_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, start_time, opr_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        start_time,
+        opr_log,
+        debug_log,
+    } = ctx;
+    let metoda = "analyze_file (zera/FF, EOF)";
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -405,6 +525,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             
             *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size;
 
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (analysis_opt, io_err) = match stats.thread_activity.track_current(|| analyze_file(&full_path, &task.rel_path)) {
                 Ok(a) => {
                     let mut anomalies = Vec::new();
@@ -432,6 +561,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     // ścieżka `analyze_file` zwraca dla obu `eof_ok = Some(false)`,
                     // więc rozstrzyga tu file_size (0 B nie może "mieć uciętego
                     // ogona" - nie ma czego ucinać), a nie sam wynik eof_ok.
+
                     if file_size == 0 {
                         anomalies.push("Plik pusty (0 B)");
                         if task.is_common { stats.empty_files_common.fetch_add(1, Ordering::Relaxed); }
@@ -440,11 +570,11 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         anomalies.push("Ucięty Ogon (Brak znacznika EOF/EOCD)");
                         if task.is_common { stats.eof_common.fetch_add(1, Ordering::Relaxed); }
                         else { stats.eof_unique.fetch_add(1, Ordering::Relaxed); }
-                        *stats.eof_by_ext.lock().unwrap().entry(ext.clone()).or_insert(0) += 1;
+                        *stats.eof_by_ext.lock().unwrap_or_else(|e| e.into_inner()).entry(ext.clone()).or_insert(0) += 1;
                     }
 
-                    *stats.zeros_pct_sum.lock().unwrap() += a.zeros_pct;
-                    *stats.ffs_pct_sum.lock().unwrap() += a.ffs_pct;
+                    *stats.zeros_pct_sum.lock().unwrap_or_else(|e| e.into_inner()) += a.zeros_pct;
+                    *stats.ffs_pct_sum.lock().unwrap_or_else(|e| e.into_inner()) += a.ffs_pct;
                     stats.analyzed_ok.fetch_add(1, Ordering::Relaxed);
 
                     if !anomalies.is_empty()
@@ -478,6 +608,27 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     (None, Some(true))
                 }
             };
+            let wynik = if io_err == Some(true) {
+                "BŁĄD I/O".to_string()
+            } else if io_err.is_none() {
+                "PRZERWANO".to_string()
+            } else {
+                match &analysis_opt {
+                    Some(a) if a.eof_ok != Some(false) => "OK".to_string(),
+                    Some(_) => "BŁĄD: Ucięty Ogon (Brak EOF)".to_string(),
+                    None => "BŁĄD: Nieznany błąd".to_string(),
+                }
+            };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
 
             let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
             stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
@@ -497,7 +648,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now; 
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
 
@@ -509,7 +660,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 });
                 let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                     idx: bar_idx,
-                    path: full_path.to_string_lossy().to_string(),
+                    path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                 });
 
                 // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -527,7 +678,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
 
@@ -559,20 +710,39 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 /// wyniki w SQLite; (4) generuje Dziennik Końcowy (rozkład wydmuszek i uciętych
 /// EOF, osobno dla plików wspólnych i unikalnych) do pliku i do UI.
 #[instrument(skip(conn, config, tx_ui), fields(ufs_path = %config.ufs_path, script_path = %config.script_path))]
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     crate::utils::CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // 1. INICJALIZACJA DUAL-LOGGING
-    let raport_cfg = config.raporty_faz.get("Faza 6").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza6.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza6.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 6")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza6.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza6.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza6.txt", &stamp),
+        &config.log_level,
+    );
+
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -580,23 +750,50 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
+
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 6 (ANALIZA ZAWARTOŚCI I EOF) ===");
-        let _ = writeln!(f, "Zestawienie plików uszkodzonych strukturalnie, zgrupowane na Pule Wspólne i Unikalne.");
-        let _ = writeln!(f, "Uwzględnia: Puste pliki (Zera/HDD), Wydmuszki po TRIM (FF/SSD) oraz brak znaczników końca pliku.\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 6 (ANALIZA ZAWARTOŚCI I EOF) ==="
+        );
+        let _ = writeln!(
+            f,
+            "Zestawienie plików uszkodzonych strukturalnie, zgrupowane na Pule Wspólne i Unikalne."
+        );
+        let _ = writeln!(
+            f,
+            "Uwzględnia: Puste pliki (Zera/HDD), Wydmuszki po TRIM (FF/SSD) oraz brak znaczników końca pliku.\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 6. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 6. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -606,7 +803,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT id, relative_path, found_in_ufs, found_in_script, zeros_pct_ufs, zeros_pct_script, io_error_ufs, io_error_script 
          FROM files WHERE phase6_done = 0 OR phase6_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped_ufs = 0;
@@ -614,28 +811,40 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, 
-            row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<f64>>(4)?, row.get::<_, Option<f64>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, Option<f64>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, z_ufs, z_scr, err_ufs, err_scr) = r;
         let is_common = in_ufs && in_script;
-        
+
         if in_ufs {
-            if z_ufs.is_none() && err_ufs != Some(true) { 
-                ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); 
+            if z_ufs.is_none() && err_ufs != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                    is_common,
+                });
             } else {
                 skipped_ufs += 1;
             }
         }
-        
+
         if in_script {
-            if z_scr.is_none() && err_scr != Some(true) { 
-                script_tasks.push(Task { id, rel_path: rel, is_common }); 
+            if z_scr.is_none() && err_scr != Some(true) {
+                script_tasks.push(Task {
+                    id,
+                    rel_path: rel,
+                    is_common,
+                });
             } else {
                 skipped_script += 1;
             }
@@ -644,19 +853,40 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto już zbadane pliki. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto już zbadane pliki. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających inspekcji strukturalnej. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Analiza zawartości jest kompletna. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Pozwala to skryptowi wejść
+        // w Etap 4 i odznaczyć zablokowane pliki!
     }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Skan Wnętrza)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Skan Wnętrza)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Skan Wnętrza)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Skan Wnętrza)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = std::cmp::max(1, actual_threads / 2);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -748,8 +978,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let log_u = opr_log.clone(); let log_s = opr_log.clone();
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let log_u = opr_log.clone();
+            let log_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             // Referencje (nie własność) - ufs_stats/script_stats są odczytywane
             // ponownie PO zakończeniu tego bloku (raport końcowy), więc domknięcia
@@ -764,39 +998,128 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: Path::new(&config.ufs_path), tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, opr_log: log_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: Path::new(&config.ufs_path),
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                start_time,
+                                opr_log: log_u,
+                                debug_log: dbg_u.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: Path::new(&config.ufs_path), tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, opr_log: log_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: Path::new(&config.ufs_path),
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            start_time,
+                            opr_log: log_u,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza ciał plików (UFS) zakończona.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Analiza ciał plików (UFS) zakończona.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
                 if !script_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: Path::new(&config.script_path), tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, opr_log: log_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: Path::new(&config.script_path),
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                start_time,
+                                opr_log: log_s,
+                                debug_log: dbg_s.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: Path::new(&config.script_path), tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, opr_log: log_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: Path::new(&config.script_path),
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            start_time,
+                            opr_log: log_s,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza ciał plików (Skrypt) zakończona.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Analiza ciał plików (Skrypt) zakończona.".to_string(),
+                    ));
                 }
             });
-            drop(tx_db); 
+            drop(tx_db);
         } else {
-            let log_u = opr_log.clone(); let log_s = opr_log.clone();
+            let log_u = opr_log.clone();
+            let log_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: Path::new(&config.ufs_path), tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, opr_log: log_u, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza ciał plików (UFS) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: Path::new(&config.ufs_path),
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    start_time,
+                    opr_log: log_u,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Analiza ciał plików (UFS) zakończona.".to_string(),
+                ));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: Path::new(&config.script_path), tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, opr_log: log_s, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza ciał plików (Skrypt) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: Path::new(&config.script_path),
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    start_time,
+                    opr_log: log_s,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Analiza ciał plików (Skrypt) zakończona.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -819,12 +1142,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa wiązanie macierzy w bazie SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa wiązanie macierzy w bazie SQLite...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET phase6_done = CASE 
             WHEN (found_in_ufs = 0 OR zeros_pct_ufs IS NOT NULL OR io_error_ufs = 1) 
@@ -839,122 +1166,277 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
          FROM files WHERE phase6_done = 1"
     )?;
 
-    let mut ufs_z_com = 0; let mut ufs_z_uni = 0;
-    let mut scr_z_com = 0; let mut scr_z_uni = 0;
-    
-    let mut ufs_e_com = 0; let mut ufs_e_uni = 0;
-    let mut scr_e_com = 0; let mut scr_e_uni = 0;
+    let mut ufs_z_com = 0;
+    let mut ufs_z_uni = 0;
+    let mut scr_z_com = 0;
+    let mut scr_z_uni = 0;
+
+    let mut ufs_e_com = 0;
+    let mut ufs_e_uni = 0;
+    let mut scr_e_com = 0;
+    let mut scr_e_uni = 0;
 
     let mut spoofing_matrix_ufs: HashMap<String, Vec<String>> = HashMap::new();
     let mut spoofing_matrix_script: HashMap<String, Vec<String>> = HashMap::new();
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<f64>>(3)?, row.get::<_, Option<f64>>(4)?,
-            row.get::<_, Option<bool>>(5)?, row.get::<_, Option<bool>>(6)?
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (rel_path, in_ufs, in_scr, z_ufs, z_scr, e_ufs, e_scr) = r;
         let is_common = in_ufs && in_scr;
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
 
         if in_ufs {
-            if let Some(z) = z_ufs && z > 99.0 { if is_common { ufs_z_com += 1; } else { ufs_z_uni += 1; } }
-            if e_ufs == Some(false) { 
-                if is_common { ufs_e_com += 1; } else { ufs_e_uni += 1; } 
-                spoofing_matrix_ufs.entry(ext.clone()).or_default().push(rel_path.clone());
+            if let Some(z) = z_ufs
+                && z > 99.0
+            {
+                if is_common {
+                    ufs_z_com += 1;
+                } else {
+                    ufs_z_uni += 1;
+                }
+            }
+            if e_ufs == Some(false) {
+                if is_common {
+                    ufs_e_com += 1;
+                } else {
+                    ufs_e_uni += 1;
+                }
+                spoofing_matrix_ufs
+                    .entry(ext.clone())
+                    .or_default()
+                    .push(rel_path.clone());
             }
         }
 
         if in_scr {
-            if let Some(z) = z_scr && z > 99.0 { if is_common { scr_z_com += 1; } else { scr_z_uni += 1; } }
-            if e_scr == Some(false) { 
-                if is_common { scr_e_com += 1; } else { scr_e_uni += 1; } 
-                spoofing_matrix_script.entry(ext.clone()).or_default().push(rel_path);
+            if let Some(z) = z_scr
+                && z > 99.0
+            {
+                if is_common {
+                    scr_z_com += 1;
+                } else {
+                    scr_z_uni += 1;
+                }
+            }
+            if e_scr == Some(false) {
+                if is_common {
+                    scr_e_com += 1;
+                } else {
+                    scr_e_uni += 1;
+                }
+                spoofing_matrix_script
+                    .entry(ext.clone())
+                    .or_default()
+                    .push(rel_path);
             }
         }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 6 (ANALIZA ZAWARTOŚCI I ZNACZNIKÓW EOF)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 6 (ANALIZA ZAWARTOŚCI I ZNACZNIKÓW EOF)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
     if ufs_z_com > 0 || ufs_z_uni > 0 || scr_z_com > 0 || scr_z_uni > 0 {
-        let _ = writeln!(&mut log_out, "[ 1 ] ANALIZA WYDMUSZEK (Puste pliki HDD i SSD):");
-        let _ = writeln!(&mut log_out, "   -> UFS Explorer:    {} (Pula Wspólna), {} (Pula Unikalna)", ufs_z_com, ufs_z_uni);
-        let _ = writeln!(&mut log_out, "   -> Skrypt Autorski: {} (Pula Wspólna), {} (Pula Unikalna)", scr_z_com, scr_z_uni);
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Plik jest widoczny na dysku, zachował oryginalną nazwę i rozmiar,");
-        let _ = writeln!(&mut log_out, "      ale wewnątrz nie posiada żadnych danych użytkownika.");
-        let _ = writeln!(&mut log_out, "      * Wydmuszka HDD (Zera) powstaje przy uszkodzonej alokacji przestrzeni.");
-        let _ = writeln!(&mut log_out, "      * Wydmuszka SSD (Bloki 0xFF) to efekt zadziałania komendy TRIM po usunięciu pliku.\n");
+        let _ = writeln!(
+            &mut log_out,
+            "[ 1 ] ANALIZA WYDMUSZEK (Puste pliki HDD i SSD):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> UFS Explorer:    {} (Pula Wspólna), {} (Pula Unikalna)",
+            ufs_z_com, ufs_z_uni
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Skrypt Autorski: {} (Pula Wspólna), {} (Pula Unikalna)",
+            scr_z_com, scr_z_uni
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Plik jest widoczny na dysku, zachował oryginalną nazwę i rozmiar,"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      ale wewnątrz nie posiada żadnych danych użytkownika."
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      * Wydmuszka HDD (Zera) powstaje przy uszkodzonej alokacji przestrzeni."
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      * Wydmuszka SSD (Bloki 0xFF) to efekt zadziałania komendy TRIM po usunięciu pliku.\n"
+        );
     } else {
-        let _ = writeln!(&mut log_out, "[ 1 ] ANALIZA WYDMUSZEK: ✔ Brak. Pliki zawierają prawdziwe dane.\n");
+        let _ = writeln!(
+            &mut log_out,
+            "[ 1 ] ANALIZA WYDMUSZEK: ✔ Brak. Pliki zawierają prawdziwe dane.\n"
+        );
     }
 
     if ufs_e_com > 0 || ufs_e_uni > 0 || scr_e_com > 0 || scr_e_uni > 0 {
-        let _ = writeln!(&mut log_out, "[ 2 ] ANALIZA ZNACZNIKÓW KOŃCA PLIKU (Brak ogona EOF / EOCD):");
-        let _ = writeln!(&mut log_out, "   -> UFS Explorer:    {} (Pula Wspólna), {} (Pula Unikalna)", ufs_e_com, ufs_e_uni);
-        let _ = writeln!(&mut log_out, "   -> Skrypt Autorski: {} (Pula Wspólna), {} (Pula Unikalna)", scr_e_com, scr_e_uni);
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki strukturalne (np. JPG, PDF, ZIP, DOCX) wymagają do poprawnego");
-        let _ = writeln!(&mut log_out, "      działania specjalnego kodu binarnego na samym końcu. Jego brak wskazuje, że plik");
-        let _ = writeln!(&mut log_out, "      jest ucięty (np. zdjęcie załaduje się tylko do połowy).\n");
-        
-        let add_spoof_to_log = |out_str: &mut String, map: &HashMap<String, Vec<String>>, label: &str| {
-            if !map.is_empty() {
-                let _ = writeln!(out_str, "   -> MACIERZ USZKODZEŃ EOF ({})", label);
-                let mut sorted: Vec<_> = map.iter().collect();
-                sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len())); 
-                for (ext, paths) in sorted.into_iter().take(5) {
-                    let _ = writeln!(out_str, "      Rozszerzenie .{:<5} | Liczba: {} | Przykład: {}", ext, paths.len(), paths.first().unwrap_or(&"".to_string()));
+        let _ = writeln!(
+            &mut log_out,
+            "[ 2 ] ANALIZA ZNACZNIKÓW KOŃCA PLIKU (Brak ogona EOF / EOCD):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> UFS Explorer:    {} (Pula Wspólna), {} (Pula Unikalna)",
+            ufs_e_com, ufs_e_uni
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Skrypt Autorski: {} (Pula Wspólna), {} (Pula Unikalna)",
+            scr_e_com, scr_e_uni
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Pliki strukturalne (np. JPG, PDF, ZIP, DOCX) wymagają do poprawnego"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      działania specjalnego kodu binarnego na samym końcu. Jego brak wskazuje, że plik"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      jest ucięty (np. zdjęcie załaduje się tylko do połowy).\n"
+        );
+
+        let add_spoof_to_log =
+            |out_str: &mut String, map: &HashMap<String, Vec<String>>, label: &str| {
+                if !map.is_empty() {
+                    let _ = writeln!(out_str, "   -> MACIERZ USZKODZEŃ EOF ({})", label);
+                    let mut sorted: Vec<_> = map.iter().collect();
+                    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
+                    for (ext, paths) in sorted.into_iter().take(5) {
+                        let _ = writeln!(
+                            out_str,
+                            "      Rozszerzenie .{:<5} | Liczba: {} | Przykład: {}",
+                            ext,
+                            paths.len(),
+                            paths.first().unwrap_or(&"".to_string())
+                        );
+                    }
                 }
-            }
-        };
+            };
         add_spoof_to_log(&mut log_out, &spoofing_matrix_ufs, "UFS Explorer");
         add_spoof_to_log(&mut log_out, &spoofing_matrix_script, "Skrypt Autorski");
     } else {
-        let _ = writeln!(&mut log_out, "[ 2 ] ANALIZA ZNACZNIKÓW EOF: ✔ Brak. Wszystkie obsługiwane pliki posiadają ogony.");
+        let _ = writeln!(
+            &mut log_out,
+            "[ 2 ] ANALIZA ZNACZNIKÓW EOF: ✔ Brak. Wszystkie obsługiwane pliki posiadają ogony."
+        );
     }
 
     // PRZYWRÓCONE: Zestawienie wagowe zeskanowanych formatów (TOP 5)
-    let _ = writeln!(&mut log_out, "\n[ 3 ] WSZYSTKIE PRZESKANOWANE FORMATY (Zestawienie wagowe):");
+    let _ = writeln!(
+        &mut log_out,
+        "\n[ 3 ] WSZYSTKIE PRZESKANOWANE FORMATY (Zestawienie wagowe):"
+    );
     let print_all_exts = |out_str: &mut String, map: &HashMap<String, u64>, label: &str| {
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   [ {} ]", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
 
     if total_io_errors > 0 {
-        let _ = writeln!(&mut log_out, "\n[ 🚨 ] BŁĘDY FIZYCZNE I/O (Brak dostępu / Bad Sectory):");
-        let _ = writeln!(&mut log_out, "   -> Odmowy dostępu na dysku UFS Explorer:        {}", ufs_stats.errors.load(Ordering::SeqCst));
-        let _ = writeln!(&mut log_out, "   -> Odmowy dostępu na dysku Skryptu:             {}", script_stats.errors.load(Ordering::SeqCst));
+        let _ = writeln!(
+            &mut log_out,
+            "\n[ 🚨 ] BŁĘDY FIZYCZNE I/O (Brak dostępu / Bad Sectory):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Odmowy dostępu na dysku UFS Explorer:        {}",
+            ufs_stats.errors.load(Ordering::SeqCst)
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Odmowy dostępu na dysku Skryptu:             {}",
+            script_stats.errors.load(Ordering::SeqCst)
+        );
     }
 
     // Zapis do fizycznego pliku "Dziennik Końcowy" na podstawie konfiguracji Dual-Logging
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -964,7 +1446,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // Zrzut telemetrii do głównego pliku logów w tle
     info!(
-        ufs_z_com, ufs_z_uni, scr_z_com, scr_z_uni,
+        ufs_z_com,
+        ufs_z_uni,
+        scr_z_com,
+        scr_z_uni,
         total_io_errors,
         czas_trwania_sek = elapsed.as_secs_f64(),
         "Faza 6 zakończona"
@@ -1001,10 +1486,14 @@ mod tests {
     /// rozszerzeniem (analyze_file czyta rozszerzenie z realnej ścieżki na
     /// dysku, więc samo NamedTempFile - zwykle bez rozszerzenia - nie wystarczy).
     fn temp_file_with_ext(content: &[u8], ext: &str) -> (NamedTempFile, PathBuf) {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(content).unwrap();
+        let mut temp_file =
+            NamedTempFile::new().expect("Nie można utworzyć tymczasowego pliku dla testu");
+        temp_file
+            .write_all(content)
+            .expect("Zapis danych do pliku nie powiódł się");
         let new_path = temp_file.path().with_extension(ext);
-        std::fs::rename(temp_file.path(), &new_path).unwrap();
+        std::fs::rename(temp_file.path(), &new_path)
+            .expect("Zapis danych do pliku nie powiódł się");
         (temp_file, new_path)
     }
 
@@ -1016,7 +1505,7 @@ mod tests {
     fn test_analyze_file_all_zeros_is_hdd_wydmuszka() {
         let content = vec![0x00u8; 4096];
         let (_guard, path) = temp_file_with_ext(&content, "dat");
-        let result = analyze_file(&path, "test.dat").unwrap();
+        let result = analyze_file(&path, "test.dat").expect("Analiza pliku nie powiodła się");
         assert!(result.zeros_pct > 99.0);
         assert_eq!(result.ffs_pct, 0.0);
     }
@@ -1025,7 +1514,7 @@ mod tests {
     fn test_analyze_file_all_ff_is_ssd_trim_wydmuszka() {
         let content = vec![0xFFu8; 4096];
         let (_guard, path) = temp_file_with_ext(&content, "dat");
-        let result = analyze_file(&path, "test.dat").unwrap();
+        let result = analyze_file(&path, "test.dat").expect("Analiza pliku nie powiodła się");
         assert!(result.ffs_pct > 99.0);
         assert_eq!(result.zeros_pct, 0.0);
     }
@@ -1065,8 +1554,15 @@ mod tests {
     fn test_process_side_stream_przerwanie_w_trakcie_odczytu_nie_jest_bledem_io() {
         let content = vec![0u8; 20_000_000]; // 20 MB - wielokrotność bufora 128 KB
         let (_guard, path) = temp_file_with_ext(&content, "dat");
-        let base_path = path.parent().unwrap().to_path_buf();
-        let rel_path = path.file_name().unwrap().to_string_lossy().to_string();
+        let base_path = path
+            .parent()
+            .expect("Ścieżka nadrzędna powinna być dostępna")
+            .to_path_buf();
+        let rel_path = path
+            .file_name()
+            .expect("Nie można pobrać nazwy pliku")
+            .to_string_lossy()
+            .to_string();
 
         CANCEL_SIGNAL.store(false, Ordering::Relaxed);
         let przelacznik = std::thread::spawn(|| {
@@ -1077,25 +1573,50 @@ mod tests {
         let stats = LiveStats::new(1);
         let (tx_db, rx_db) = mpsc::sync_channel(10);
         let (tx_ui, _rx_ui) = mpsc::channel();
-        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
-        let tasks = vec![Task { id: 1, rel_path, is_common: false }];
+        let opr_log = Arc::new(Mutex::new(
+            tempfile::tempfile().expect("Nie można utworzyć pliku tymczasowego dla logów"),
+        ));
+        let tasks = vec![Task {
+            id: 1,
+            rel_path,
+            is_common: false,
+        }];
 
         process_side_stream(StreamCtx {
-            base_path: &base_path, tasks: &tasks, side_label: "UFS Explorer", stats: &stats,
-            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log,
+            base_path: &base_path,
+            tasks: &tasks,
+            side_label: "UFS Explorer",
+            stats: &stats,
+            tx_db,
+            is_ufs: true,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            start_time: Instant::now(),
+            opr_log,
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
-        przelacznik.join().unwrap();
+        przelacznik
+            .join()
+            .expect("Oczekiwanie na zakończenie wątku nie powiodło się");
         CANCEL_SIGNAL.store(false, Ordering::Relaxed); // sprzątanie - stan globalny
 
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "Anulowanie nie może zwiększać licznika błędów I/O");
+        assert_eq!(
+            stats.errors.load(Ordering::Relaxed),
+            0,
+            "Anulowanie nie może zwiększać licznika błędów I/O"
+        );
 
         // Zadanie mogło albo nie zostać w ogóle wysłane (przerwane na granicy
         // pliku/paczki), albo zostać wysłane z (None, None) - obie sytuacje są
         // poprawne, jedyne co jest ZABRONIONE to io_error=Some(true).
         if let Ok(ScanMsg::UfsChunk(wyniki)) = rx_db.try_recv() {
             for w in wyniki {
-                assert_ne!(w.io_error, Some(true), "Anulowanie NIE MOŻE zapisać trwałego io_error=true - plik nigdy by nie wrócił do kolejki");
+                assert_ne!(
+                    w.io_error,
+                    Some(true),
+                    "Anulowanie NIE MOŻE zapisać trwałego io_error=true - plik nigdy by nie wrócił do kolejki"
+                );
             }
         }
     }
@@ -1104,7 +1625,7 @@ mod tests {
     fn test_analyze_file_mixed_content_no_wydmuszka() {
         let content: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
         let (_guard, path) = temp_file_with_ext(&content, "dat");
-        let result = analyze_file(&path, "test.dat").unwrap();
+        let result = analyze_file(&path, "test.dat").expect("Analiza pliku nie powiodła się");
         assert!(result.zeros_pct < 99.0);
         assert!(result.ffs_pct < 99.0);
     }
@@ -1112,7 +1633,7 @@ mod tests {
     #[test]
     fn test_analyze_file_empty_file_eof_false() {
         let (_guard, path) = temp_file_with_ext(b"", "jpg");
-        let result = analyze_file(&path, "test.jpg").unwrap();
+        let result = analyze_file(&path, "test.jpg").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(false));
         assert_eq!(result.zeros_pct, 0.0);
         assert_eq!(result.ffs_pct, 0.0);
@@ -1128,7 +1649,7 @@ mod tests {
         content.extend(vec![0x41u8; 100]); // wypełniacz
         content.extend_from_slice(&[0xFF, 0xD9]); // poprawny znacznik końca
         let (_guard, path) = temp_file_with_ext(&content, "jpg");
-        let result = analyze_file(&path, "test.jpg").unwrap();
+        let result = analyze_file(&path, "test.jpg").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(true));
     }
 
@@ -1138,7 +1659,7 @@ mod tests {
         content.extend(vec![0x41u8; 100]);
         content.extend_from_slice(&[0x00, 0x00]); // ucięty - brak FF D9
         let (_guard, path) = temp_file_with_ext(&content, "jpg");
-        let result = analyze_file(&path, "test.jpg").unwrap();
+        let result = analyze_file(&path, "test.jpg").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(false));
     }
 
@@ -1147,9 +1668,11 @@ mod tests {
         let mut content = vec![0x89u8, b'P', b'N', b'G'];
         content.extend(vec![0x00u8; 50]);
         // Kanoniczny chunk IEND: długość(0) + "IEND" + CRC
-        content.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]);
         let (_guard, path) = temp_file_with_ext(&content, "png");
-        let result = analyze_file(&path, "test.png").unwrap();
+        let result = analyze_file(&path, "test.png").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(true));
     }
 
@@ -1158,7 +1681,7 @@ mod tests {
         let mut content = vec![0x89u8, b'P', b'N', b'G'];
         content.extend(vec![0x00u8; 60]); // brak poprawnego IEND na końcu
         let (_guard, path) = temp_file_with_ext(&content, "png");
-        let result = analyze_file(&path, "test.png").unwrap();
+        let result = analyze_file(&path, "test.png").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(false));
     }
 
@@ -1173,8 +1696,12 @@ mod tests {
         content.extend(vec![0x41u8; 100]);
         content.extend_from_slice(b"\n%%EOF");
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(false), "%%EOF bez wiarygodnego startxref/xref nie może dawać Some(true)");
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok,
+            Some(false),
+            "%%EOF bez wiarygodnego startxref/xref nie może dawać Some(true)"
+        );
     }
 
     #[test]
@@ -1182,7 +1709,7 @@ mod tests {
         let mut content = b"%PDF-1.4\n".to_vec();
         content.extend(vec![0x41u8; 100]); // brak %%EOF w ogóle
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(false));
     }
 
@@ -1205,8 +1732,12 @@ mod tests {
     fn test_analyze_file_pdf_z_wiarygodnym_xref_klasycznym_przechodzi() {
         let content = zbuduj_pdf_z_klasycznym_xref();
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(true), "startxref wskazuje na prawdziwą tablicę xref - musi przejść");
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok,
+            Some(true),
+            "startxref wskazuje na prawdziwą tablicę xref - musi przejść"
+        );
     }
 
     #[test]
@@ -1216,14 +1747,20 @@ mod tests {
         tresc.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
 
         let xref_offset = tresc.len();
-        tresc.extend_from_slice(b"2 0 obj\n<< /Type /XRef /Size 2 /Filter /FlateDecode /Length 4 >>\nstream\n");
+        tresc.extend_from_slice(
+            b"2 0 obj\n<< /Type /XRef /Size 2 /Filter /FlateDecode /Length 4 >>\nstream\n",
+        );
         tresc.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // tresc strumienia - dowolne bajty, bez dekompresji
         tresc.extend_from_slice(b"\nendstream\nendobj\n");
         tresc.extend_from_slice(format!("startxref\n{}\n%%EOF", xref_offset).as_bytes());
 
         let (_guard, path) = temp_file_with_ext(&tresc, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(true), "startxref wskazuje na obiekt-strumień xref (/XRef) - musi przejść");
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok,
+            Some(true),
+            "startxref wskazuje na obiekt-strumień xref (/XRef) - musi przejść"
+        );
     }
 
     /// Typowe uszkodzenie odzysku: liczba w `startxref` przetrwała (bo leży
@@ -1235,8 +1772,12 @@ mod tests {
         content.extend(vec![0x41u8; 50]);
         content.extend_from_slice(b"\nstartxref\n999999\n%%EOF");
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(false), "startxref poza granicami pliku nie może dawać Some(true)");
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok,
+            Some(false),
+            "startxref poza granicami pliku nie może dawać Some(true)"
+        );
     }
 
     #[test]
@@ -1245,8 +1786,12 @@ mod tests {
         content.extend(vec![0x41u8; 50]); // offset 9 wskaże w te smieci, nie w xref
         content.extend_from_slice(b"\nstartxref\n9\n%%EOF");
         let (_guard, path) = temp_file_with_ext(&content, "pdf");
-        let result = analyze_file(&path, "test.pdf").unwrap();
-        assert_eq!(result.eof_ok, Some(false), "startxref wskazujący w przypadkowe bajty nie może dawać Some(true)");
+        let result = analyze_file(&path, "test.pdf").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok,
+            Some(false),
+            "startxref wskazujący w przypadkowe bajty nie może dawać Some(true)"
+        );
     }
 
     #[test]
@@ -1256,7 +1801,7 @@ mod tests {
         content.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06]); // sygnatura EOCD
         content.extend(vec![0x00u8; 18]); // reszta rekordu EOCD
         let (_guard, path) = temp_file_with_ext(&content, "docx");
-        let result = analyze_file(&path, "test.docx").unwrap();
+        let result = analyze_file(&path, "test.docx").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(true));
     }
 
@@ -1265,7 +1810,7 @@ mod tests {
         let mut content = vec![0x50u8, 0x4B, 0x03, 0x04];
         content.extend(vec![0x00u8; 68]); // brak sygnatury EOCD gdziekolwiek
         let (_guard, path) = temp_file_with_ext(&content, "zip");
-        let result = analyze_file(&path, "test.zip").unwrap();
+        let result = analyze_file(&path, "test.zip").expect("Analiza pliku nie powiodła się");
         assert_eq!(result.eof_ok, Some(false));
     }
 
@@ -1273,8 +1818,11 @@ mod tests {
     fn test_analyze_file_unknown_extension_no_eof_rule() {
         let content = vec![0x41u8; 100];
         let (_guard, path) = temp_file_with_ext(&content, "bin");
-        let result = analyze_file(&path, "test.bin").unwrap();
-        assert_eq!(result.eof_ok, None, "Rozszerzenie bez zdefiniowanej reguły EOF powinno dać None");
+        let result = analyze_file(&path, "test.bin").expect("Analiza pliku nie powiodła się");
+        assert_eq!(
+            result.eof_ok, None,
+            "Rozszerzenie bez zdefiniowanej reguły EOF powinno dać None"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1320,30 +1868,55 @@ mod tests {
     #[test]
     fn test_build_source_block_top_eof_ext_by_frequency() {
         let stats = LiveStats::new(4);
-        stats.eof_by_ext.lock().unwrap().insert("jpg".to_string(), 5);
-        stats.eof_by_ext.lock().unwrap().insert("pdf".to_string(), 12);
+        stats
+            .eof_by_ext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("jpg".to_string(), 5);
+        stats
+            .eof_by_ext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("pdf".to_string(), 12);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Top formaty uciętego EOF:")).unwrap();
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Top formaty uciętego EOF:"))
+            .expect("Szukany element powinien znajdować się w kolekcji");
         let pos_pdf = line.find(".pdf (12)").expect(".pdf powinien być na liście");
         let pos_jpg = line.find(".jpg (5)").expect(".jpg powinien być na liście");
-        assert!(pos_pdf < pos_jpg, "częstszy format uciętego EOF powinien być wymieniony pierwszy");
+        assert!(
+            pos_pdf < pos_jpg,
+            "częstszy format uciętego EOF powinien być wymieniony pierwszy"
+        );
     }
 
     #[test]
     fn test_build_source_block_average_zeros_and_ffs_pct() {
         let stats = LiveStats::new(4);
-        *stats.zeros_pct_sum.lock().unwrap() = 150.0;
-        *stats.ffs_pct_sum.lock().unwrap() = 30.0;
+        *stats
+            .zeros_pct_sum
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 150.0;
+        *stats.ffs_pct_sum.lock().unwrap_or_else(|e| e.into_inner()) = 30.0;
         stats.analyzed_ok.store(3, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        assert!(block.contains("Średni % zer w próbce: 50.0%"), "150/3 = 50.0: {}", block);
-        assert!(block.contains("Średni % 0xFF w próbce: 10.0%"), "30/3 = 10.0: {}", block);
+        assert!(
+            block.contains("Średni % zer w próbce: 50.0%"),
+            "150/3 = 50.0: {}",
+            block
+        );
+        assert!(
+            block.contains("Średni % 0xFF w próbce: 10.0%"),
+            "30/3 = 10.0: {}",
+            block
+        );
     }
 
     #[test]
@@ -1351,7 +1924,11 @@ mod tests {
         let stats = LiveStats::new(4);
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
-        assert!(block.contains("Średni % zer w próbce: 0.0%"), "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}", block);
+        assert!(
+            block.contains("Średni % zer w próbce: 0.0%"),
+            "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}",
+            block
+        );
     }
 
     /// E2E na realnych plikach tymczasowych (measure twice — cztery nowe
@@ -1373,31 +1950,93 @@ mod tests {
         jpg_content.extend(vec![0x41u8; 50]); // brak FF D9 na końcu - ucięty
         let (_g3, jpg_path) = temp_file_with_ext(&jpg_content, "jpg");
 
-        let base_path = pusty_path.parent().unwrap().to_path_buf();
+        let base_path = pusty_path
+            .parent()
+            .expect("Ścieżka nadrzędna powinna być dostępna")
+            .to_path_buf();
         let tasks = vec![
-            Task { id: 1, rel_path: pusty_path.file_name().unwrap().to_string_lossy().to_string(), is_common: true },
-            Task { id: 2, rel_path: czesciowy_path.file_name().unwrap().to_string_lossy().to_string(), is_common: true },
-            Task { id: 3, rel_path: jpg_path.file_name().unwrap().to_string_lossy().to_string(), is_common: false },
+            Task {
+                id: 1,
+                rel_path: pusty_path
+                    .file_name()
+                    .expect("Nie można pobrać nazwy pliku")
+                    .to_string_lossy()
+                    .to_string(),
+                is_common: true,
+            },
+            Task {
+                id: 2,
+                rel_path: czesciowy_path
+                    .file_name()
+                    .expect("Nie można pobrać nazwy pliku")
+                    .to_string_lossy()
+                    .to_string(),
+                is_common: true,
+            },
+            Task {
+                id: 3,
+                rel_path: jpg_path
+                    .file_name()
+                    .expect("Nie można pobrać nazwy pliku")
+                    .to_string_lossy()
+                    .to_string(),
+                is_common: false,
+            },
         ];
 
         let stats = LiveStats::new(1);
         let (tx_db, _rx_db) = mpsc::sync_channel(10);
         let (tx_ui, _rx_ui) = mpsc::channel();
-        let opr_log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let opr_log = Arc::new(Mutex::new(
+            tempfile::tempfile().expect("Nie można utworzyć pliku tymczasowego dla logów"),
+        ));
 
         process_side_stream(StreamCtx {
-            base_path: &base_path, tasks: &tasks, side_label: "UFS Explorer", stats: &stats,
-            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, start_time: Instant::now(), opr_log,
+            base_path: &base_path,
+            tasks: &tasks,
+            side_label: "UFS Explorer",
+            stats: &stats,
+            tx_db,
+            is_ufs: true,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            start_time: Instant::now(),
+            opr_log,
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
-        assert_eq!(stats.empty_files_common.load(Ordering::Relaxed), 1, "pusty plik wspólny musi trafić do nowego koszyka");
-        assert_eq!(stats.eof_common.load(Ordering::Relaxed), 0, "pusty plik NIE powinien też trafiać do koszyka uciętego EOF");
-        assert_eq!(stats.partial_wydmuszka_common.load(Ordering::Relaxed), 1, "60% zer musi trafić do częściowej wydmuszki");
-        assert_eq!(stats.zero_common.load(Ordering::Relaxed), 0, "60% to za mało na PEŁNĄ wydmuszkę (próg >99%)");
-        assert_eq!(stats.eof_unique.load(Ordering::Relaxed), 1, "ucięty JPG unikalny musi trafić do koszyka EOF");
+        assert_eq!(
+            stats.empty_files_common.load(Ordering::Relaxed),
+            1,
+            "pusty plik wspólny musi trafić do nowego koszyka"
+        );
+        assert_eq!(
+            stats.eof_common.load(Ordering::Relaxed),
+            0,
+            "pusty plik NIE powinien też trafiać do koszyka uciętego EOF"
+        );
+        assert_eq!(
+            stats.partial_wydmuszka_common.load(Ordering::Relaxed),
+            1,
+            "60% zer musi trafić do częściowej wydmuszki"
+        );
+        assert_eq!(
+            stats.zero_common.load(Ordering::Relaxed),
+            0,
+            "60% to za mało na PEŁNĄ wydmuszkę (próg >99%)"
+        );
+        assert_eq!(
+            stats.eof_unique.load(Ordering::Relaxed),
+            1,
+            "ucięty JPG unikalny musi trafić do koszyka EOF"
+        );
 
-        let mapa = stats.eof_by_ext.lock().unwrap();
-        assert_eq!(mapa.get("jpg"), Some(&1), "rozszerzenie uciętego pliku musi trafić do rozbicia formatów");
+        let mapa = stats.eof_by_ext.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            mapa.get("jpg"),
+            Some(&1),
+            "rozszerzenie uciętego pliku musi trafić do rozbicia formatów"
+        );
     }
 
     #[test]
@@ -1408,7 +2047,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki analizy")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki analizy"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki analizy (Wariant A): {R:1} {G:2}");
     }
 
@@ -1435,7 +2077,12 @@ mod tests {
     /// sam wzorzec co w Fazie 5.
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki analizy (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki analizy (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(1);
         let start_time = Instant::now() - Duration::from_millis(500);
@@ -1443,16 +2090,26 @@ mod tests {
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta '{}' z panelu Fazy 6 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+                "etykieta '{}' z panelu Fazy 6 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 8, "panel powinien mieć dokładnie 8 etykiet wymagających wyjaśnienia");
+        assert_eq!(
+            sprawdzonych, 8,
+            "panel powinien mieć dokładnie 8 etykiet wymagających wyjaśnienia"
+        );
     }
 }

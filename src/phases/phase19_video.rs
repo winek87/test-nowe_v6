@@ -47,17 +47,17 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use crate::video_image::{self, VideoDamage};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -101,8 +101,7 @@ const SQL_ZAPIS_SCRIPT: &str =
 /// nigdy nie dostanie flagi ukończenia i będzie analizowane przy każdym
 /// uruchomieniu; odwrotnie — rozszerzenie tutaj, ale bez analizatora, na wieki
 /// zostanie z `phase19_done = 0`. Pilnuje tego osobny test spójności.
-const SQL_FINALIZACJA: &str =
-    "UPDATE files SET phase19_done = CASE
+const SQL_FINALIZACJA: &str = "UPDATE files SET phase19_done = CASE
             WHEN (found_in_ufs = 0 OR video_ok_ufs IS NOT NULL OR io_error_ufs = 1)
              AND (found_in_script = 0 OR video_ok_script IS NOT NULL OR io_error_script = 1) THEN 1
             ELSE 0 END
@@ -157,10 +156,14 @@ pub(crate) struct LiveStats {
     total_duration_sec: AtomicU64,
     /// Liczniki per kategoria uszkodzenia, rozbite na wspólne/unikalne —
     /// ten sam wzorzec co w Fazach 11/12/13.
-    err_ftyp_common: AtomicUsize, err_ftyp_unique: AtomicUsize,
-    err_moov_common: AtomicUsize, err_moov_unique: AtomicUsize,
-    err_trunc_common: AtomicUsize, err_trunc_unique: AtomicUsize,
-    err_other_common: AtomicUsize, err_other_unique: AtomicUsize,
+    err_ftyp_common: AtomicUsize,
+    err_ftyp_unique: AtomicUsize,
+    err_moov_common: AtomicUsize,
+    err_moov_unique: AtomicUsize,
+    err_trunc_common: AtomicUsize,
+    err_trunc_unique: AtomicUsize,
+    err_other_common: AtomicUsize,
+    err_other_unique: AtomicUsize,
     /// Rozkład rozszerzeń (mp4/mov/m4v) — po wadze bajtów.
     ext_weights: Mutex<HashMap<String, u64>>,
     thread_activity: crate::thread_activity::ThreadActivityTracker,
@@ -169,13 +172,19 @@ pub(crate) struct LiveStats {
 impl LiveStats {
     fn new(slot_count: usize) -> Self {
         Self {
-            processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0),
-            ok: AtomicUsize::new(0), errors: AtomicUsize::new(0),
+            processed_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            ok: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
             total_duration_sec: AtomicU64::new(0),
-            err_ftyp_common: AtomicUsize::new(0), err_ftyp_unique: AtomicUsize::new(0),
-            err_moov_common: AtomicUsize::new(0), err_moov_unique: AtomicUsize::new(0),
-            err_trunc_common: AtomicUsize::new(0), err_trunc_unique: AtomicUsize::new(0),
-            err_other_common: AtomicUsize::new(0), err_other_unique: AtomicUsize::new(0),
+            err_ftyp_common: AtomicUsize::new(0),
+            err_ftyp_unique: AtomicUsize::new(0),
+            err_moov_common: AtomicUsize::new(0),
+            err_moov_unique: AtomicUsize::new(0),
+            err_trunc_common: AtomicUsize::new(0),
+            err_trunc_unique: AtomicUsize::new(0),
+            err_other_common: AtomicUsize::new(0),
+            err_other_unique: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
@@ -188,7 +197,11 @@ fn compute_half_threads(total_threads: usize) -> usize {
 
 /// Patrz identyczna logika i uzasadnienie w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Formatuje czas trwania w sekundach do czytelnej postaci (np. "1h 23m 45s").
@@ -196,9 +209,13 @@ fn format_duration(total_sec: u64) -> String {
     let hours = total_sec / 3600;
     let mins = (total_sec % 3600) / 60;
     let secs = total_sec % 60;
-    if hours > 0 { format!("{}h {}m {}s", hours, mins, secs) }
-    else if mins > 0 { format!("{}m {}s", mins, secs) }
-    else { format!("{}s", secs) }
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, secs)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> String {
@@ -207,23 +224,39 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(e, w)| format!(".{} ({})", e, format_bytes(*w))).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(e, w)| format!(".{} ({})", e, format_bytes(*w)))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
-    let activity = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
+    let activity =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nSpójne kontenery: {}\nŁączny materiał: {}\nBrak nagłówka ftyp: {} wspólne / {} unikalne\nBrak moov / luki TS: {} wspólne / {} unikalne\nPlik ucięty: {} wspólne / {} unikalne\nInne uszkodzenia: {} wspólne / {} unikalne\nWątki odczytu (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb, display_ext,
+        label,
+        speed_mb,
+        display_ext,
         stats.ok.load(Ordering::Relaxed),
         format_duration(stats.total_duration_sec.load(Ordering::Relaxed)),
-        stats.err_ftyp_common.load(Ordering::Relaxed), stats.err_ftyp_unique.load(Ordering::Relaxed),
-        stats.err_moov_common.load(Ordering::Relaxed), stats.err_moov_unique.load(Ordering::Relaxed),
-        stats.err_trunc_common.load(Ordering::Relaxed), stats.err_trunc_unique.load(Ordering::Relaxed),
-        stats.err_other_common.load(Ordering::Relaxed), stats.err_other_unique.load(Ordering::Relaxed),
+        stats.err_ftyp_common.load(Ordering::Relaxed),
+        stats.err_ftyp_unique.load(Ordering::Relaxed),
+        stats.err_moov_common.load(Ordering::Relaxed),
+        stats.err_moov_unique.load(Ordering::Relaxed),
+        stats.err_trunc_common.load(Ordering::Relaxed),
+        stats.err_trunc_unique.load(Ordering::Relaxed),
+        stats.err_other_common.load(Ordering::Relaxed),
+        stats.err_other_unique.load(Ordering::Relaxed),
         activity,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -245,6 +278,19 @@ fn bump_damage_counter(stats: &LiveStats, damage: VideoDamage, is_common: bool) 
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Etykieta metody dla logu debug/dashboardu — mirror'uje tę samą decyzję
+/// dyspatchu co pętla niżej (po rozszerzeniu), czysto do NAZEWNICTWA, bez
+/// dotykania właściwej logiki analizy. Ten sam wzorzec co
+/// `phase13::decoding_method_for`.
+fn analysis_method_for(rel_path: &str) -> &'static str {
+    if crate::ts_stream::is_ts_extension(rel_path) { "analyze_ts_file (TS)" }
+    else if crate::flv_stream::is_flv_extension(rel_path) { "analyze_flv_file (FLV)" }
+    else if crate::mkv_container::is_mkv_extension(rel_path) { "read_mkv_file (Matroska)" }
+    else if crate::riff_container::is_riff_extension(rel_path) { "read_riff_file (RIFF)" }
+    else if crate::mp3_stream::is_mp3_extension(rel_path) { "analyze_mp3_file (MP3)" }
+    else { "read_video_file (MP4/MOV ISOBMFF)" }
+}
+
 // ============================================================================
 // PRZETWARZANIE JEDNEJ STRONY
 // ============================================================================
@@ -259,12 +305,24 @@ pub struct StreamCtx<'a> {
     pub start_time: Instant,
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
     pub bar_idx: usize,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 #[allow(clippy::too_many_arguments)]
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, start_time, tx_ui, bar_idx } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        start_time,
+        tx_ui,
+        bar_idx,
+        debug_log,
+    } = ctx;
 
     let last_ui_update = Arc::new(AtomicU64::new(0));
 
@@ -301,6 +359,8 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             // `applies_to`/`repair`/`verify` w Fazie 17: panika w KTÓRYMKOLWIEK
             // analizatorze nie może ubić wątku Rayon / całej sesji TUI dla
             // jednego spreparowanego pliku w korpusie.
+            let metoda = analysis_method_for(&task.rel_path);
+            let call_start = debug_log.is_active().then(Instant::now);
             let side_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> SideVideoResult { if crate::ts_stream::is_ts_extension(&task.rel_path) {
                 match stats.thread_activity.track_current(|| crate::ts_stream::analyze_ts_file(&full_path)) {
                     Some(a) if a.is_healthy() => {
@@ -577,6 +637,16 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     duration_ms: None, track_count: None, io_error: Some(false), created_unix: None,
                 }
             });
+            if let Some(t) = call_start {
+                let wynik = if side_result.io_error == Some(true) {
+                    "BŁĄD I/O".to_string()
+                } else if side_result.ok == Some(true) {
+                    "OK".to_string()
+                } else {
+                    format!("BŁĄD: {}", side_result.reason.as_deref().unwrap_or("Nieznany błąd"))
+                };
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+            }
             results.push(side_result);
 
             let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
@@ -588,17 +658,17 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
             if should_update && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                 if !local_ext.is_empty() {
-                    let mut g = stats.ext_weights.lock().unwrap();
+                    let mut g = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext.drain() { *g.entry(k).or_insert(0) += v; }
                 }
                 let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: bar_idx, current: current as u64, message: format_display_path(&task.rel_path) });
-                let _ = tx_ui.send(PhaseEvent::UpdateBottomPath { idx: bar_idx, path: full_path.to_string_lossy().to_string() });
+                let _ = tx_ui.send(PhaseEvent::UpdateBottomPath { idx: bar_idx, path: format!("[{}] {}", metoda, full_path.to_string_lossy()) });
                 let _ = tx_ui.send(PhaseEvent::UpdateSideText { idx: bar_idx, text: build_source_block(side_label, stats, start_time) });
             }
         }
 
         if !local_ext.is_empty() {
-            let mut g = stats.ext_weights.lock().unwrap();
+            let mut g = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext.drain() { *g.entry(k).or_insert(0) += v; }
         }
 
@@ -619,7 +689,11 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 // GŁÓWNA FUNKCJA (Entrypoint)
 // ============================================================================
 
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
     let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 19: Diagnostyka Wideo (MP4/MOV/M4V, MKV/WebM, FLV, strumienie TS, WAV/AVI, MP3).".to_string()));
 
@@ -627,28 +701,46 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
     for col in [
-        "video_ok_ufs BOOLEAN", "video_ok_script BOOLEAN",
-        "video_reason_ufs TEXT", "video_reason_script TEXT",
-        "video_duration_ms_ufs INTEGER", "video_duration_ms_script INTEGER",
-        "video_tracks_ufs INTEGER", "video_tracks_script INTEGER",
+        "video_ok_ufs BOOLEAN",
+        "video_ok_script BOOLEAN",
+        "video_reason_ufs TEXT",
+        "video_reason_script TEXT",
+        "video_duration_ms_ufs INTEGER",
+        "video_duration_ms_script INTEGER",
+        "video_tracks_ufs INTEGER",
+        "video_tracks_script INTEGER",
         "phase19_done BOOLEAN DEFAULT 0",
     ] {
         let _ = conn.execute(&format!("ALTER TABLE files ADD COLUMN {}", col), []);
     }
 
-    let raport_cfg = config.raporty_faz.get("Faza 19").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza19.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza19.txt".to_string(),
-    });
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 19")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza19.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza19.txt".to_string(),
+        });
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza19.txt", &stamp),
+        &config.log_level,
+    );
 
     // --- ETAP 1: DOBÓR ZADAŃ ---
     let mut stmt = conn.prepare(
         "SELECT id, relative_path, found_in_ufs, found_in_script, video_ok_ufs, video_ok_script,
                 io_error_ufs, io_error_script
-         FROM files WHERE phase19_done = 0 OR phase19_done IS NULL"
+         FROM files WHERE phase19_done = 0 OR phase19_done IS NULL",
     )?;
 
     let mut ufs_tasks = Vec::new();
@@ -656,9 +748,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut skipped = 0usize;
 
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?))
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
+        ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
@@ -669,37 +768,89 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             || crate::flv_stream::is_flv_extension(&rel)
             || crate::riff_container::is_riff_extension(&rel)
             || crate::mp3_stream::is_mp3_extension(&rel);
-        if !supported { continue; }
+        if !supported {
+            continue;
+        }
         let is_common = in_ufs && in_scr;
         if in_ufs {
-            if ok_u.is_none() && err_u != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); }
-            else { skipped += 1; }
+            if ok_u.is_none() && err_u != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                    is_common,
+                });
+            } else {
+                skipped += 1;
+            }
         }
         if in_scr {
-            if ok_s.is_none() && err_s != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common }); }
-            else { skipped += 1; }
+            if ok_s.is_none() && err_s != Some(true) {
+                script_tasks.push(Task {
+                    id,
+                    rel_path: rel,
+                    is_common,
+                });
+            } else {
+                skipped += 1;
+            }
         }
     }
     drop(stmt);
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if skipped > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto {} plików już przeanalizowanych.", skipped)));
-    }
-    if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wideo wymagających diagnostyki. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto {} plików już przeanalizowanych.",
+            skipped
+        )));
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE" } else { "SEKWENCYJNIE" };
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Metodyka pracy szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    if total_db_rows == 0 {
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Diagnostyka kontenerów wideo została ukończona. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Świadomie usuwamy `return Ok(());`. Pozwala to skryptowi gładko
+        // wejść w Etap 4 i dopiąć status phase19_done dla powieszonych plików!
+    }
+
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE"
+    } else {
+        "SEKWENCYJNIE"
+    };
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Metodyka pracy szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     // --- ETAP 2: UI ---
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Wideo)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Wideo)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Wideo)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Wideo)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = compute_half_threads(actual_threads);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -726,33 +877,56 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let mut db_inserted = 0usize;
             let mut last_db_update = Instant::now();
 
-            let update_sql = |c: &mut Connection, chunk: &[SideVideoResult], is_ufs: bool| -> Result<()> {
-                let tx = c.transaction()?;
-                {
-                    let mut stmt = match is_ufs {
-                        true => tx.prepare_cached(SQL_ZAPIS_UFS)?,
-                        false => tx.prepare_cached(SQL_ZAPIS_SCRIPT)?,
-                    };
-                    for r in chunk {
-                        stmt.execute(params![r.ok, r.reason, r.duration_ms, r.track_count, r.io_error, r.id, r.created_unix])?;
+            let update_sql =
+                |c: &mut Connection, chunk: &[SideVideoResult], is_ufs: bool| -> Result<()> {
+                    let tx = c.transaction()?;
+                    {
+                        let mut stmt = match is_ufs {
+                            true => tx.prepare_cached(SQL_ZAPIS_UFS)?,
+                            false => tx.prepare_cached(SQL_ZAPIS_SCRIPT)?,
+                        };
+                        for r in chunk {
+                            stmt.execute(params![
+                                r.ok,
+                                r.reason,
+                                r.duration_ms,
+                                r.track_count,
+                                r.io_error,
+                                r.id,
+                                r.created_unix
+                            ])?;
+                        }
                     }
-                }
-                tx.commit()
-            };
+                    tx.commit()
+                };
 
             for msg in rx_db {
                 let n = match &msg {
-                    ScanMsg::UfsChunk(c) => { update_sql(conn_ref, c, true)?; c.len() }
-                    ScanMsg::ScriptChunk(c) => { update_sql(conn_ref, c, false)?; c.len() }
+                    ScanMsg::UfsChunk(c) => {
+                        update_sql(conn_ref, c, true)?;
+                        c.len()
+                    }
+                    ScanMsg::ScriptChunk(c) => {
+                        update_sql(conn_ref, c, false)?;
+                        c.len()
+                    }
                 };
                 db_inserted += n;
                 let now = Instant::now();
                 if now.duration_since(last_db_update).as_millis() > 60 {
                     last_db_update = now;
-                    let _ = tx_ui_db.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Zapisywanie diagnostyki wideo...".to_string() });
+                    let _ = tx_ui_db.send(PhaseEvent::UpdateBar {
+                        idx: 2,
+                        current: db_inserted as u64,
+                        message: "Zapisywanie diagnostyki wideo...".to_string(),
+                    });
                 }
             }
-            let _ = tx_ui_db.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Pomyślnie zsynchronizowano z SQLite.".to_string() });
+            let _ = tx_ui_db.send(PhaseEvent::UpdateBar {
+                idx: 2,
+                current: db_inserted as u64,
+                message: "Pomyślnie zsynchronizowano z SQLite.".to_string(),
+            });
             Ok(())
         });
 
@@ -765,36 +939,121 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let script_base_ref = &script_base;
             let tx_ui_1 = tx_ui.clone();
             let tx_ui_2 = tx_ui.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
-                        pool.install(|| process_side_stream(StreamCtx { base_path: ufs_base_ref, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, }));
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
+                        pool.install(|| {
+                            process_side_stream(StreamCtx {
+                                base_path: ufs_base_ref,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                start_time,
+                                tx_ui: &tx_ui_1,
+                                bar_idx: 0,
+                                debug_log: dbg_u.clone(),
+                            })
+                        });
                     } else {
-                        process_side_stream(StreamCtx { base_path: ufs_base_ref, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, });
+                        process_side_stream(StreamCtx {
+                            base_path: ufs_base_ref,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            start_time,
+                            tx_ui: &tx_ui_1,
+                            bar_idx: 0,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_1.send(PhaseEvent::Log("✔ Diagnostyka UFS zakończona.".to_string()));
+                    let _ =
+                        tx_ui_1.send(PhaseEvent::Log("✔ Diagnostyka UFS zakończona.".to_string()));
                 }
             });
             s.spawn(move || {
                 if !script_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
-                        pool.install(|| process_side_stream(StreamCtx { base_path: script_base_ref, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, }));
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
+                        pool.install(|| {
+                            process_side_stream(StreamCtx {
+                                base_path: script_base_ref,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                start_time,
+                                tx_ui: &tx_ui_2,
+                                bar_idx: 1,
+                                debug_log: dbg_s.clone(),
+                            })
+                        });
                     } else {
-                        process_side_stream(StreamCtx { base_path: script_base_ref, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, });
+                        process_side_stream(StreamCtx {
+                            base_path: script_base_ref,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            start_time,
+                            tx_ui: &tx_ui_2,
+                            bar_idx: 1,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_2.send(PhaseEvent::Log("✔ Diagnostyka Skrypt zakończona.".to_string()));
+                    let _ = tx_ui_2.send(PhaseEvent::Log(
+                        "✔ Diagnostyka Skrypt zakończona.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
         } else {
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: &tx_ui, bar_idx: 0, });
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    start_time,
+                    tx_ui: &tx_ui,
+                    bar_idx: 0,
+                    debug_log: dbg_u,
+                });
                 let _ = tx_ui.send(PhaseEvent::Log("✔ Diagnostyka UFS zakończona.".to_string()));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, });
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Diagnostyka Skrypt zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    start_time,
+                    tx_ui: &tx_ui,
+                    bar_idx: 1,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✔ Diagnostyka Skrypt zakończona.".to_string(),
+                ));
             }
             // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
             // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
@@ -823,7 +1082,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     wynik_zapisu?;
 
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Diagnostyka przerwana przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Diagnostyka przerwana przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
@@ -832,45 +1093,110 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 5: RAPORT ---
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
-    let sum = |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let sum =
+        |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst);
 
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 19 (DIAGNOSTYKA KONTENERÓW I STRUMIENI WIDEO)");
-    let _ = writeln!(&mut log_out, "Czas trwania: {:.2?} | Transfer: {}", elapsed, format_bytes(total_bytes));
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
-    let _ = writeln!(&mut log_out, "Spójne kontenery: {}", sum(&ufs_stats.ok, &script_stats.ok));
-    let _ = writeln!(&mut log_out, "Łączny materiał wideo: {}", format_duration(
-        ufs_stats.total_duration_sec.load(Ordering::SeqCst) + script_stats.total_duration_sec.load(Ordering::SeqCst)));
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 19 (DIAGNOSTYKA KONTENERÓW I STRUMIENI WIDEO)"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Czas trwania: {:.2?} | Transfer: {}",
+        elapsed,
+        format_bytes(total_bytes)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Spójne kontenery: {}",
+        sum(&ufs_stats.ok, &script_stats.ok)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Łączny materiał wideo: {}",
+        format_duration(
+            ufs_stats.total_duration_sec.load(Ordering::SeqCst)
+                + script_stats.total_duration_sec.load(Ordering::SeqCst)
+        )
+    );
     let _ = writeln!(&mut log_out, "\n[ KATEGORIE USZKODZEŃ ]");
-    let _ = writeln!(&mut log_out, "  Brak nagłówka ftyp: {} wspólne / {} unikalne",
-        sum(&ufs_stats.err_ftyp_common, &script_stats.err_ftyp_common), sum(&ufs_stats.err_ftyp_unique, &script_stats.err_ftyp_unique));
+    let _ = writeln!(
+        &mut log_out,
+        "  Brak nagłówka ftyp: {} wspólne / {} unikalne",
+        sum(&ufs_stats.err_ftyp_common, &script_stats.err_ftyp_common),
+        sum(&ufs_stats.err_ftyp_unique, &script_stats.err_ftyp_unique)
+    );
     let moov_c = sum(&ufs_stats.err_moov_common, &script_stats.err_moov_common);
     let moov_u = sum(&ufs_stats.err_moov_unique, &script_stats.err_moov_unique);
-    let _ = writeln!(&mut log_out, "  Brak tablic moov / luki w ciągłości TS: {} wspólne / {} unikalne", moov_c, moov_u);
-    let _ = writeln!(&mut log_out, "  Plik ucięty:        {} wspólne / {} unikalne",
-        sum(&ufs_stats.err_trunc_common, &script_stats.err_trunc_common), sum(&ufs_stats.err_trunc_unique, &script_stats.err_trunc_unique));
-    let _ = writeln!(&mut log_out, "  Inne uszkodzenia:   {} wspólne / {} unikalne",
-        sum(&ufs_stats.err_other_common, &script_stats.err_other_common), sum(&ufs_stats.err_other_unique, &script_stats.err_other_unique));
-    let _ = writeln!(&mut log_out, "\nBłędy I/O: {}", sum(&ufs_stats.errors, &script_stats.errors));
+    let _ = writeln!(
+        &mut log_out,
+        "  Brak tablic moov / luki w ciągłości TS: {} wspólne / {} unikalne",
+        moov_c, moov_u
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "  Plik ucięty:        {} wspólne / {} unikalne",
+        sum(&ufs_stats.err_trunc_common, &script_stats.err_trunc_common),
+        sum(&ufs_stats.err_trunc_unique, &script_stats.err_trunc_unique)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "  Inne uszkodzenia:   {} wspólne / {} unikalne",
+        sum(&ufs_stats.err_other_common, &script_stats.err_other_common),
+        sum(&ufs_stats.err_other_unique, &script_stats.err_other_unique)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "\nBłędy I/O: {}",
+        sum(&ufs_stats.errors, &script_stats.errors)
+    );
 
     if moov_c > 0 {
         let _ = writeln!(&mut log_out, "\n[ ℹ POTENCJAŁ NAPRAWCZY ]");
-        let _ = writeln!(&mut log_out, "  {} plików WSPÓLNYCH ma uszkodzone tablice moov. To jedyna kategoria", moov_c);
-        let _ = writeln!(&mut log_out, "  uszkodzenia wideo teoretycznie naprawialna przez złożenie z drugiej kopii");
-        let _ = writeln!(&mut log_out, "  (dane klatek mdat mogą być nietknięte - brakuje tylko mapy, gdzie leżą).");
+        let _ = writeln!(
+            &mut log_out,
+            "  {} plików WSPÓLNYCH ma uszkodzone tablice moov. To jedyna kategoria",
+            moov_c
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "  uszkodzenia wideo teoretycznie naprawialna przez złożenie z drugiej kopii"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "  (dane klatek mdat mogą być nietknięte - brakuje tylko mapy, gdzie leżą)."
+        );
     }
 
     let _ = writeln!(&mut log_out, "\n[ ⚠ ZAKRES WERYFIKACJI ]");
-    let _ = writeln!(&mut log_out, "  Ta faza sprawdza SPÓJNOŚĆ STRUKTURY (kontenera MP4 lub ciągłości pakietów TS),");
+    let _ = writeln!(
+        &mut log_out,
+        "  Ta faza sprawdza SPÓJNOŚĆ STRUKTURY (kontenera MP4 lub ciągłości pakietów TS),"
+    );
     let _ = writeln!(&mut log_out, "  NIE poprawność samych klatek wideo.");
-    let _ = writeln!(&mut log_out, "  Pełne dekodowanie H.264/HEVC wymagałoby ffmpeg (zależność systemowa).");
+    let _ = writeln!(
+        &mut log_out,
+        "  Pełne dekodowanie H.264/HEVC wymagałoby ffmpeg (zależność systemowa)."
+    );
 
     if let Ok(mut f) = File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Dziennik Końcowy w: {}", dz_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
     }
     for line in log_out.lines() {
         let _ = tx_ui.send(PhaseEvent::Log(line.to_string()));
@@ -922,8 +1248,16 @@ mod tests {
             }
         });
 
-        assert_eq!(s.ok, Some(false), "Panika musi zostać zamieniona na porażkę analizy, nie propagować się dalej");
-        assert_eq!(s.io_error, Some(false), "Panika NIE jest błędem I/O - plik istnieje i jest czytelny, tylko parser go nie udźwignął");
+        assert_eq!(
+            s.ok,
+            Some(false),
+            "Panika musi zostać zamieniona na porażkę analizy, nie propagować się dalej"
+        );
+        assert_eq!(
+            s.io_error,
+            Some(false),
+            "Panika NIE jest błędem I/O - plik istnieje i jest czytelny, tylko parser go nie udźwignął"
+        );
     }
 
     #[test]
@@ -972,7 +1306,11 @@ mod tests {
         stats.err_moov_common.store(3, Ordering::Relaxed);
         stats.errors.store(1, Ordering::Relaxed);
 
-        let block = build_source_block("UFS Explorer", &stats, Instant::now() - Duration::from_secs(1));
+        let block = build_source_block(
+            "UFS Explorer",
+            &stats,
+            Instant::now() - Duration::from_secs(1),
+        );
         assert!(block.starts_with("[UFS Explorer]"));
         assert!(block.contains("Spójne kontenery: 10"));
         assert!(block.contains("Łączny materiał: 1h 2m 5s"));
@@ -985,8 +1323,15 @@ mod tests {
         use std::time::Duration;
         let stats = LiveStats::new(2);
         stats.thread_activity.mark_busy(0);
-        let block = build_source_block("UFS Explorer", &stats, Instant::now() - Duration::from_millis(500));
-        let line = block.lines().find(|l| l.starts_with("Wątki odczytu")).expect("powinna istnieć linia Wariantu A");
+        let block = build_source_block(
+            "UFS Explorer",
+            &stats,
+            Instant::now() - Duration::from_millis(500),
+        );
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki odczytu"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki odczytu (Wariant A): {G:1} {R:2}");
     }
 
@@ -1030,7 +1375,12 @@ mod tests {
     #[test]
     fn test_lista_rozszerzen_w_sql_pokrywa_sie_z_bramka_w_rust() {
         let z_sql = rozszerzenia_z_sql();
-        assert_eq!(z_sql.len(), 13, "spodziewamy się 13 rozszerzeń, SQL ma: {:?}", z_sql);
+        assert_eq!(
+            z_sql.len(),
+            13,
+            "spodziewamy się 13 rozszerzeń, SQL ma: {:?}",
+            z_sql
+        );
 
         for ext in &z_sql {
             let nazwa = format!("plik.{}", ext);
@@ -1045,7 +1395,10 @@ mod tests {
     #[test]
     fn test_kazde_obslugiwane_rozszerzenie_jest_w_liscie_sql() {
         let z_sql = rozszerzenia_z_sql();
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi", "mp3"] {
+        for ext in [
+            "mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi",
+            "mp3",
+        ] {
             assert!(
                 z_sql.iter().any(|e| e == ext),
                 "rozszerzenie .{} jest obsługiwane w Ruście, ale brak go w liście SQL - plik byłby analizowany przy KAŻDYM uruchomieniu",
@@ -1056,8 +1409,18 @@ mod tests {
 
     #[test]
     fn test_formaty_poza_zakresem_nie_sa_obslugiwane() {
-        for nazwa in ["film.wmv", "film.mpg", "zdjecie.jpg", "dokument.pdf", "bez_rozszerzenia"] {
-            assert!(!obslugiwane(nazwa), "'{}' nie należy do zakresu Fazy 19", nazwa);
+        for nazwa in [
+            "film.wmv",
+            "film.mpg",
+            "zdjecie.jpg",
+            "dokument.pdf",
+            "bez_rozszerzenia",
+        ] {
+            assert!(
+                !obslugiwane(nazwa),
+                "'{}' nie należy do zakresu Fazy 19",
+                nazwa
+            );
         }
     }
 
@@ -1067,7 +1430,10 @@ mod tests {
     /// parsera Matroski.
     #[test]
     fn test_predykaty_analizatorow_sa_rozlaczne() {
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi", "mp3"] {
+        for ext in [
+            "mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi",
+            "mp3",
+        ] {
             let nazwa = format!("plik.{}", ext);
             let trafienia = [
                 video_image::is_video_extension(&nazwa),
@@ -1076,16 +1442,27 @@ mod tests {
                 crate::flv_stream::is_flv_extension(&nazwa),
                 crate::riff_container::is_riff_extension(&nazwa),
                 crate::mp3_stream::is_mp3_extension(&nazwa),
-            ].iter().filter(|t| **t).count();
+            ]
+            .iter()
+            .filter(|t| **t)
+            .count();
 
-            assert_eq!(trafienia, 1, "rozszerzenie .{} musi pasować do DOKŁADNIE jednego analizatora, pasuje do {}", ext, trafienia);
+            assert_eq!(
+                trafienia, 1,
+                "rozszerzenie .{} musi pasować do DOKŁADNIE jednego analizatora, pasuje do {}",
+                ext, trafienia
+            );
         }
     }
 
     #[test]
     fn test_rozpoznawanie_rozszerzen_ignoruje_wielkosc_liter() {
         for nazwa in ["FILM.MP4", "Film.Mkv", "NAGRANIE.FLV", "strumien.M2TS"] {
-            assert!(obslugiwane(nazwa), "'{}' musi być rozpoznane niezależnie od wielkości liter", nazwa);
+            assert!(
+                obslugiwane(nazwa),
+                "'{}' musi być rozpoznane niezależnie od wielkości liter",
+                nazwa
+            );
         }
     }
 
@@ -1094,26 +1471,50 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn utworz(sciezka: &Path, bajty: &[u8]) {
-        if let Some(r) = sciezka.parent() { fs::create_dir_all(r).unwrap(); }
-        fs::write(sciezka, bajty).unwrap();
+        if let Some(r) = sciezka.parent() {
+            fs::create_dir_all(r).expect("Nie można utworzyć katalogów nadrzędnych");
+        }
+        fs::write(sciezka, bajty).expect("Nie można zapisać danych do pliku");
     }
 
-    fn uruchom(katalog: &Path, zadania: &[Task], is_ufs: bool) -> (LiveStats, Vec<SideVideoResult>) {
+    fn uruchom(
+        katalog: &Path,
+        zadania: &[Task],
+        is_ufs: bool,
+    ) -> (LiveStats, Vec<SideVideoResult>) {
         let (tx_db, rx_db) = mpsc::sync_channel(10_000);
         let (tx_ui, _rx_ui) = mpsc::channel();
         let stats = LiveStats::new(2);
 
-        process_side_stream(StreamCtx { base_path: katalog, tasks: zadania, side_label: "Test", stats: &stats, tx_db, is_ufs, start_time: Instant::now(), tx_ui: &tx_ui, bar_idx: 0, });
+        process_side_stream(StreamCtx {
+            base_path: katalog,
+            tasks: zadania,
+            side_label: "Test",
+            stats: &stats,
+            tx_db,
+            is_ufs,
+            start_time: Instant::now(),
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
+        });
 
-        let wyniki: Vec<SideVideoResult> = rx_db.into_iter().flat_map(|m| match m {
-            ScanMsg::UfsChunk(c) | ScanMsg::ScriptChunk(c) => c,
-        }).collect();
+        let wyniki: Vec<SideVideoResult> = rx_db
+            .into_iter()
+            .flat_map(|m| match m {
+                ScanMsg::UfsChunk(c) | ScanMsg::ScriptChunk(c) => c,
+            })
+            .collect();
 
         (stats, wyniki)
     }
 
     fn zadanie(id: i32, rel: &str, wspolny: bool) -> Task {
-        Task { id, rel_path: rel.to_string(), is_common: wspolny }
+        Task {
+            id,
+            rel_path: rel.to_string(),
+            is_common: wspolny,
+        }
     }
 
     /// Brakujący plik to błąd I/O — kategoria zupełnie inna niż uszkodzenie
@@ -1121,7 +1522,7 @@ mod tests {
     /// gdzie problemem jest niedostępny nośnik.
     #[test]
     fn test_brakujacy_plik_jest_bledem_io_nie_uszkodzeniem() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let zadania = [
             zadanie(1, "nie_ma.mp4", true),
             zadanie(2, "nie_ma.ts", true),
@@ -1131,12 +1532,20 @@ mod tests {
 
         let (stats, wyniki) = uruchom(dir.path(), &zadania, true);
 
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 4, "każdy brakujący plik to jeden błąd I/O");
+        assert_eq!(
+            stats.errors.load(Ordering::Relaxed),
+            4,
+            "każdy brakujący plik to jeden błąd I/O"
+        );
         assert_eq!(stats.ok.load(Ordering::Relaxed), 0);
 
         for w in &wyniki {
             assert_eq!(w.io_error, Some(true), "id {}", w.id);
-            assert!(w.ok.is_none(), "przy błędzie I/O nie ma orzeczenia o pliku (id {})", w.id);
+            assert!(
+                w.ok.is_none(),
+                "przy błędzie I/O nie ma orzeczenia o pliku (id {})",
+                w.id
+            );
             assert!(w.reason.is_none());
         }
 
@@ -1144,31 +1553,55 @@ mod tests {
             + stats.err_moov_common.load(Ordering::Relaxed)
             + stats.err_trunc_common.load(Ordering::Relaxed)
             + stats.err_other_common.load(Ordering::Relaxed);
-        assert_eq!(uszkodzenia, 0, "niedostępny plik NIE jest uszkodzeniem kontenera");
+        assert_eq!(
+            uszkodzenia, 0,
+            "niedostępny plik NIE jest uszkodzeniem kontenera"
+        );
     }
 
     /// Plik istnieje, ale nie jest tym, co obiecuje rozszerzenie — to
     /// uszkodzenie, nie błąd I/O.
     #[test]
     fn test_falszywe_rozszerzenie_jest_uszkodzeniem_nie_bledem_io() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let smieci = b"to nie jest zaden kontener wideo, tylko zwykly tekst";
 
-        for (i, nazwa) in ["a.ts", "b.flv", "c.mkv", "d.mp4", "e.wav"].iter().enumerate() {
+        for (i, nazwa) in ["a.ts", "b.flv", "c.mkv", "d.mp4", "e.wav"]
+            .iter()
+            .enumerate()
+        {
             utworz(&dir.path().join(nazwa), smieci);
             let (stats, wyniki) = uruchom(dir.path(), &[zadanie(i as i32, nazwa, true)], true);
 
-            assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "'{}' istnieje, więc to nie błąd I/O", nazwa);
+            assert_eq!(
+                stats.errors.load(Ordering::Relaxed),
+                0,
+                "'{}' istnieje, więc to nie błąd I/O",
+                nazwa
+            );
             assert_eq!(wyniki.len(), 1);
-            assert_eq!(wyniki[0].ok, Some(false), "'{}' musi zostać uznany za niesprawny", nazwa);
+            assert_eq!(
+                wyniki[0].ok,
+                Some(false),
+                "'{}' musi zostać uznany za niesprawny",
+                nazwa
+            );
             assert_eq!(wyniki[0].io_error, Some(false));
-            assert!(wyniki[0].reason.is_some(), "uszkodzenie musi być opisane: '{}'", nazwa);
+            assert!(
+                wyniki[0].reason.is_some(),
+                "uszkodzenie musi być opisane: '{}'",
+                nazwa
+            );
 
             let uszkodzenia = stats.err_ftyp_common.load(Ordering::Relaxed)
                 + stats.err_moov_common.load(Ordering::Relaxed)
                 + stats.err_trunc_common.load(Ordering::Relaxed)
                 + stats.err_other_common.load(Ordering::Relaxed);
-            assert_eq!(uszkodzenia, 1, "'{}' musi trafić do dokładnie jednego koszyka uszkodzeń", nazwa);
+            assert_eq!(
+                uszkodzenia, 1,
+                "'{}' musi trafić do dokładnie jednego koszyka uszkodzeń",
+                nazwa
+            );
         }
     }
 
@@ -1176,33 +1609,51 @@ mod tests {
     fn test_kazda_gałaz_analizy_opisuje_wlasny_format() {
         // Komunikat musi nazywać format, którego dotyczy - inaczej operator nie
         // wie, czy plik trafił do właściwego parsera.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let smieci = b"nie kontener";
 
         for (nazwa, fragment) in [("a.ts", "TS"), ("b.flv", "FLV"), ("c.wav", "RIFF")] {
             utworz(&dir.path().join(nazwa), smieci);
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
-            let powod = wyniki[0].reason.clone().unwrap();
+            let powod = wyniki[0]
+                .reason
+                .clone()
+                .expect("Nie można utworzyć katalogu tymczasowego dla testu");
             assert!(
                 powod.contains(fragment),
-                "plik '{}' musi zostać opisany przez parser {}: {}", nazwa, fragment, powod
+                "plik '{}' musi zostać opisany przez parser {}: {}",
+                nazwa,
+                fragment,
+                powod
             );
         }
     }
 
     #[test]
     fn test_uszkodzenia_rozdzielone_na_wspolne_i_unikalne() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("wspolny.flv"), b"smieci");
         utworz(&dir.path().join("unikalny.flv"), b"smieci");
 
-        let (stats, _) = uruchom(dir.path(), &[
-            zadanie(1, "wspolny.flv", true),
-            zadanie(2, "unikalny.flv", false),
-        ], true);
+        let (stats, _) = uruchom(
+            dir.path(),
+            &[
+                zadanie(1, "wspolny.flv", true),
+                zadanie(2, "unikalny.flv", false),
+            ],
+            true,
+        );
 
-        assert_eq!(stats.err_ftyp_common.load(Ordering::Relaxed), 1, "plik wspólny do koszyka wspólnych");
-        assert_eq!(stats.err_ftyp_unique.load(Ordering::Relaxed), 1, "plik unikalny do koszyka unikalnych");
+        assert_eq!(
+            stats.err_ftyp_common.load(Ordering::Relaxed),
+            1,
+            "plik wspólny do koszyka wspólnych"
+        );
+        assert_eq!(
+            stats.err_ftyp_unique.load(Ordering::Relaxed),
+            1,
+            "plik unikalny do koszyka unikalnych"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1220,7 +1671,9 @@ mod tests {
         data_chunk.extend_from_slice(b"data");
         data_chunk.extend_from_slice(&(probki.len() as u32).to_le_bytes());
         data_chunk.extend_from_slice(probki);
-        if probki.len() % 2 == 1 { data_chunk.push(0); }
+        if probki.len() % 2 == 1 {
+            data_chunk.push(0);
+        }
 
         let mut fmt_chunk = Vec::new();
         fmt_chunk.extend_from_slice(b"fmt ");
@@ -1240,28 +1693,49 @@ mod tests {
 
     #[test]
     fn test_riff_zdrowy_wav_jest_uznany_za_sprawny() {
-        let dir = tempfile::tempdir().unwrap();
-        utworz(&dir.path().join("zdrowy.wav"), &zbuduj_wav(&[1, 2, 3, 4, 5]));
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        utworz(
+            &dir.path().join("zdrowy.wav"),
+            &zbuduj_wav(&[1, 2, 3, 4, 5]),
+        );
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "zdrowy.wav", true)], true);
 
         assert_eq!(wyniki.len(), 1);
-        assert_eq!(wyniki[0].ok, Some(true), "zdrowy WAV musi zostać uznany za sprawny");
+        assert_eq!(
+            wyniki[0].ok,
+            Some(true),
+            "zdrowy WAV musi zostać uznany za sprawny"
+        );
         assert_eq!(wyniki[0].io_error, Some(false));
-        assert!(wyniki[0].reason.as_deref().unwrap().contains("RIFF"));
+        assert!(
+            wyniki[0]
+                .reason
+                .as_deref()
+                .expect("Nie można utworzyć katalogu tymczasowego dla testu")
+                .contains("RIFF")
+        );
         assert_eq!(stats.ok.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn test_riff_uciety_wav_jest_uszkodzeniem_typu_trunc() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let wav = zbuduj_wav(&[1, 2, 3, 4, 5]);
         utworz(&dir.path().join("uciety.wav"), &wav[..wav.len() - 3]);
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "uciety.wav", true)], true);
 
-        assert_eq!(wyniki[0].ok, Some(false), "ucięty WAV musi zostać uznany za uszkodzony");
-        assert_eq!(stats.err_trunc_common.load(Ordering::Relaxed), 1, "ucięcie musi trafić do koszyka 'plik ucięty'");
+        assert_eq!(
+            wyniki[0].ok,
+            Some(false),
+            "ucięty WAV musi zostać uznany za uszkodzony"
+        );
+        assert_eq!(
+            stats.err_trunc_common.load(Ordering::Relaxed),
+            1,
+            "ucięcie musi trafić do koszyka 'plik ucięty'"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1284,20 +1758,30 @@ mod tests {
 
     #[test]
     fn test_mp3_zdrowy_strumien_jest_uznany_za_sprawny() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("zdrowy.mp3"), &zbuduj_mp3(5));
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "zdrowy.mp3", true)], true);
 
         assert_eq!(wyniki.len(), 1);
-        assert_eq!(wyniki[0].ok, Some(true), "zdrowy strumień MP3 musi zostać uznany za sprawny");
-        assert!(wyniki[0].reason.as_deref().unwrap().contains("ramek"));
+        assert_eq!(
+            wyniki[0].ok,
+            Some(true),
+            "zdrowy strumień MP3 musi zostać uznany za sprawny"
+        );
+        assert!(
+            wyniki[0]
+                .reason
+                .as_deref()
+                .expect("Nie można utworzyć katalogu tymczasowego dla testu")
+                .contains("ramek")
+        );
         assert_eq!(stats.ok.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn test_mp3_uszkodzony_w_srodku_jest_wykryty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let mut plik = zbuduj_mp3(2);
         plik.extend(vec![0x00u8; 500]); // wyspa uszkodzenia
         plik.extend(zbuduj_mp3(2));
@@ -1305,14 +1789,25 @@ mod tests {
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "uszkodzony.mp3", true)], true);
 
-        assert_eq!(wyniki[0].ok, Some(false), "strumień z wyspą uszkodzenia musi zostać uznany za niesprawny");
-        assert_eq!(stats.err_other_common.load(Ordering::Relaxed), 1, "utrata synchronizacji trafia do koszyka 'inne uszkodzenia'");
+        assert_eq!(
+            wyniki[0].ok,
+            Some(false),
+            "strumień z wyspą uszkodzenia musi zostać uznany za niesprawny"
+        );
+        assert_eq!(
+            stats.err_other_common.load(Ordering::Relaxed),
+            1,
+            "utrata synchronizacji trafia do koszyka 'inne uszkodzenia'"
+        );
     }
 
     #[test]
     fn test_mp3_smieci_z_rozszerzeniem_mp3_to_missing_ftyp() {
-        let dir = tempfile::tempdir().unwrap();
-        utworz(&dir.path().join("smieci.mp3"), b"to nie jest strumien MPEG audio");
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        utworz(
+            &dir.path().join("smieci.mp3"),
+            b"to nie jest strumien MPEG audio",
+        );
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, "smieci.mp3", true)], true);
 
@@ -1322,17 +1817,28 @@ mod tests {
 
     #[test]
     fn test_wagi_rozszerzen_licza_bajty_i_normalizuja_wielkosc_liter() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("a.MP4"), &vec![0u8; 300]);
         utworz(&dir.path().join("b.mp4"), &[0u8; 200]);
         utworz(&dir.path().join("c.mkv"), &[0u8; 100]);
 
-        let (stats, _) = uruchom(dir.path(), &[
-            zadanie(1, "a.MP4", true), zadanie(2, "b.mp4", true), zadanie(3, "c.mkv", true),
-        ], true);
+        let (stats, _) = uruchom(
+            dir.path(),
+            &[
+                zadanie(1, "a.MP4", true),
+                zadanie(2, "b.mp4", true),
+                zadanie(3, "c.mkv", true),
+            ],
+            true,
+        );
 
-        let m = stats.ext_weights.lock().unwrap();
-        assert_eq!(m.get("mp4"), Some(&500), "oba warianty wielkości liter w jednym koszyku: {:?}", *m);
+        let m = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            m.get("mp4"),
+            Some(&500),
+            "oba warianty wielkości liter w jednym koszyku: {:?}",
+            *m
+        );
         assert_eq!(m.get("mkv"), Some(&100));
     }
 
@@ -1341,52 +1847,73 @@ mod tests {
     /// wpisanie tam czegokolwiek byłoby wymyślonym dowodem.
     #[test]
     fn test_czas_utworzenia_tylko_dla_isobmff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         for nazwa in ["a.ts", "b.flv", "c.mkv", "d.wav"] {
             utworz(&dir.path().join(nazwa), b"smieci");
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
             assert!(
                 wyniki[0].created_unix.is_none(),
-                "'{}' nie jest kontenerem ISOBMFF - czas utworzenia musi zostać nieustalony", nazwa
+                "'{}' nie jest kontenerem ISOBMFF - czas utworzenia musi zostać nieustalony",
+                nazwa
             );
         }
     }
 
     #[test]
     fn test_wyniki_trafiaja_do_wlasciwego_kanalu() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("x.mp4"), b"smieci");
         let zadania = [zadanie(1, "x.mp4", true)];
 
         let (tx_db, rx_db) = mpsc::sync_channel(100);
         let (tx_ui, _rx) = mpsc::channel();
         let stats = LiveStats::new(2);
-        process_side_stream(StreamCtx { base_path: dir.path(), tasks: &zadania, side_label: "T", stats: &stats, tx_db, is_ufs: false, start_time: Instant::now(), tx_ui: &tx_ui, bar_idx: 0, });
+        process_side_stream(StreamCtx {
+            base_path: dir.path(),
+            tasks: &zadania,
+            side_label: "T",
+            stats: &stats,
+            tx_db,
+            is_ufs: false,
+            start_time: Instant::now(),
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
+        });
 
         let msgs: Vec<ScanMsg> = rx_db.into_iter().collect();
         assert!(!msgs.is_empty());
-        assert!(msgs.iter().all(|m| matches!(m, ScanMsg::ScriptChunk(_))), "przy is_ufs=false tylko kanał Skryptu");
+        assert!(
+            msgs.iter().all(|m| matches!(m, ScanMsg::ScriptChunk(_))),
+            "przy is_ufs=false tylko kanał Skryptu"
+        );
     }
 
     #[test]
     fn test_identyfikatory_wracaja_nienaruszone() {
-        let dir = tempfile::tempdir().unwrap();
-        let zadania: Vec<Task> = (0..4).map(|i| {
-            let nazwa = format!("p{}.mp4", i);
-            utworz(&dir.path().join(&nazwa), b"smieci");
-            zadanie(500 + i, &nazwa, true)
-        }).collect();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let zadania: Vec<Task> = (0..4)
+            .map(|i| {
+                let nazwa = format!("p{}.mp4", i);
+                utworz(&dir.path().join(&nazwa), b"smieci");
+                zadanie(500 + i, &nazwa, true)
+            })
+            .collect();
 
         let (_, wyniki) = uruchom(dir.path(), &zadania, true);
 
         let mut id: Vec<i32> = wyniki.iter().map(|w| w.id).collect();
         id.sort();
-        assert_eq!(id, vec![500, 501, 502, 503], "wynik wiązany jest z wierszem bazy po id");
+        assert_eq!(
+            id,
+            vec![500, 501, 502, 503],
+            "wynik wiązany jest z wierszem bazy po id"
+        );
     }
 
     #[test]
     fn test_pusta_lista_zadan_nic_nie_wysyla() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let (stats, wyniki) = uruchom(dir.path(), &[], true);
         assert!(wyniki.is_empty());
         assert_eq!(stats.processed_files.load(Ordering::Relaxed), 0);
@@ -1401,29 +1928,55 @@ mod tests {
     #[test]
     #[ignore = "Wymaga image/test_fixture.mp4, test_fixture_real.mkv i test_fixture.flv. Uruchom z --ignored."]
     fn test_e2e_zdrowe_kontenery_sa_uznane_za_sprawne() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let mut zadania = Vec::new();
 
-        for (i, zrodlo) in ["test_fixture.mp4", "test_fixture_real.mkv", "test_fixture.flv"].iter().enumerate() {
+        for (i, zrodlo) in [
+            "test_fixture.mp4",
+            "test_fixture_real.mkv",
+            "test_fixture.flv",
+        ]
+        .iter()
+        .enumerate()
+        {
             let sciezka = Path::new("image").join(zrodlo);
-            if !sciezka.exists() { continue; }
-            fs::copy(&sciezka, dir.path().join(zrodlo)).unwrap();
+            if !sciezka.exists() {
+                continue;
+            }
+            fs::copy(&sciezka, dir.path().join(zrodlo)).expect("Kopiowanie pliku nie powiodło się");
             zadania.push(zadanie(i as i32, zrodlo, true));
         }
-        assert!(!zadania.is_empty(), "co najmniej jeden fixture musi istnieć");
+        assert!(
+            !zadania.is_empty(),
+            "co najmniej jeden fixture musi istnieć"
+        );
 
         let (stats, wyniki) = uruchom(dir.path(), &zadania, true);
 
         assert_eq!(
-            stats.ok.load(Ordering::Relaxed), zadania.len(),
+            stats.ok.load(Ordering::Relaxed),
+            zadania.len(),
             "wszystkie zdrowe kontenery muszą zostać uznane za sprawne, wyniki: {:?}",
-            wyniki.iter().map(|w| (w.id, w.ok, w.reason.clone())).collect::<Vec<_>>()
+            wyniki
+                .iter()
+                .map(|w| (w.id, w.ok, w.reason.clone()))
+                .collect::<Vec<_>>()
         );
         assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
 
         for w in &wyniki {
-            assert_eq!(w.ok, Some(true), "id {} musi być sprawny: {:?}", w.id, w.reason);
-            assert!(w.track_count.is_some(), "sprawny kontener musi zgłosić liczbę ścieżek (id {})", w.id);
+            assert_eq!(
+                w.ok,
+                Some(true),
+                "id {} musi być sprawny: {:?}",
+                w.id,
+                w.reason
+            );
+            assert!(
+                w.track_count.is_some(),
+                "sprawny kontener musi zgłosić liczbę ścieżek (id {})",
+                w.id
+            );
         }
 
         assert!(
@@ -1440,22 +1993,34 @@ mod tests {
     #[test]
     #[ignore = "Wymaga image/test_fixture_mkv_truncated.mkv. Uruchom z --ignored."]
     fn test_e2e_uciety_mkv_trafia_do_kosza_uciec() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let nazwa = "test_fixture_mkv_truncated.mkv";
-        fs::copy(Path::new("image").join(nazwa), dir.path().join(nazwa)).unwrap();
+        fs::copy(Path::new("image").join(nazwa), dir.path().join(nazwa))
+            .expect("Kopiowanie pliku nie powiodło się");
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
 
-        assert_eq!(wyniki[0].ok, Some(false), "ucięty kontener nie jest sprawny: {:?}", wyniki[0].reason);
-        assert_eq!(stats.ok.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "plik istnieje - to nie błąd I/O");
         assert_eq!(
-            stats.err_trunc_common.load(Ordering::Relaxed), 1,
+            wyniki[0].ok,
+            Some(false),
+            "ucięty kontener nie jest sprawny: {:?}",
+            wyniki[0].reason
+        );
+        assert_eq!(stats.ok.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.errors.load(Ordering::Relaxed),
+            0,
+            "plik istnieje - to nie błąd I/O"
+        );
+        assert_eq!(
+            stats.err_trunc_common.load(Ordering::Relaxed),
+            1,
             "MkvDamage::Truncated musi trafić do koszyka „plik ucięty”"
         );
         assert!(
             wyniki[0].reason.as_deref().unwrap_or("").contains("ucięty"),
-            "opis musi nazwać ucięcie: {:?}", wyniki[0].reason
+            "opis musi nazwać ucięcie: {:?}",
+            wyniki[0].reason
         );
     }
 
@@ -1464,18 +2029,24 @@ mod tests {
     #[test]
     #[ignore = "Wymaga image/test_fixture_mp4_pod_mkv.mkv. Uruchom z --ignored."]
     fn test_e2e_mp4_pod_mkv_jest_falszywym_rozszerzeniem() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let nazwa = "test_fixture_mp4_pod_mkv.mkv";
-        fs::copy(Path::new("image").join(nazwa), dir.path().join(nazwa)).unwrap();
+        fs::copy(Path::new("image").join(nazwa), dir.path().join(nazwa))
+            .expect("Kopiowanie pliku nie powiodło się");
 
         let (stats, wyniki) = uruchom(dir.path(), &[zadanie(1, nazwa, true)], true);
 
         assert_eq!(wyniki[0].ok, Some(false));
         assert_eq!(
-            stats.err_ftyp_common.load(Ordering::Relaxed), 1,
+            stats.err_ftyp_common.load(Ordering::Relaxed),
+            1,
             "niespójna struktura EBML (w tym fałszywe rozszerzenie) idzie do koszyka „brak nagłówka”"
         );
-        assert_eq!(stats.err_trunc_common.load(Ordering::Relaxed), 0, "to nie ucięcie");
+        assert_eq!(
+            stats.err_trunc_common.load(Ordering::Relaxed),
+            0,
+            "to nie ucięcie"
+        );
     }
 
     /// ASYMETRIA DO ROZSTRZYGNIĘCIA: gałąź ISOBMFF nie zapisuje opisu przy
@@ -1489,14 +2060,20 @@ mod tests {
     #[test]
     #[ignore = "Wymaga image/test_fixture.mp4 i test_fixture.flv. Uruchom z --ignored."]
     fn test_opis_sukcesu_jest_zapisywany_przez_kazda_galaz() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         let mut sprawdzone = 0;
         // ISOBMFF, FLV i Matroska — trzy różne gałęzie, ta sama umowa.
-        for zrodlo in ["test_fixture.mp4", "test_fixture.flv", "test_fixture_real.mkv"] {
+        for zrodlo in [
+            "test_fixture.mp4",
+            "test_fixture.flv",
+            "test_fixture_real.mkv",
+        ] {
             let sciezka = Path::new("image").join(zrodlo);
-            if !sciezka.exists() { continue; }
-            fs::copy(&sciezka, dir.path().join(zrodlo)).unwrap();
+            if !sciezka.exists() {
+                continue;
+            }
+            fs::copy(&sciezka, dir.path().join(zrodlo)).expect("Kopiowanie pliku nie powiodło się");
 
             let (_, wyniki) = uruchom(dir.path(), &[zadanie(1, zrodlo, true)], true);
             assert_eq!(wyniki[0].ok, Some(true), "{} musi być sprawny", zrodlo);
@@ -1517,28 +2094,45 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn baza() -> Connection {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (1, 'a.mp4', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
         conn
     }
 
-    fn zapisz(conn: &Connection, sql: &str, ok: Option<bool>, powod: Option<&str>, czas: Option<i64>) {
-        conn.execute(sql, params![ok, powod, None::<i64>, Some(2i64), Some(false), 1, czas]).unwrap();
+    fn zapisz(
+        conn: &Connection,
+        sql: &str,
+        ok: Option<bool>,
+        powod: Option<&str>,
+        czas: Option<i64>,
+    ) {
+        conn.execute(
+            sql,
+            params![ok, powod, None::<i64>, Some(2i64), Some(false), 1, czas],
+        )
+        .expect("Inicjalizacja bazy danych nie powiodła się");
     }
 
     #[test]
     fn test_zapis_nie_miesza_kolumn_obu_stron() {
         let conn = baza();
         zapisz(&conn, SQL_ZAPIS_UFS, Some(true), Some("UFS spójny"), None);
-        zapisz(&conn, SQL_ZAPIS_SCRIPT, Some(false), Some("Skrypt uszkodzony"), None);
+        zapisz(
+            &conn,
+            SQL_ZAPIS_SCRIPT,
+            Some(false),
+            Some("Skrypt uszkodzony"),
+            None,
+        );
 
         let (ok_u, ok_s, pow_u, pow_s): (Option<bool>, Option<bool>, Option<String>, Option<String>) = conn.query_row(
             "SELECT video_ok_ufs, video_ok_script, video_reason_ufs, video_reason_script FROM files WHERE id = 1",
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         assert_eq!((ok_u, ok_s), (Some(true), Some(false)));
         assert_eq!(pow_u.as_deref(), Some("UFS spójny"));
@@ -1552,12 +2146,27 @@ mod tests {
         let conn = baza();
         zapisz(&conn, SQL_ZAPIS_UFS, Some(true), Some("spójny"), None);
         // Drugi przebieg: brak orzeczenia (NULL) plus zgłoszony błąd I/O.
-        conn.execute(SQL_ZAPIS_UFS, params![None::<bool>, None::<String>, None::<i64>, None::<i64>, Some(true), 1, None::<i64>]).unwrap();
+        conn.execute(
+            SQL_ZAPIS_UFS,
+            params![
+                None::<bool>,
+                None::<String>,
+                None::<i64>,
+                None::<i64>,
+                Some(true),
+                1,
+                None::<i64>
+            ],
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let (ok, powod, blad): (Option<bool>, Option<String>, Option<bool>) = conn.query_row(
-            "SELECT video_ok_ufs, video_reason_ufs, io_error_ufs FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (ok, powod, blad): (Option<bool>, Option<String>, Option<bool>) = conn
+            .query_row(
+                "SELECT video_ok_ufs, video_reason_ufs, io_error_ufs FROM files WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         assert_eq!(ok, Some(true), "wcześniejsze orzeczenie musi przetrwać");
         assert_eq!(powod.as_deref(), Some("spójny"));
@@ -1572,15 +2181,41 @@ mod tests {
 
         // UFS nie odczytał czasu, Skrypt owszem.
         zapisz(&conn, SQL_ZAPIS_UFS, Some(true), Some("ok"), None);
-        zapisz(&conn, SQL_ZAPIS_SCRIPT, Some(true), Some("ok"), Some(1_669_712_412));
+        zapisz(
+            &conn,
+            SQL_ZAPIS_SCRIPT,
+            Some(true),
+            Some("ok"),
+            Some(1_669_712_412),
+        );
 
-        let czas: Option<i64> = conn.query_row("SELECT video_created_unix FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(czas, Some(1_669_712_412), "czas odczytany przez JEDNĄ stronę wystarcza");
+        let czas: Option<i64> = conn
+            .query_row(
+                "SELECT video_created_unix FROM files WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
+        assert_eq!(
+            czas,
+            Some(1_669_712_412),
+            "czas odczytany przez JEDNĄ stronę wystarcza"
+        );
 
         // I nie zostaje nadpisany przez stronę, która go nie zna.
         zapisz(&conn, SQL_ZAPIS_UFS, Some(true), Some("ok"), None);
-        let czas2: Option<i64> = conn.query_row("SELECT video_created_unix FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(czas2, Some(1_669_712_412), "strona bez czasu nie może go wymazać");
+        let czas2: Option<i64> = conn
+            .query_row(
+                "SELECT video_created_unix FROM files WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
+        assert_eq!(
+            czas2,
+            Some(1_669_712_412),
+            "strona bez czasu nie może go wymazać"
+        );
     }
 
     #[test]
@@ -1588,12 +2223,24 @@ mod tests {
         // Kolejność parametrów jest nieoczywista (`?6` to id, `?7` stoi przed
         // nim w treści) - błąd w wiązaniu podmieniłby wiersze.
         let conn = baza();
-        conn.execute("INSERT INTO files (id, relative_path, found_in_ufs) VALUES (2, 'b.mp4', 1)", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, relative_path, found_in_ufs) VALUES (2, 'b.mp4', 1)",
+            [],
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         zapisz(&conn, SQL_ZAPIS_UFS, Some(true), Some("pierwszy"), None);
 
-        let pow1: Option<String> = conn.query_row("SELECT video_reason_ufs FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
-        let pow2: Option<String> = conn.query_row("SELECT video_reason_ufs FROM files WHERE id = 2", [], |r| r.get(0)).unwrap();
+        let pow1: Option<String> = conn
+            .query_row("SELECT video_reason_ufs FROM files WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
+        let pow2: Option<String> = conn
+            .query_row("SELECT video_reason_ufs FROM files WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         assert_eq!(pow1.as_deref(), Some("pierwszy"));
         assert_eq!(pow2, None, "drugi wiersz nie mógł zostać tknięty");
@@ -1605,66 +2252,115 @@ mod tests {
 
     fn finalizuj(
         rel: &str,
-        found_ufs: bool, found_script: bool,
-        ok_ufs: Option<bool>, ok_script: Option<bool>,
-        err_ufs: Option<bool>, err_script: Option<bool>,
+        found_ufs: bool,
+        found_script: bool,
+        ok_ufs: Option<bool>,
+        ok_script: Option<bool>,
+        err_ufs: Option<bool>,
+        err_script: Option<bool>,
     ) -> Option<bool> {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, video_ok_ufs, video_ok_script, io_error_ufs, io_error_script, phase19_done)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
             params![rel, found_ufs, found_script, ok_ufs, ok_script, err_ufs, err_script],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
 
-        conn.execute(SQL_FINALIZACJA, []).unwrap();
-        conn.query_row("SELECT phase19_done FROM files WHERE id = 1", [], |r| r.get(0)).unwrap()
+        conn.execute(SQL_FINALIZACJA, [])
+            .expect("Inicjalizacja bazy danych nie powiodła się");
+        conn.query_row("SELECT phase19_done FROM files WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("Inicjalizacja bazy danych nie powiodła się")
     }
 
     #[test]
     fn test_obie_strony_rozstrzygniete_domykaja_faze() {
-        assert_eq!(finalizuj("a.mp4", true, true, Some(true), Some(false), Some(false), Some(false)), Some(true));
+        assert_eq!(
+            finalizuj(
+                "a.mp4",
+                true,
+                true,
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false)
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_blad_io_tez_domyka_strone() {
         // Inaczej plik z trwale niedostępnego nośnika wracałby do kolejki bez końca.
-        assert_eq!(finalizuj("a.mkv", true, true, Some(true), None, Some(false), Some(true)), Some(true));
+        assert_eq!(
+            finalizuj(
+                "a.mkv",
+                true,
+                true,
+                Some(true),
+                None,
+                Some(false),
+                Some(true)
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_strona_nieobecna_jest_z_definicji_rozstrzygnieta() {
-        assert_eq!(finalizuj("a.flv", true, false, Some(true), None, Some(false), None), Some(true));
+        assert_eq!(
+            finalizuj("a.flv", true, false, Some(true), None, Some(false), None),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_brak_wyniku_bez_bledu_zostawia_plik_w_kolejce() {
         assert_eq!(
-            finalizuj("a.ts", true, true, Some(true), None, Some(false), None), Some(false),
+            finalizuj("a.ts", true, true, Some(true), None, Some(false), None),
+            Some(false),
             "strona obecna, nieprzeanalizowana i bez błędu musi zostać do ponowienia"
         );
     }
 
     #[test]
     fn test_finalizacja_nie_rusza_plikow_niebedacych_wideo() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, phase19_done) VALUES (1, 'zdjecie.jpg', 1, 0, 0)",
             [],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
 
-        conn.execute(SQL_FINALIZACJA, []).unwrap();
+        conn.execute(SQL_FINALIZACJA, [])
+            .expect("Inicjalizacja bazy danych nie powiodła się");
 
-        let gotowe: Option<bool> = conn.query_row("SELECT phase19_done FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(gotowe, Some(false), "plik poza zakresem fazy nie może dostać jej flagi ukończenia");
+        let gotowe: Option<bool> = conn
+            .query_row("SELECT phase19_done FROM files WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("Inicjalizacja bazy danych nie powiodła się");
+        assert_eq!(
+            gotowe,
+            Some(false),
+            "plik poza zakresem fazy nie może dostać jej flagi ukończenia"
+        );
     }
 
     #[test]
     fn test_finalizacja_obejmuje_kazde_obslugiwane_rozszerzenie() {
-        for ext in ["mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi", "mp3"] {
+        for ext in [
+            "mp4", "mov", "m4v", "ts", "m2ts", "mts", "mkv", "webm", "mka", "flv", "wav", "avi",
+            "mp3",
+        ] {
             let nazwa = format!("film.{}", ext);
             assert_eq!(
-                finalizuj(&nazwa, true, false, Some(true), None, Some(false), None), Some(true),
-                "rozszerzenie .{} musi być objęte domknięciem fazy", ext
+                finalizuj(&nazwa, true, false, Some(true), None, Some(false), None),
+                Some(true),
+                "rozszerzenie .{} musi być objęte domknięciem fazy",
+                ext
             );
         }
     }

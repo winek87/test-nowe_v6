@@ -26,16 +26,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, hash_file, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path, hash_file};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{info, instrument};
 
@@ -88,11 +88,11 @@ pub(crate) struct LiveStats {
     hash_errors: AtomicUsize,
     /// Pliki, których rozszerzenie nie zgadza się z prawdziwym nagłówkiem binarnym.
     magic_errors: AtomicUsize,
-    valid_signatures: AtomicUsize, 
-    
+    valid_signatures: AtomicUsize,
+
     /// Suma wag (bajtów) per rozszerzenie — do wyliczenia "Top format" w panelu bocznym.
     ext_weights: Mutex<HashMap<String, u64>>,
-    
+
     offset_anomalies: AtomicUsize,
     null_padding: AtomicUsize,
     ascii_trash: AtomicUsize,
@@ -186,50 +186,78 @@ struct HeaderAnomalies {
 /// używane w heurystyce `has_trash`.
 fn analyze_header_cluster(buf: &[u8], file_size: u64, ext: &str) -> HeaderAnomalies {
     let mut anom = HeaderAnomalies {
-        is_micro: false, has_null: false, has_offset: false, has_trash: false,
-        sub_magic_err: false, slack_contam: false, parasitic: false,
-        endian_conflict: false, boundary_drop: false, high_volatility: false,
+        is_micro: false,
+        has_null: false,
+        has_offset: false,
+        has_trash: false,
+        sub_magic_err: false,
+        slack_contam: false,
+        parasitic: false,
+        endian_conflict: false,
+        boundary_drop: false,
+        high_volatility: false,
     };
 
     if file_size < 32 || buf.len() < 32 {
         anom.is_micro = true;
-        return anom; 
+        return anom;
     }
 
     anom.has_null = buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0x00;
-    
-    anom.has_offset = buf.windows(4).position(|w| {
-        w == b"\xFF\xD8\xFF\xE0" || w == b"\xFF\xD8\xFF\xE1" ||
-        w == b"\x50\x4B\x03\x04" ||
-        w == b"%PDF" ||
-        w == b"\x89PNG"
-    }).is_some_and(|pos| pos > 0 && pos < buf.len().saturating_sub(4));
+
+    anom.has_offset = buf
+        .windows(4)
+        .position(|w| {
+            w == b"\xFF\xD8\xFF\xE0"
+                || w == b"\xFF\xD8\xFF\xE1"
+                || w == b"\x50\x4B\x03\x04"
+                || w == b"%PDF"
+                || w == b"\x89PNG"
+        })
+        .is_some_and(|pos| pos > 0 && pos < buf.len().saturating_sub(4));
 
     let is_pdf = &buf[0..4] == b"%PDF";
-    anom.has_trash = !is_pdf && buf[0..4].iter().all(|b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation()) 
-        && !anom.has_offset 
+    anom.has_trash = !is_pdf
+        && buf[0..4]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation())
+        && !anom.has_offset
         && matches!(ext, "jpg" | "zip" | "mp4" | "png");
 
-    if buf.len() >= 12 && &buf[0..4] == b"RIFF" && &buf[8..12] != b"AVI " && &buf[8..12] != b"WEBP" && &buf[8..12] != b"WAVE" {
+    if buf.len() >= 12
+        && &buf[0..4] == b"RIFF"
+        && &buf[8..12] != b"AVI "
+        && &buf[8..12] != b"WEBP"
+        && &buf[8..12] != b"WAVE"
+    {
         anom.sub_magic_err = true;
     }
-    
-    if buf.len() >= 10 && &buf[0..2] == b"BM" && (buf[6] != 0 || buf[7] != 0 || buf[8] != 0 || buf[9] != 0) {
+
+    if buf.len() >= 10
+        && &buf[0..2] == b"BM"
+        && (buf[6] != 0 || buf[7] != 0 || buf[8] != 0 || buf[9] != 0)
+    {
         anom.slack_contam = true;
     }
-    
-    anom.parasitic = buf[32..].windows(4).any(|w| w == b"\x50\x4B\x03\x04" || w == b"\x50\x45\x00\x00");
 
-    if buf.len() >= 4 && &buf[0..2] == b"II" && buf[2] == 0x00 && buf[3] == 0x2A { 
+    anom.parasitic = buf[32..]
+        .windows(4)
+        .any(|w| w == b"\x50\x4B\x03\x04" || w == b"\x50\x45\x00\x00");
+
+    if buf.len() >= 4 && &buf[0..2] == b"II" && buf[2] == 0x00 && buf[3] == 0x2A {
         anom.endian_conflict = true;
     }
 
     if buf.len() >= 512 {
-        anom.boundary_drop = (buf[508] == 0x00 && buf[509] == 0x00 && buf[510] == 0x00 && buf[511] == 0x00) 
-                          || (buf[508] == 0xFF && buf[509] == 0xFF && buf[510] == 0xFF && buf[511] == 0xFF);
+        anom.boundary_drop =
+            (buf[508] == 0x00 && buf[509] == 0x00 && buf[510] == 0x00 && buf[511] == 0x00)
+                || (buf[508] == 0xFF && buf[509] == 0xFF && buf[510] == 0xFF && buf[511] == 0xFF);
     }
 
-    let volatility: i32 = buf.windows(2).map(|w| (w[0] as i32 - w[1] as i32).abs()).sum();
+    let volatility: i32 = buf
+        .windows(2)
+        .map(|w| (w[0] as i32 - w[1] as i32).abs())
+        .sum();
     anom.high_volatility = volatility > 60000;
 
     anom
@@ -242,28 +270,60 @@ fn analyze_header_cluster(buf: &[u8], file_size: u64, ext: &str) -> HeaderAnomal
 /// inna, niezależna instancja Rayon z własną numeracją slotów, więc sumowanie
 /// obu numeracji razem byłoby mylące (patrz zastrzeżenie w `thread_activity`).
 fn build_crypto_block(own: &LiveStats, other: &LiveStats, start_time: Instant) -> String {
-    let combined_bytes = own.processed_bytes.load(Ordering::Relaxed) + other.processed_bytes.load(Ordering::Relaxed);
+    let combined_bytes =
+        own.processed_bytes.load(Ordering::Relaxed) + other.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed_mb = (combined_bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_exts_str = {
         let mut merged: HashMap<String, u64> = HashMap::new();
-        for (k, v) in own.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
-        for (k, v) in other.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
+        for (k, v) in own
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            *merged.entry(k.clone()).or_insert(0) += v;
+        }
+        for (k, v) in other
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            *merged.entry(k.clone()).or_insert(0) += v;
+        }
         let mut sorted: Vec<_> = merged.into_iter().collect();
         sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_top = if top_exts_str.is_empty() { "Analiza danych...".to_string() } else { top_exts_str };
+    let display_top = if top_exts_str.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_exts_str
+    };
 
-    let combined_valid = own.valid_signatures.load(Ordering::Relaxed) + other.valid_signatures.load(Ordering::Relaxed);
-    let combined_io_err = own.hash_errors.load(Ordering::Relaxed) + other.hash_errors.load(Ordering::Relaxed);
-    let combined_magic_err = own.magic_errors.load(Ordering::Relaxed) + other.magic_errors.load(Ordering::Relaxed);
+    let combined_valid = own.valid_signatures.load(Ordering::Relaxed)
+        + other.valid_signatures.load(Ordering::Relaxed);
+    let combined_io_err =
+        own.hash_errors.load(Ordering::Relaxed) + other.hash_errors.load(Ordering::Relaxed);
+    let combined_magic_err =
+        own.magic_errors.load(Ordering::Relaxed) + other.magic_errors.load(Ordering::Relaxed);
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&own.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&own.thread_activity.snapshot());
 
     format!(
         "[Kryptografia i sygnatury]\nPrędkość: {:.2} MB/s\nTop format: {}\nPoprawne sygnatury: {}\nBłędy I/O: {}\nSpoofing (magic): {}\nWątki BLAKE3 (Wariant A): {}",
@@ -274,7 +334,8 @@ fn build_crypto_block(own: &LiveStats, other: &LiveStats, start_time: Instant) -
 /// Buduje zbiorczy blok "[Anomalie pierwszego klastra]" sumując 9 kategorii
 /// anomalii nagłówka z OBU stron, zgodnie z Wariantem B panelu bocznego.
 fn build_anomaly_block(own: &LiveStats, other: &LiveStats) -> String {
-    let sum = |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
+    let sum =
+        |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
 
     format!(
         "[Anomalie pierwszego klastra]\nPrzesunięty nagłówek: {}\nNull-padding: {}\nŚmieci ASCII: {}\nMikro-plik <32B: {}\nZła pod-sygnatura: {}\nSkażony slack space: {}\nIniekcja pasożytnicza: {}\nKonflikt endian: {}\nUrwana granica sektora: {}\nWysoka wolatywność: {}",
@@ -325,6 +386,7 @@ pub struct StreamCtx<'a> {
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
     pub start_time: Instant,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 /// Odnotowuje, że JEDEN plik z `chunk` został "rozpatrzony" — niezależnie od
@@ -358,7 +420,9 @@ fn advance_progress(
     file_size: u64,
 ) {
     stats.processed_files.fetch_add(1, Ordering::Relaxed);
-    stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
+    stats
+        .processed_bytes
+        .fetch_add(file_size, Ordering::Relaxed);
 
     let current = stats.processed_files.load(Ordering::Relaxed);
     let now = Instant::now();
@@ -368,7 +432,7 @@ fn advance_progress(
         *last_ui_update = now;
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() {
                 *global_map.entry(k).or_insert(0) += v;
             }
@@ -395,16 +459,31 @@ fn advance_progress(
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
-
 #[allow(clippy::match_like_matches_macro)]
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, other_stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log, start_time } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        other_stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        start_time,
+        debug_log,
+    } = ctx;
+    let metoda = "hash_file (BLAKE3, magic bytes)";
 
     // Używamy for_each_init w celu zachowania stanu per-wątek (stoper UI + bufor logów)
     tasks.par_chunks(CHUNK_SIZE).for_each_init(
         || (tx_db.clone(), Instant::now(), Vec::new()),
         |(tx, last_ui_update, log_buf), chunk| {
-            if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
+            if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                return;
+            }
 
             let mut results = Vec::with_capacity(chunk.len());
             let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
@@ -429,19 +508,52 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             // niżej pliku: `advance_progress`).
 
             for task in chunk {
-                if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 let full_path: PathBuf = base_path.join(&task.rel_path);
+
+                // Log info: linia "Start" PRZED jakimkolwiek I/O — niezależnie
+                // od tego, na której z czterech ścieżek wyjścia plik się
+                // skończy (patrz "Koniec" w każdej z nich niżej).
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                ));
 
                 let mut file = match File::open(&full_path) {
                     Ok(f) => f,
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
                         // Logujemy do lokalnego wektora zamiast blokować Mutexa
-                        log_buf.push(format!("[{}] Błąd I/O (Brak dostępu): \"{}\"", side_label, task.rel_path));
-                        results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        log_buf.push(format!(
+                            "[{}] Błąd I/O (Brak dostępu): \"{}\"",
+                            side_label, task.rel_path
+                        ));
+                        log_buf.push(format!(
+                            "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: BŁĄD I/O (otwarcie)] Źródło: \"{}\"",
+                            crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                        ));
+                        results.push(ScanResult {
+                            id: task.id,
+                            hash: None,
+                            magic_ok: None,
+                            io_error: Some(true),
+                        });
                         // Rozmiar nieznany - plik nigdy się nie otworzył, nie ma czego zmierzyć.
-                        advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, 0);
+                        advance_progress(
+                            stats,
+                            other_stats,
+                            tx_ui,
+                            bar_idx,
+                            start_time,
+                            last_ui_update,
+                            &mut local_ext_weights,
+                            &full_path,
+                            task,
+                            0,
+                        );
                         continue;
                     }
                 };
@@ -466,9 +578,32 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     Ok(n) => n,
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
-                        log_buf.push(format!("[{}] Błąd I/O (odczyt nagłówka): \"{}\"", side_label, task.rel_path));
-                        results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
-                        advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
+                        log_buf.push(format!(
+                            "[{}] Błąd I/O (odczyt nagłówka): \"{}\"",
+                            side_label, task.rel_path
+                        ));
+                        log_buf.push(format!(
+                            "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: BŁĄD I/O (odczyt nagłówka)] Źródło: \"{}\"",
+                            crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                        ));
+                        results.push(ScanResult {
+                            id: task.id,
+                            hash: None,
+                            magic_ok: None,
+                            io_error: Some(true),
+                        });
+                        advance_progress(
+                            stats,
+                            other_stats,
+                            tx_ui,
+                            bar_idx,
+                            start_time,
+                            last_ui_update,
+                            &mut local_ext_weights,
+                            &full_path,
+                            task,
+                            file_size,
+                        );
                         continue;
                     }
                 };
@@ -483,70 +618,162 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     // `io_error=Some(false)` dawało kombinację, która nigdy nie spełnia
                     // warunku `phase3_done` (`hash_ufs IS NOT NULL OR io_error_ufs = 1`) -
                     // plik wracał do kolejki i był przetwarzany od nowa w nieskończoność.
-                    match stats.thread_activity.track_current(|| hash_file(&full_path)) {
+                    let call_start = debug_log.is_active().then(Instant::now);
+                    let wynik_hash = stats
+                        .thread_activity
+                        .track_current(|| hash_file(&full_path));
+                    let wynik = if wynik_hash.is_ok() { "OK" } else { "BŁĄD I/O" };
+                    if let Some(t) = call_start {
+                        debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+                    }
+                    log_buf.push(format!(
+                        "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                        crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                    ));
+                    match wynik_hash {
                         Ok(h) => {
                             results.push(ScanResult {
                                 id: task.id,
                                 hash: Some(h),
-                                magic_ok: Some(true), io_error: Some(false)
+                                magic_ok: Some(true),
+                                io_error: Some(false),
                             });
                         }
                         Err(_) => {
                             stats.hash_errors.fetch_add(1, Ordering::Relaxed);
-                            log_buf.push(format!("[{}] Błąd I/O (hashowanie pustego pliku nie powiodło się): \"{}\"", side_label, task.rel_path));
-                            results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                            log_buf.push(format!(
+                                "[{}] Błąd I/O (hashowanie pustego pliku nie powiodło się): \"{}\"",
+                                side_label, task.rel_path
+                            ));
+                            results.push(ScanResult {
+                                id: task.id,
+                                hash: None,
+                                magic_ok: None,
+                                io_error: Some(true),
+                            });
                         }
                     }
-                    advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
+                    advance_progress(
+                        stats,
+                        other_stats,
+                        tx_ui,
+                        bar_idx,
+                        start_time,
+                        last_ui_update,
+                        &mut local_ext_weights,
+                        &full_path,
+                        task,
+                        file_size,
+                    );
                     continue;
                 }
 
                 let first_chunk = &buffer[..first_read];
-                let file_name = Path::new(&task.rel_path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-                let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
-                
+                let file_name = Path::new(&task.rel_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let ext = Path::new(&task.rel_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("brak")
+                    .to_lowercase();
+
                 *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size as u64;
 
                 let a = analyze_header_cluster(first_chunk, file_size, &ext);
                 let mut detected_anomalies = Vec::new();
 
-                if a.is_micro { stats.micro_files.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Mikro-plik (<32B)"); }
-                if a.has_null { stats.null_padding.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Puste bloki (Null-Padding)"); }
-                if a.has_offset { stats.offset_anomalies.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Przesunięty Nagłówek"); }
-                if a.has_trash { stats.ascii_trash.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Śmieci ASCII"); }
-                if a.sub_magic_err { stats.sub_magic_errors.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Błąd Pod-Sygnatury"); }
-                if a.slack_contam { stats.slack_space_contam.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Skażenie Slack Space"); }
-                if a.parasitic { stats.parasitic_injections.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Iniekcja Pasożytnicza"); }
-                if a.endian_conflict { stats.endian_conflicts.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Konflikt Endianness"); }
-                if a.boundary_drop { stats.boundary_drops.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Urwana Granica Sektora"); }
-                if a.high_volatility { stats.high_volatility.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Wysoka Wolatywność (HFV)"); }
+                if a.is_micro {
+                    stats.micro_files.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Mikro-plik (<32B)");
+                }
+                if a.has_null {
+                    stats.null_padding.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Puste bloki (Null-Padding)");
+                }
+                if a.has_offset {
+                    stats.offset_anomalies.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Przesunięty Nagłówek");
+                }
+                if a.has_trash {
+                    stats.ascii_trash.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Śmieci ASCII");
+                }
+                if a.sub_magic_err {
+                    stats.sub_magic_errors.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Błąd Pod-Sygnatury");
+                }
+                if a.slack_contam {
+                    stats.slack_space_contam.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Skażenie Slack Space");
+                }
+                if a.parasitic {
+                    stats.parasitic_injections.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Iniekcja Pasożytnicza");
+                }
+                if a.endian_conflict {
+                    stats.endian_conflicts.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Konflikt Endianness");
+                }
+                if a.boundary_drop {
+                    stats.boundary_drops.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Urwana Granica Sektora");
+                }
+                if a.high_volatility {
+                    stats.high_volatility.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Wysoka Wolatywność (HFV)");
+                }
 
                 let mut magic_ok = Some(true);
                 if file_name.contains('.') {
                     let parts: Vec<&str> = file_name.split('.').filter(|s| !s.is_empty()).collect();
-                    let ext_parts = if parts.len() > 1 { &parts[1..] } else { &parts[0..] };
+                    let ext_parts = if parts.len() > 1 {
+                        &parts[1..]
+                    } else {
+                        &parts[0..]
+                    };
 
                     if let Some(kind) = infer::get(first_chunk) {
                         let kind_ext = kind.extension();
                         let matches = ext_parts.iter().any(|&e| {
-                            kind_ext == e || match (kind_ext, e) {
-                                ("jpg", "jpeg") | ("jpeg", "jpg") => true,
-                                ("tif", "tiff") | ("tiff", "tif") | ("tif", "dng") | ("tiff", "dng") | ("tif", "cr2") | ("tif", "nef") | ("tif", "arw") => true, 
-                                ("heic", "heif") | ("heif", "heic") | ("heic", "hef") | ("heif", "hef") => true,
-                                ("mp4", "m4v") | ("mov", "mp4") | ("mp4", "mov") => true, 
-                                ("mkv", "webm") | ("webm", "mkv") => true, 
-                                ("mpeg", "mpg") | ("mpg", "mpeg") | ("mpeg", "ts") | ("mpg", "ts") => true, 
-                                ("ogg", "ogv") | ("ogg", "oga") | ("ogg", "ogx") => true,
-                                ("flv", "f4v") => true,
-                                ("zip", "docx") | ("zip", "xlsx") | ("zip", "pptx") => true,
-                                ("zip", "odt") | ("zip", "ods") | ("zip", "odp") => true,
-                                ("zip", "epub") | ("zip", "apk") | ("zip", "jar") => true,
-                                ("gz", "tar") | ("bz2", "tar") | ("7z", "tar") | ("rar", "tar") => true,
-                                ("sqlite", "db") | ("sqlite", "sqlite3") | ("sqlite3", "db") => true,
-                                ("htm", "html") | ("html", "htm") => true,
-                                ("mid", "midi") | ("midi", "mid") => true,
-                                _ => false,
-                            }
+                            kind_ext == e
+                                || match (kind_ext, e) {
+                                    ("jpg", "jpeg") | ("jpeg", "jpg") => true,
+                                    ("tif", "tiff")
+                                    | ("tiff", "tif")
+                                    | ("tif", "dng")
+                                    | ("tiff", "dng")
+                                    | ("tif", "cr2")
+                                    | ("tif", "nef")
+                                    | ("tif", "arw") => true,
+                                    ("heic", "heif")
+                                    | ("heif", "heic")
+                                    | ("heic", "hef")
+                                    | ("heif", "hef") => true,
+                                    ("mp4", "m4v") | ("mov", "mp4") | ("mp4", "mov") => true,
+                                    ("mkv", "webm") | ("webm", "mkv") => true,
+                                    ("mpeg", "mpg")
+                                    | ("mpg", "mpeg")
+                                    | ("mpeg", "ts")
+                                    | ("mpg", "ts") => true,
+                                    ("ogg", "ogv") | ("ogg", "oga") | ("ogg", "ogx") => true,
+                                    ("flv", "f4v") => true,
+                                    ("zip", "docx") | ("zip", "xlsx") | ("zip", "pptx") => true,
+                                    ("zip", "odt") | ("zip", "ods") | ("zip", "odp") => true,
+                                    ("zip", "epub") | ("zip", "apk") | ("zip", "jar") => true,
+                                    ("gz", "tar")
+                                    | ("bz2", "tar")
+                                    | ("7z", "tar")
+                                    | ("rar", "tar") => true,
+                                    ("sqlite", "db")
+                                    | ("sqlite", "sqlite3")
+                                    | ("sqlite3", "db") => true,
+                                    ("htm", "html") | ("html", "htm") => true,
+                                    ("mid", "midi") | ("midi", "mid") => true,
+                                    _ => false,
+                                }
                         });
 
                         if matches {
@@ -567,7 +794,13 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 if !detected_anomalies.is_empty() {
                     let anomalies_str = detected_anomalies.join(", ");
-                    log_buf.push(format!("[{:<15}] [{}] Format: .{:<5} | Ścieżka: \"{}\"", side_label, anomalies_str, ext, full_path.display()));
+                    log_buf.push(format!(
+                        "[{:<15}] [{}] Format: .{:<5} | Ścieżka: \"{}\"",
+                        side_label,
+                        anomalies_str,
+                        ext,
+                        full_path.display()
+                    ));
                 }
 
                 // --- WŁAŚCIWE HASHOWANIE: przez zoptymalizowaną funkcję z utils.rs ---
@@ -589,7 +822,23 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 // więc plik z bad sectorem trafionym w środku (nagłówek 128KB odczytał się
                 // poprawnie, dalsza część pliku już nie) wpadał w tę samą nieskończoną
                 // pętlę ponawiania.
-                let (file_hash, hash_io_error) = match stats.thread_activity.track_current(|| hash_file(&full_path)) {
+                let call_start = debug_log.is_active().then(Instant::now);
+                let wynik_hash = stats
+                    .thread_activity
+                    .track_current(|| hash_file(&full_path));
+                let wynik = match &wynik_hash {
+                    Ok(_) => "OK",
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => "PRZERWANO",
+                    Err(_) => "BŁĄD I/O",
+                };
+                if let Some(t) = call_start {
+                    debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+                }
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                ));
+                let (file_hash, hash_io_error) = match wynik_hash {
                     Ok(h) => (Some(h), false),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         // Anulowanie przez użytkownika (Ctrl+C) — NIE liczymy jako błąd dysku
@@ -597,27 +846,43 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     }
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
-                        log_buf.push(format!("[{}] Błąd I/O podczas właściwego hashowania: \"{}\"", side_label, task.rel_path));
+                        log_buf.push(format!(
+                            "[{}] Błąd I/O podczas właściwego hashowania: \"{}\"",
+                            side_label, task.rel_path
+                        ));
                         (None, true)
                     }
                 };
 
-                if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                advance_progress(stats, other_stats, tx_ui, bar_idx, start_time, last_ui_update, &mut local_ext_weights, &full_path, task, file_size);
+                advance_progress(
+                    stats,
+                    other_stats,
+                    tx_ui,
+                    bar_idx,
+                    start_time,
+                    last_ui_update,
+                    &mut local_ext_weights,
+                    &full_path,
+                    task,
+                    file_size,
+                );
 
                 results.push(ScanResult {
                     id: task.id,
                     hash: file_hash,
                     magic_ok,
-                    io_error: Some(hash_io_error)
+                    io_error: Some(hash_io_error),
                 });
             }
 
             // --- Zrzuty zbiorcze na koniec pętli nad paczką ---
 
             if !local_ext_weights.is_empty() {
-                let mut global_map = stats.ext_weights.lock().unwrap();
+                let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in local_ext_weights.drain() {
                     *global_map.entry(k).or_insert(0) += v;
                 }
@@ -625,11 +890,12 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
             // Hurtowy zapis logów do pliku tekstowego na dysku
             if !log_buf.is_empty()
-                && let Ok(mut f) = opr_log.lock() {
-                    for line in log_buf.drain(..) {
-                        let _ = writeln!(f, "{}", line);
-                    }
+                && let Ok(mut f) = opr_log.lock()
+            {
+                for line in log_buf.drain(..) {
+                    let _ = writeln!(f, "{}", line);
                 }
+            }
 
             if !results.is_empty() {
                 if is_ufs {
@@ -638,7 +904,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     let _ = tx.send(ScanMsg::ScriptChunk(results));
                 }
             }
-        }
+        },
     );
 
     let _ = tx_ui.send(PhaseEvent::UpdateBar {
@@ -682,7 +948,11 @@ fn compute_half_threads(total_threads: usize) -> usize {
 /// tu maskujący błąd sizingu). Obserwowane na Raspberry Pi 5: 4 aktywne
 /// wątki Rayon w trybie SEQUENTIAL, panel pokazywał tylko 2 sloty.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Punkt wejścia Fazy 3, wołany przez `menu::actions::run_phase_with_ui`.
@@ -697,20 +967,39 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 ///
 /// Idempotentna na poziomie pliku: pliki z już wyliczonym hashem lub
 /// oznaczone błędem I/O są pomijane przy kolejnym uruchomieniu (`phase3_done`).
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     crate::utils::CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 3").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza3.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza3.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 3")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza3.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza3.txt".to_string(),
+        });
+
     std::fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza3.txt", &stamp),
+        &config.log_level,
+    );
+
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -718,22 +1007,45 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 3 (FAŁSZYWE ROZSZERZENIA I ANOMALIE KLASTRA) ===");
-        let _ = writeln!(f, "Zestawienie plików, których zawartość binarna nie zgadza się z rozszerzeniem (wykrywane na żywo):\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 3 (FAŁSZYWE ROZSZERZENIA I ANOMALIE KLASTRA) ==="
+        );
+        let _ = writeln!(
+            f,
+            "Zestawienie plików, których zawartość binarna nie zgadza się z rozszerzeniem (wykrywane na żywo):\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 3. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 3. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -741,48 +1053,86 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // --- ETAP 1: POBIERANIE ZADAŃ Z BAZY ---
     let mut stmt = conn.prepare(
         "SELECT id, relative_path, hash_ufs, hash_script, io_error_ufs, io_error_script 
-         FROM files WHERE size_match = 1 AND phase3_done = 0"
+         FROM files WHERE size_match = 1 AND phase3_done = 0",
     )?;
-    
+
     let mut ufs_tasks: Vec<Task> = Vec::new();
     let mut script_tasks: Vec<Task> = Vec::new();
-    
+
     let mut skipped_ufs = 0;
     let mut skipped_script = 0;
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, 
-            row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, 
-            row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, h_ufs, h_scr, err_ufs, err_scr) = r;
-        
-        if h_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone() }); } 
-        else { skipped_ufs += 1; }
-        
-        if h_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel }); } 
-        else { skipped_script += 1; }
+
+        if h_ufs.is_none() && err_ufs != Some(true) {
+            ufs_tasks.push(Task {
+                id,
+                rel_path: rel.clone(),
+            });
+        } else {
+            skipped_ufs += 1;
+        }
+
+        if h_scr.is_none() && err_scr != Some(true) {
+            script_tasks.push(Task { id, rel_path: rel });
+        } else {
+            skipped_script += 1;
+        }
     }
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto pliki z wyliczonym już hashem. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto pliki z wyliczonym już hashem. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_files = ufs_tasks.len() + script_tasks.len();
     if total_files == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików o tym samym rozmiarze do weryfikacji. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Hashowanie jest już kompletne. Zamykam status fazy (Etap 4 i 5)...".to_string(),
+        ));
+        // UWAGA: Usunięto `return Ok(());` aby pozwolić skryptowi przejść do Etapu 4 i odznaczyć zablokowane pliki!
     }
 
+    //    let total_files = ufs_tasks.len() + script_tasks.len();
+    //    if total_files == 0 {
+    //        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików o tym samym rozmiarze do weryfikacji. Baza aktualna.".to_string()));
+    //        return Ok(());
+    //    }
+
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (BLAKE3)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (BLAKE3)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_files as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (BLAKE3)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (BLAKE3)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_files as u64,
+        color: Color::Green,
+    });
 
     // Wyliczone TERAZ (nie tylko w gałęzi CONCURRENT niżej), bo LiveStats
     // potrzebuje tej wartości do rozmiaru trackera zajętości (Wariant A,
@@ -893,6 +1243,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let tx2 = tx_db.clone();
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -906,44 +1258,137 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
                     // Tworzymy prywatną pulę wątków TYLKO dla UFS
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, other_stats: stat_s, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_path,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                other_stats: stat_s,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                opr_log: log_u,
+                                start_time,
+                                debug_log: dbg_u.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, other_stats: stat_s, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_path,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            other_stats: stat_s,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: log_u,
+                            start_time,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie dysku UFS zakończone.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Hashowanie dysku UFS zakończone.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
                 if !script_tasks.is_empty() {
                     // Tworzymy prywatną pulę wątków TYLKO dla Skryptu
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, other_stats: stat_u, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_path,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                other_stats: stat_u,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                opr_log: log_s,
+                                start_time,
+                                debug_log: dbg_s.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, other_stats: stat_u, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_path,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            other_stats: stat_u,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: log_s,
+                            start_time,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie dysku Skryptu zakończone.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Hashowanie dysku Skryptu zakończone.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
-
         } else {
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
-            
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, other_stats: &script_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie dysku UFS zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_path,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    other_stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: log_u,
+                    start_time,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Hashowanie dysku UFS zakończone.".to_string(),
+                ));
             }
-            
+
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, other_stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie dysku Skryptu zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_path,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    other_stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: log_s,
+                    start_time,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Hashowanie dysku Skryptu zakończone.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -966,12 +1411,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa korelacja danych i budowa macierzy w SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa korelacja danych i budowa macierzy w SQLite...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET 
             hash_match = CASE 
@@ -995,90 +1444,238 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let mut stmt = conn.prepare("SELECT relative_path, hash_match, magic_ok_ufs, magic_ok_script FROM files WHERE size_match = 1 AND phase3_done = 1 AND found_in_ufs = 1 AND found_in_script = 1")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?, row.get::<_, Option<bool>>(2)?, row.get::<_, Option<bool>>(3)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<bool>>(1)?,
+            row.get::<_, Option<bool>>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+        ))
     })?;
 
     for (rel_path, hash_match, magic_ufs, magic_script) in rows.flatten() {
-        if hash_match == Some(true) { match_count += 1; } 
-        else if hash_match == Some(false) { mismatch_count += 1; }
-        
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
-        if magic_ufs == Some(false) { *spoofing_matrix_ufs.entry(ext.clone()).or_insert(0) += 1; }
-        if magic_script == Some(false) { *spoofing_matrix_script.entry(ext).or_insert(0) += 1; }
+        if hash_match == Some(true) {
+            match_count += 1;
+        } else if hash_match == Some(false) {
+            mismatch_count += 1;
+        }
+
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
+        if magic_ufs == Some(false) {
+            *spoofing_matrix_ufs.entry(ext.clone()).or_insert(0) += 1;
+        }
+        if magic_script == Some(false) {
+            *spoofing_matrix_script.entry(ext).or_insert(0) += 1;
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    
-    let ufs_anom = ufs_stats.offset_anomalies.load(Ordering::SeqCst) + ufs_stats.null_padding.load(Ordering::SeqCst) + ufs_stats.ascii_trash.load(Ordering::SeqCst) + ufs_stats.sub_magic_errors.load(Ordering::SeqCst) + ufs_stats.slack_space_contam.load(Ordering::SeqCst) + ufs_stats.parasitic_injections.load(Ordering::SeqCst) + ufs_stats.endian_conflicts.load(Ordering::SeqCst) + ufs_stats.boundary_drops.load(Ordering::SeqCst) + ufs_stats.high_volatility.load(Ordering::SeqCst);
-    let scr_anom = script_stats.offset_anomalies.load(Ordering::SeqCst) + script_stats.null_padding.load(Ordering::SeqCst) + script_stats.ascii_trash.load(Ordering::SeqCst) + script_stats.sub_magic_errors.load(Ordering::SeqCst) + script_stats.slack_space_contam.load(Ordering::SeqCst) + script_stats.parasitic_injections.load(Ordering::SeqCst) + script_stats.endian_conflicts.load(Ordering::SeqCst) + script_stats.boundary_drops.load(Ordering::SeqCst) + script_stats.high_volatility.load(Ordering::SeqCst);
-    
-    let all_anomalies = ufs_anom + scr_anom;
-    let tot_micro = ufs_stats.micro_files.load(Ordering::SeqCst) + script_stats.micro_files.load(Ordering::SeqCst);
-    
-    let confidence_score = if total_files > 0 { 
-        let clean = total_files.saturating_sub(all_anomalies + spoofing_matrix_ufs.values().sum::<usize>() + spoofing_matrix_script.values().sum::<usize>());
-        (clean as f64 / total_files as f64) * 100.0 
-    } else { 0.0 };
 
-    let total_io_errors = ufs_stats.hash_errors.load(Ordering::SeqCst) + script_stats.hash_errors.load(Ordering::SeqCst);
-    let total_magic_errors = ufs_stats.magic_errors.load(Ordering::SeqCst) + script_stats.magic_errors.load(Ordering::SeqCst);
+    let ufs_anom = ufs_stats.offset_anomalies.load(Ordering::SeqCst)
+        + ufs_stats.null_padding.load(Ordering::SeqCst)
+        + ufs_stats.ascii_trash.load(Ordering::SeqCst)
+        + ufs_stats.sub_magic_errors.load(Ordering::SeqCst)
+        + ufs_stats.slack_space_contam.load(Ordering::SeqCst)
+        + ufs_stats.parasitic_injections.load(Ordering::SeqCst)
+        + ufs_stats.endian_conflicts.load(Ordering::SeqCst)
+        + ufs_stats.boundary_drops.load(Ordering::SeqCst)
+        + ufs_stats.high_volatility.load(Ordering::SeqCst);
+    let scr_anom = script_stats.offset_anomalies.load(Ordering::SeqCst)
+        + script_stats.null_padding.load(Ordering::SeqCst)
+        + script_stats.ascii_trash.load(Ordering::SeqCst)
+        + script_stats.sub_magic_errors.load(Ordering::SeqCst)
+        + script_stats.slack_space_contam.load(Ordering::SeqCst)
+        + script_stats.parasitic_injections.load(Ordering::SeqCst)
+        + script_stats.endian_conflicts.load(Ordering::SeqCst)
+        + script_stats.boundary_drops.load(Ordering::SeqCst)
+        + script_stats.high_volatility.load(Ordering::SeqCst);
+
+    let all_anomalies = ufs_anom + scr_anom;
+    let tot_micro = ufs_stats.micro_files.load(Ordering::SeqCst)
+        + script_stats.micro_files.load(Ordering::SeqCst);
+
+    let confidence_score = if total_files > 0 {
+        let clean = total_files.saturating_sub(
+            all_anomalies
+                + spoofing_matrix_ufs.values().sum::<usize>()
+                + spoofing_matrix_script.values().sum::<usize>(),
+        );
+        (clean as f64 / total_files as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let total_io_errors = ufs_stats.hash_errors.load(Ordering::SeqCst)
+        + script_stats.hash_errors.load(Ordering::SeqCst);
+    let total_magic_errors = ufs_stats.magic_errors.load(Ordering::SeqCst)
+        + script_stats.magic_errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 3 (KRYPTOGRAFIA BLAKE3 I ANOMALIE NAGŁÓWKÓW)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 3 (KRYPTOGRAFIA BLAKE3 I ANOMALIE NAGŁÓWKÓW)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let _ = writeln!(&mut log_out, "[ 1 ] WYNIKI HASHOWANIA (Weryfikacja Bit-to-Bit):");
-    let _ = writeln!(&mut log_out, "   -> Zgodne hashe (BLAKE3): {} plików", match_count);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki o tym samym rozmiarze posiadają w 100% identyczną zawartość binarną na obu dyskach.");
-    let _ = writeln!(&mut log_out, "   -> Różne hashe (Kolizje): {} plików", mismatch_count);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki ważą tyle samo, ale różnią się wewnątrz. Oznacza to korupcję (nadpisanie innymi danymi) podczas odzyskiwania na jednym z dysków.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] WYNIKI HASHOWANIA (Weryfikacja Bit-to-Bit):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zgodne hashe (BLAKE3): {} plików",
+        match_count
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Pliki o tym samym rozmiarze posiadają w 100% identyczną zawartość binarną na obu dyskach."
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Różne hashe (Kolizje): {} plików",
+        mismatch_count
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Pliki ważą tyle samo, ale różnią się wewnątrz. Oznacza to korupcję (nadpisanie innymi danymi) podczas odzyskiwania na jednym z dysków.\n"
+    );
 
-    let _ = writeln!(&mut log_out, "[ 2 ] WERYFIKACJA MAGIC BYTES (Deep Signature):");
-    let _ = writeln!(&mut log_out, "   -> Potwierdzone sygnatury w UFS:    {}", ufs_stats.valid_signatures.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Potwierdzone sygnatury w Skrypt: {}", script_stats.valid_signatures.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Format zadeklarowany w nazwie pliku (np. .jpg) zgadza się z prawdziwym, wbudowanym nagłówkiem binarnym pliku.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 2 ] WERYFIKACJA MAGIC BYTES (Deep Signature):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Potwierdzone sygnatury w UFS:    {}",
+        ufs_stats.valid_signatures.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Potwierdzone sygnatury w Skrypt: {}",
+        script_stats.valid_signatures.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Format zadeklarowany w nazwie pliku (np. .jpg) zgadza się z prawdziwym, wbudowanym nagłówkiem binarnym pliku.\n"
+    );
 
     if all_anomalies > 0 || tot_micro > 0 {
-        let _ = writeln!(&mut log_out, "[ 3 ] ROZKŁAD ANOMALII PIERWSZEGO KLASTRA (Uszkodzenia strukturalne):");
-        let _ = writeln!(&mut log_out, "   Wykryto łącznie: {} anomalii (oraz {} mikro-plików)", all_anomalies, tot_micro);
-        let _ = writeln!(&mut log_out, "   [ ZNACZENIE ]: Błędy pierwszych 512 bajtów pliku wskazują, że program odzyskujący (Carver) źle wyliczył początek pliku, lub plik został nadpisany wirusem / śmieciami z innej partycji.\n");
-        let _ = writeln!(&mut log_out, "   -> Przesunięte nagłówki: {}", ufs_stats.offset_anomalies.load(Ordering::SeqCst) + script_stats.offset_anomalies.load(Ordering::SeqCst));
-        let _ = writeln!(&mut log_out, "   -> Puste bloki (Null-Padding): {}", ufs_stats.null_padding.load(Ordering::SeqCst) + script_stats.null_padding.load(Ordering::SeqCst));
-        let _ = writeln!(&mut log_out, "   -> Zanieczyszczenie pamięci (ASCII Trash): {}", ufs_stats.ascii_trash.load(Ordering::SeqCst) + script_stats.ascii_trash.load(Ordering::SeqCst));
-        let _ = writeln!(&mut log_out, "   -> Skażenie Slack Space: {}", ufs_stats.slack_space_contam.load(Ordering::SeqCst) + script_stats.slack_space_contam.load(Ordering::SeqCst));
+        let _ = writeln!(
+            &mut log_out,
+            "[ 3 ] ROZKŁAD ANOMALII PIERWSZEGO KLASTRA (Uszkodzenia strukturalne):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   Wykryto łącznie: {} anomalii (oraz {} mikro-plików)",
+            all_anomalies, tot_micro
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   [ ZNACZENIE ]: Błędy pierwszych 512 bajtów pliku wskazują, że program odzyskujący (Carver) źle wyliczył początek pliku, lub plik został nadpisany wirusem / śmieciami z innej partycji.\n"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Przesunięte nagłówki: {}",
+            ufs_stats.offset_anomalies.load(Ordering::SeqCst)
+                + script_stats.offset_anomalies.load(Ordering::SeqCst)
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Puste bloki (Null-Padding): {}",
+            ufs_stats.null_padding.load(Ordering::SeqCst)
+                + script_stats.null_padding.load(Ordering::SeqCst)
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Zanieczyszczenie pamięci (ASCII Trash): {}",
+            ufs_stats.ascii_trash.load(Ordering::SeqCst)
+                + script_stats.ascii_trash.load(Ordering::SeqCst)
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Skażenie Slack Space: {}",
+            ufs_stats.slack_space_contam.load(Ordering::SeqCst)
+                + script_stats.slack_space_contam.load(Ordering::SeqCst)
+        );
         let _ = writeln!(&mut log_out);
     }
 
     if !spoofing_matrix_ufs.is_empty() || !spoofing_matrix_script.is_empty() {
-        let _ = writeln!(&mut log_out, "[ 4 ] MACIERZ FAŁSZERSTW ROZSZERZEŃ (Spoofing):");
-        let _ = writeln!(&mut log_out, "   Fałszywe odzyski wygenerowane przez UFS Explorer: {}", spoofing_matrix_ufs.values().sum::<usize>());
-        let _ = writeln!(&mut log_out, "   Fałszywe odzyski wygenerowane przez Skrypt Aut.:  {}\n", spoofing_matrix_script.values().sum::<usize>());
+        let _ = writeln!(
+            &mut log_out,
+            "[ 4 ] MACIERZ FAŁSZERSTW ROZSZERZEŃ (Spoofing):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   Fałszywe odzyski wygenerowane przez UFS Explorer: {}",
+            spoofing_matrix_ufs.values().sum::<usize>()
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   Fałszywe odzyski wygenerowane przez Skrypt Aut.:  {}\n",
+            spoofing_matrix_script.values().sum::<usize>()
+        );
     }
 
-    let _ = writeln!(&mut log_out, "[ 5 ] ZAUFANIE DO ALGORYTMÓW (Carver Confidence Score):");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 5 ] ZAUFANIE DO ALGORYTMÓW (Carver Confidence Score):"
+    );
     let _ = writeln!(&mut log_out, "   -> Zaufanie: {:.2}%", confidence_score);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Ilość plików w skali całego odzysku, które posiadają w 100% zdrowy i logiczny pierwszy klaster danych.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Ilość plików w skali całego odzysku, które posiadają w 100% zdrowy i logiczny pierwszy klaster danych.\n"
+    );
 
     if total_io_errors > 0 || total_magic_errors > 0 {
         let _ = writeln!(&mut log_out, "[ 6 ] PODSUMOWANIE BŁĘDÓW KRYTYCZNYCH:");
-        let _ = writeln!(&mut log_out, "   -> Błędy I/O (Brak dostępu / Bad Sectory): {}", total_io_errors);
-        let _ = writeln!(&mut log_out, "   -> Błędy Sygnatur (Niezgodność rozszerzeń): {}", total_magic_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy I/O (Brak dostępu / Bad Sectory): {}",
+            total_io_errors
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy Sygnatur (Niezgodność rozszerzeń): {}",
+            total_magic_errors
+        );
     }
 
     // Zapis do fizycznego pliku "Dziennik Końcowy" na podstawie konfiguracji Dual-Logging
     if let Ok(mut f) = std::fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy raport również do Ratatui Log Panel
@@ -1153,7 +1750,10 @@ mod tests {
         // aktywnych wątków globalnej puli Rayon.
         let actual_threads = 4;
         let half_threads = compute_half_threads(actual_threads);
-        assert_eq!(compute_activity_slots("SEQUENTIAL", actual_threads, half_threads), 4);
+        assert_eq!(
+            compute_activity_slots("SEQUENTIAL", actual_threads, half_threads),
+            4
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1182,7 +1782,10 @@ mod tests {
     #[test]
     fn test_analyze_header_null_padding_detected() {
         let mut buf = vec![0x00; 64];
-        buf[0] = 0x00; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x00;
+        buf[0] = 0x00;
+        buf[1] = 0x00;
+        buf[2] = 0x00;
+        buf[3] = 0x00;
         let a = analyze_header_cluster(&buf, 64, "dat");
         assert!(a.has_null);
     }
@@ -1191,18 +1794,30 @@ mod tests {
     fn test_analyze_header_offset_jpeg_detected() {
         // Sygnatura JPEG (FF D8 FF E0) przesunięta o 8 bajtów śmieci na start
         let mut buf = vec![0x41; 64]; // 'A' jako wypełniacz
-        buf[8] = 0xFF; buf[9] = 0xD8; buf[10] = 0xFF; buf[11] = 0xE0;
+        buf[8] = 0xFF;
+        buf[9] = 0xD8;
+        buf[10] = 0xFF;
+        buf[11] = 0xE0;
         let a = analyze_header_cluster(&buf, 64, "jpg");
-        assert!(a.has_offset, "Sygnatura JPEG na pozycji > 0 powinna być wykryta jako przesunięty nagłówek");
+        assert!(
+            a.has_offset,
+            "Sygnatura JPEG na pozycji > 0 powinna być wykryta jako przesunięty nagłówek"
+        );
     }
 
     #[test]
     fn test_analyze_header_offset_not_flagged_when_at_position_zero() {
         // Ta sama sygnatura, ale na pozycji 0 - to jest POPRAWNY plik, nie anomalia
         let mut buf = vec![0x00; 64];
-        buf[0] = 0xFF; buf[1] = 0xD8; buf[2] = 0xFF; buf[3] = 0xE0;
+        buf[0] = 0xFF;
+        buf[1] = 0xD8;
+        buf[2] = 0xFF;
+        buf[3] = 0xE0;
         let a = analyze_header_cluster(&buf, 64, "jpg");
-        assert!(!a.has_offset, "Sygnatura na pozycji 0 to prawidłowy nagłówek, nie przesunięcie");
+        assert!(
+            !a.has_offset,
+            "Sygnatura na pozycji 0 to prawidłowy nagłówek, nie przesunięcie"
+        );
     }
 
     #[test]
@@ -1246,7 +1861,8 @@ mod tests {
     fn test_analyze_header_bmp_slack_contamination() {
         // Nagłówek BMP ('BM') z niezerowym bajtem zarezerwowanym (offset 6)
         let mut buf = vec![0x00; 64];
-        buf[0] = b'B'; buf[1] = b'M';
+        buf[0] = b'B';
+        buf[1] = b'M';
         buf[6] = 0xFF; // powinno być 0x00 w poprawnym pliku
         let a = analyze_header_cluster(&buf, 64, "bmp");
         assert!(a.slack_contam);
@@ -1256,7 +1872,10 @@ mod tests {
     fn test_analyze_header_parasitic_zip_injection() {
         // Sygnatura ZIP osadzona głęboko w pliku (po bajcie 32) - podejrzenie iniekcji
         let mut buf = vec![0x41; 64];
-        buf[40] = 0x50; buf[41] = 0x4B; buf[42] = 0x03; buf[43] = 0x04;
+        buf[40] = 0x50;
+        buf[41] = 0x4B;
+        buf[42] = 0x03;
+        buf[43] = 0x04;
         let a = analyze_header_cluster(&buf, 64, "jpg");
         assert!(a.parasitic);
     }
@@ -1264,7 +1883,10 @@ mod tests {
     #[test]
     fn test_analyze_header_tiff_little_endian_conflict() {
         let mut buf = vec![0x00; 64];
-        buf[0] = b'I'; buf[1] = b'I'; buf[2] = 0x00; buf[3] = 0x2A;
+        buf[0] = b'I';
+        buf[1] = b'I';
+        buf[2] = 0x00;
+        buf[3] = 0x2A;
         let a = analyze_header_cluster(&buf, 64, "tif");
         assert!(a.endian_conflict);
     }
@@ -1272,7 +1894,10 @@ mod tests {
     #[test]
     fn test_analyze_header_boundary_drop_zeros() {
         let mut buf = vec![0x41; 512];
-        buf[508] = 0x00; buf[509] = 0x00; buf[510] = 0x00; buf[511] = 0x00;
+        buf[508] = 0x00;
+        buf[509] = 0x00;
+        buf[510] = 0x00;
+        buf[511] = 0x00;
         let a = analyze_header_cluster(&buf, 512, "dat");
         assert!(a.boundary_drop);
     }
@@ -1280,7 +1905,10 @@ mod tests {
     #[test]
     fn test_analyze_header_boundary_drop_ff() {
         let mut buf = vec![0x41; 512];
-        buf[508] = 0xFF; buf[509] = 0xFF; buf[510] = 0xFF; buf[511] = 0xFF;
+        buf[508] = 0xFF;
+        buf[509] = 0xFF;
+        buf[510] = 0xFF;
+        buf[511] = 0xFF;
         let a = analyze_header_cluster(&buf, 512, "dat");
         assert!(a.boundary_drop);
     }
@@ -1291,7 +1919,9 @@ mod tests {
         // bajtów: (n-1) * 255. Próg w analyze_header_cluster to > 60000, więc
         // potrzeba n-1 > ~235, czyli co najmniej 237 bajtów (64B dawało tylko
         // 63*255=16065 - stąd wcześniejsza fałszywa porażka tego testu).
-        let buf: Vec<u8> = (0..300).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect();
+        let buf: Vec<u8> = (0..300)
+            .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
+            .collect();
         let a = analyze_header_cluster(&buf, 300, "dat");
         assert!(a.high_volatility);
     }
@@ -1301,7 +1931,10 @@ mod tests {
         // Poprawny JPEG na pozycji 0, gładki gradient bajtów (niska wolatywność),
         // rozmiar >512B żeby ominąć próg boundary_drop w sposób neutralny
         let mut buf = vec![0u8; 600];
-        buf[0] = 0xFF; buf[1] = 0xD8; buf[2] = 0xFF; buf[3] = 0xE0;
+        buf[0] = 0xFF;
+        buf[1] = 0xD8;
+        buf[2] = 0xFF;
+        buf[3] = 0xE0;
         buf[4..].fill(0x80); // stała wartość = zero wolatywności
         let a = analyze_header_cluster(&buf, 600, "jpg");
 
@@ -1341,8 +1974,8 @@ mod tests {
 
         assert!(block.starts_with("[Kryptografia i sygnatury]"));
         assert!(block.contains("Poprawne sygnatury: 15")); // 10 + 5
-        assert!(block.contains("Błędy I/O: 3"));            // 1 + 2
-        assert!(block.contains("Spoofing (magic): 3"));     // 3 + 0
+        assert!(block.contains("Błędy I/O: 3")); // 1 + 2
+        assert!(block.contains("Spoofing (magic): 3")); // 3 + 0
     }
 
     #[test]
@@ -1368,7 +2001,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_crypto_block(&own, &other, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki BLAKE3")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki BLAKE3"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki BLAKE3 (Wariant A): {G:1} {R:2} {G:3}");
     }
 
@@ -1377,15 +2013,28 @@ mod tests {
         let own = LiveStats::new(4);
         let other = LiveStats::new(4);
 
-        own.ext_weights.lock().unwrap().insert("jpg".to_string(), 500);
-        other.ext_weights.lock().unwrap().insert("jpg".to_string(), 600); // razem 1100 - powinno wygrać
-        own.ext_weights.lock().unwrap().insert("png".to_string(), 200);
+        own.ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("jpg".to_string(), 500);
+        other
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("jpg".to_string(), 600); // razem 1100 - powinno wygrać
+        own.ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("png".to_string(), 200);
 
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_crypto_block(&own, &other, start_time);
 
         // .jpg (razem 1100 bajtów, poniżej 1KB więc format_bytes pokaże "B") powinien być pierwszy na liście Top format
-        let top_line = block.lines().find(|l| l.starts_with("Top format:")).unwrap();
+        let top_line = block
+            .lines()
+            .find(|l| l.starts_with("Top format:"))
+            .expect("Szukany element powinien znajdować się w kolekcji");
         assert!(top_line.contains(".jpg"));
     }
 
@@ -1416,7 +2065,11 @@ mod tests {
 
         // Każda linia poza nagłówkiem powinna kończyć się na ": 0"
         for line in block.lines().skip(1) {
-            assert!(line.ends_with(": 0"), "Oczekiwano zera dla świeżo utworzonych LiveStats: {}", line);
+            assert!(
+                line.ends_with(": 0"),
+                "Oczekiwano zera dla świeżo utworzonych LiveStats: {}",
+                line
+            );
         }
     }
 
@@ -1427,18 +2080,21 @@ mod tests {
     /// Pomocnicza konstrukcja `StreamCtx` z jednym zadaniem — resztę pól
     /// wypełnia neutralnymi wartościami, zwraca też odbiorcę `ScanMsg`, żeby
     /// test mógł zbadać wynik wysłany do wątku bazy.
-    fn uruchom_strumien_z_jednym_zadaniem(
-        base_path: &Path,
-        rel_path: &str,
-    ) -> Vec<ScanResult> {
-        let tasks = vec![Task { id: 42, rel_path: rel_path.to_string() }];
+    fn uruchom_strumien_z_jednym_zadaniem(base_path: &Path, rel_path: &str) -> Vec<ScanResult> {
+        let tasks = vec![Task {
+            id: 42,
+            rel_path: rel_path.to_string(),
+        }];
         let stats = LiveStats::new(1);
         let other_stats = LiveStats::new(1);
         let (tx_db, rx_db) = mpsc::sync_channel(8);
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        let log_dir = tempfile::tempdir().unwrap();
-        let opr_log = Arc::new(Mutex::new(File::create(log_dir.path().join("log.txt")).unwrap()));
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let opr_log = Arc::new(Mutex::new(
+            File::create(log_dir.path().join("log.txt")).expect("Nie można utworzyć pliku"),
+        ));
 
         process_side_stream(StreamCtx {
             base_path,
@@ -1452,6 +2108,7 @@ mod tests {
             bar_idx: 0,
             opr_log,
             start_time: Instant::now(),
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
         let mut wyniki = Vec::new();
@@ -1479,17 +2136,22 @@ mod tests {
     /// powodowała nieskończone ponawianie.
     #[test]
     fn test_prawdziwy_blad_io_przy_odczycie_naglowka_nie_jest_pustym_plikiem() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("nie_jest_plikiem")).unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::create_dir(dir.path().join("nie_jest_plikiem"))
+            .expect("Nie można utworzyć katalogu");
 
         let wyniki = uruchom_strumien_z_jednym_zadaniem(dir.path(), "nie_jest_plikiem");
 
         assert_eq!(wyniki.len(), 1);
         let r = &wyniki[0];
         assert_eq!(r.id, 42);
-        assert_eq!(r.hash, None, "przy błędzie I/O nie ma sensownego hashu do zapisania");
         assert_eq!(
-            r.io_error, Some(true),
+            r.hash, None,
+            "przy błędzie I/O nie ma sensownego hashu do zapisania"
+        );
+        assert_eq!(
+            r.io_error,
+            Some(true),
             "prawdziwy błąd I/O MUSI zostać zgłoszony jako io_error=true - inaczej phase3_done \
              (hash_ufs IS NOT NULL OR io_error_ufs = 1) nigdy się nie spełnia i plik wraca do \
              kolejki w nieskończoność"
@@ -1502,14 +2164,18 @@ mod tests {
     /// faktycznego błędu I/O nie może zepsuć poprawnej ścieżki.
     #[test]
     fn test_naprawde_pusty_plik_nadal_dostaje_hash_i_brak_bledu() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pusty.bin"), b"").unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(dir.path().join("pusty.bin"), b"")
+            .expect("Nie można zapisać danych do pliku");
 
         let wyniki = uruchom_strumien_z_jednym_zadaniem(dir.path(), "pusty.bin");
 
         assert_eq!(wyniki.len(), 1);
         let r = &wyniki[0];
-        assert!(r.hash.is_some(), "pusty plik ma poprawny hash BLAKE3 pustego ciągu, nie None");
+        assert!(
+            r.hash.is_some(),
+            "pusty plik ma poprawny hash BLAKE3 pustego ciągu, nie None"
+        );
         assert_eq!(r.io_error, Some(false), "pusty plik to NIE jest błąd I/O");
     }
 
@@ -1518,14 +2184,20 @@ mod tests {
     // `chunk`, nie tylko te, które przeszły "normalną" ścieżkę.
     // ------------------------------------------------------------------
 
-    fn uruchom_strumien_i_zwroc_postep(base_path: &Path, zadania: Vec<Task>) -> (Vec<ScanResult>, usize, u64) {
+    fn uruchom_strumien_i_zwroc_postep(
+        base_path: &Path,
+        zadania: Vec<Task>,
+    ) -> (Vec<ScanResult>, usize, u64) {
         let stats = LiveStats::new(1);
         let other_stats = LiveStats::new(1);
         let (tx_db, rx_db) = mpsc::sync_channel(8);
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        let log_dir = tempfile::tempdir().unwrap();
-        let opr_log = Arc::new(Mutex::new(File::create(log_dir.path().join("log.txt")).unwrap()));
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let opr_log = Arc::new(Mutex::new(
+            File::create(log_dir.path().join("log.txt")).expect("Nie można utworzyć pliku"),
+        ));
 
         process_side_stream(StreamCtx {
             base_path,
@@ -1539,6 +2211,7 @@ mod tests {
             bar_idx: 0,
             opr_log,
             start_time: Instant::now(),
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
         let mut wyniki = Vec::new();
@@ -1547,7 +2220,11 @@ mod tests {
                 ScanMsg::UfsChunk(r) | ScanMsg::ScriptChunk(r) => wyniki.extend(r),
             }
         }
-        (wyniki, stats.processed_files.load(Ordering::Relaxed), stats.processed_bytes.load(Ordering::Relaxed))
+        (
+            wyniki,
+            stats.processed_files.load(Ordering::Relaxed),
+            stats.processed_bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// Sedno naprawy: MIESZANKA czterech różnych ścieżek wyjścia w JEDNEJ
@@ -1559,17 +2236,31 @@ mod tests {
     /// się na 25% mimo ukończenia całej paczki.
     #[test]
     fn test_kazda_z_czterech_sciezek_wyjscia_liczy_sie_do_postepu() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("katalog")).unwrap();
-        std::fs::write(dir.path().join("pusty.bin"), b"").unwrap();
-        std::fs::write(dir.path().join("zwykly.bin"), b"tresc pliku").unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::create_dir(dir.path().join("katalog")).expect("Nie można utworzyć katalogu");
+        std::fs::write(dir.path().join("pusty.bin"), b"")
+            .expect("Nie można zapisać danych do pliku");
+        std::fs::write(dir.path().join("zwykly.bin"), b"tresc pliku")
+            .expect("Nie można zapisać danych do pliku");
         // "brak.bin" celowo NIE tworzony - File::open musi zawieść.
 
         let zadania = vec![
-            Task { id: 1, rel_path: "brak.bin".to_string() },
-            Task { id: 2, rel_path: "katalog".to_string() },
-            Task { id: 3, rel_path: "pusty.bin".to_string() },
-            Task { id: 4, rel_path: "zwykly.bin".to_string() },
+            Task {
+                id: 1,
+                rel_path: "brak.bin".to_string(),
+            },
+            Task {
+                id: 2,
+                rel_path: "katalog".to_string(),
+            },
+            Task {
+                id: 3,
+                rel_path: "pusty.bin".to_string(),
+            },
+            Task {
+                id: 4,
+                rel_path: "zwykly.bin".to_string(),
+            },
         ];
 
         let (wyniki, przetworzone, _bajty) = uruchom_strumien_i_zwroc_postep(dir.path(), zadania);
@@ -1588,17 +2279,27 @@ mod tests {
     /// pliki nie mają znanego rozmiaru (błąd otwarcia).
     #[test]
     fn test_processed_bytes_liczy_wolumen_mimo_bledow_w_tej_samej_paczce() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("zwykly.bin"), vec![0u8; 500]).unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(dir.path().join("zwykly.bin"), vec![0u8; 500])
+            .expect("Nie można zapisać danych do pliku");
 
         let zadania = vec![
-            Task { id: 1, rel_path: "brak.bin".to_string() },
-            Task { id: 2, rel_path: "zwykly.bin".to_string() },
+            Task {
+                id: 1,
+                rel_path: "brak.bin".to_string(),
+            },
+            Task {
+                id: 2,
+                rel_path: "zwykly.bin".to_string(),
+            },
         ];
 
         let (_wyniki, przetworzone, bajty) = uruchom_strumien_i_zwroc_postep(dir.path(), zadania);
 
         assert_eq!(przetworzone, 2);
-        assert_eq!(bajty, 500, "wolumen brakującego pliku wynosi 0, ale zwykły plik musi się doliczyć");
+        assert_eq!(
+            bajty, 500,
+            "wolumen brakującego pliku wynosi 0, ale zwykły plik musi się doliczyć"
+        );
     }
 }

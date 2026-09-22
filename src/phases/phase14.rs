@@ -429,6 +429,7 @@ pub struct StreamCtx<'a> {
     pub fallback_max_bytes: u64,
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
     pub bar_idx: usize,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
@@ -445,7 +446,9 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         fallback_max_bytes,
         tx_ui,
         bar_idx,
+        debug_log,
     } = ctx;
+    let metoda = "ssdeep::hash (fuzzy)";
 
     tasks
         .par_chunks(CHUNK_SIZE)
@@ -477,6 +480,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 let mut hash_opt = None;
                 let mut io_err = Some(false);
+                let call_start = debug_log.is_active().then(Instant::now);
 
                 if file_size == 0 {
                     stats.empty_files.fetch_add(1, Ordering::Relaxed);
@@ -521,6 +525,18 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         io_err = Some(true);
                     }
                 }
+                if let Some(t) = call_start {
+                    let wynik = if io_err == Some(true) {
+                        "BŁĄD I/O".to_string()
+                    } else if hash_opt.is_some() {
+                        "OK".to_string()
+                    } else if file_size == 0 {
+                        "POMINIĘTO (pusty plik)".to_string()
+                    } else {
+                        "POMINIĘTO (za mały na fuzzy hash)".to_string()
+                    };
+                    debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+                }
 
                 let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
                 stats
@@ -545,7 +561,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                     let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                         idx: bar_idx,
-                        path: full_path.to_string_lossy().to_string(),
+                        path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                     });
 
                     // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -714,13 +730,29 @@ pub fn run(
 
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
 
-    let log_twins_path =
-        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_zaginione_blizniaki.txt");
-    let log_franks_path =
-        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_frankensteiny.txt");
-    let log_partial_path =
-        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza14_czesciowe_uszkodzenia.txt");
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let log_twins_path = Path::new(&raport_cfg.katalog).join(crate::utils::stamp_filename(
+        "raport_operacyjny_faza14_zaginione_blizniaki.txt",
+        &stamp,
+    ));
+    let log_franks_path = Path::new(&raport_cfg.katalog).join(crate::utils::stamp_filename(
+        "raport_operacyjny_faza14_frankensteiny.txt",
+        &stamp,
+    ));
+    let log_partial_path = Path::new(&raport_cfg.katalog).join(crate::utils::stamp_filename(
+        "raport_operacyjny_faza14_czesciowe_uszkodzenia.txt",
+        &stamp,
+    ));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza14.txt", &stamp),
+        &config.log_level,
+    );
 
     let log_twins = match File::create(&log_twins_path) {
         Ok(f) => Arc::new(Mutex::new(f)),
@@ -922,6 +954,8 @@ pub fn run(
                 let ufs_base_ref = &ufs_base;
                 let script_base_ref = &script_base;
                 let tx_ui_ref = &tx_ui;
+                let dbg_u = debug_log.clone();
+                let dbg_s = debug_log.clone();
 
                 // NAPRAWA (ten sam bug jak w Fazie 5/6/7/10-13): dedykowana
                 // pula per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
@@ -944,6 +978,7 @@ pub fn run(
                                     fallback_max_bytes,
                                     tx_ui: tx_ui_ref,
                                     bar_idx: 0,
+                                    debug_log: dbg_u.clone(),
                                 });
                             });
                         } else {
@@ -958,6 +993,7 @@ pub fn run(
                                 fallback_max_bytes,
                                 tx_ui: tx_ui_ref,
                                 bar_idx: 0,
+                                debug_log: dbg_u.clone(),
                             });
                         }
                         let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -983,6 +1019,7 @@ pub fn run(
                                     fallback_max_bytes,
                                     tx_ui: tx_ui_ref,
                                     bar_idx: 1,
+                                    debug_log: dbg_s.clone(),
                                 });
                             });
                         } else {
@@ -997,6 +1034,7 @@ pub fn run(
                                 fallback_max_bytes,
                                 tx_ui: tx_ui_ref,
                                 bar_idx: 1,
+                                debug_log: dbg_s.clone(),
                             });
                         }
                         let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -1006,6 +1044,8 @@ pub fn run(
                 });
                 drop(tx_db);
             } else {
+                let dbg_u = debug_log.clone();
+                let dbg_s = debug_log.clone();
                 if !ufs_tasks.is_empty() {
                     process_side_stream(StreamCtx {
                         base_path: &ufs_base,
@@ -1018,6 +1058,7 @@ pub fn run(
                         fallback_max_bytes,
                         tx_ui: &tx_ui,
                         bar_idx: 0,
+                        debug_log: dbg_u,
                     });
                     let _ = tx_ui.send(PhaseEvent::Log(
                         "✔ Hashowanie CTPH dysku UFS zakończone.".to_string(),
@@ -1035,6 +1076,7 @@ pub fn run(
                         fallback_max_bytes,
                         tx_ui: &tx_ui,
                         bar_idx: 1,
+                        debug_log: dbg_s,
                     });
                     let _ = tx_ui.send(PhaseEvent::Log(
                         "✔ Hashowanie CTPH dysku Skryptu zakończone.".to_string(),

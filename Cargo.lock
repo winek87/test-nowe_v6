@@ -7,6 +7,7 @@ name = "Weryfikator"
 version = "0.5.0"
 dependencies = [
  "blake3",
+ "chrono",
  "colored",
  "crossterm",
  "ctrlc",

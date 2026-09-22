@@ -1,7 +1,7 @@
 // src/phases/phase13.rs
 
 //! # Faza 13: Pełne Dekodowanie Mediów (Wykrywanie uciętych zdjęć i Gray Banding)
-//! 
+//!
 //! Zmusza procesor do wyrenderowania każdej klatki obrazu w pamięci RAM.
 //! Kategoryzuje rozdzielczości (MP), przestrzenie kolorów (RGB/RGBA), oraz
 //! wykrywa dwie dodatkowe anomalie geometryczne/wizualne: ekstremalne
@@ -31,16 +31,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -99,8 +99,10 @@ const UNIFORM_SAMPLE_POINTS: usize = 100;
 /// jeszcze dodane, mimo że `rawloader` by je obsłużył — rozszerzamy
 /// stopniowo, tylko o przypadki zweryfikowane na prawdziwych plikach użytkownika.
 fn is_decodable_extension(path_str: &str) -> bool {
-    let exts = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".dng",
-                ".heic", ".heif", ".avif"];
+    let exts = [
+        ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".dng", ".heic",
+        ".heif", ".avif",
+    ];
     let lower_path = path_str.to_lowercase();
     exts.iter().any(|&ext| lower_path.ends_with(ext))
 }
@@ -114,7 +116,10 @@ fn is_decodable_extension(path_str: &str) -> bool {
 /// bo zmienia typ zwracanej wartości (`Err`, nie `ImageAnalysis`).
 fn classify_decode_error(err_str_lower: &str) -> (&'static str, &'static str) {
     if err_str_lower.contains("limit") || err_str_lower.contains("allocation") {
-        ("bomb", "Pikselowa Bomba (Przekroczono limit RAM / Malicious Payload)")
+        (
+            "bomb",
+            "Pikselowa Bomba (Przekroczono limit RAM / Malicious Payload)",
+        )
     } else if err_str_lower.contains("unsupported") || err_str_lower.contains("format") {
         ("fake", "Nieobsługiwany / Fałszywe rozszerzenie")
     } else {
@@ -128,12 +133,19 @@ fn classify_decode_error(err_str_lower: &str) -> (&'static str, &'static str) {
 /// przez gałąź domyślną). Wydzielone jako czysta funkcja, testowalna bez
 /// rzeczywistego dekodowania obrazu — analogicznie do [`classify_decode_error`].
 fn classify_color_bucket(color_space: &str) -> &'static str {
-    if color_space == "RGB" { "rgb" }
-    else if color_space == "RGBA" { "rgba" }
-    else if color_space == "Grayscale" { "gray" }
-    else if color_space.starts_with("RAW Bayer") { "raw" }
-    else if color_space.starts_with("HEIC") { "heic" }
-    else { "other" }
+    if color_space == "RGB" {
+        "rgb"
+    } else if color_space == "RGBA" {
+        "rgba"
+    } else if color_space == "Grayscale" {
+        "gray"
+    } else if color_space.starts_with("RAW Bayer") {
+        "raw"
+    } else if color_space.starts_with("HEIC") {
+        "heic"
+    } else {
+        "other"
+    }
 }
 
 /// Sprawdza, czy stosunek dłuższego do krótszego boku przekracza
@@ -141,7 +153,9 @@ fn classify_color_bucket(color_space: &str) -> &'static str {
 /// (unika dzielenia przez zero — taki przypadek i tak nie powinien wystąpić
 /// dla poprawnie zdekodowanego obrazu).
 fn is_extreme_aspect_ratio(width: u32, height: u32) -> bool {
-    if width == 0 || height == 0 { return false; }
+    if width == 0 || height == 0 {
+        return false;
+    }
     let (w, h) = (width as f64, height as f64);
     let ratio = if w > h { w / h } else { h / w };
     ratio > EXTREME_ASPECT_RATIO_THRESHOLD
@@ -167,7 +181,9 @@ fn is_uniform_sample(samples: &[[u8; 4]]) -> bool {
 fn sample_pixels(img: &image::DynamicImage, count: usize) -> Vec<[u8; 4]> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    if w == 0 || h == 0 || count == 0 { return Vec::new(); }
+    if w == 0 || h == 0 || count == 0 {
+        return Vec::new();
+    }
 
     let total_pixels = (w as u64) * (h as u64);
     let step = std::cmp::max(1, total_pixels / count as u64);
@@ -238,18 +254,25 @@ pub(crate) struct LiveStats {
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
-    
-    ok_common: AtomicUsize, ok_unique: AtomicUsize,
-    total_megapixels_x1_m: AtomicU64,
-    
-    err_glitch_common: AtomicUsize,  err_glitch_unique: AtomicUsize,
-    err_bomb_common: AtomicUsize,    err_bomb_unique: AtomicUsize,
-    err_fake_common: AtomicUsize,    err_fake_unique: AtomicUsize,
 
-    res_thumb_common: AtomicUsize,   res_thumb_unique: AtomicUsize,
-    res_std_common: AtomicUsize,     res_std_unique: AtomicUsize,
-    res_high_common: AtomicUsize,    res_high_unique: AtomicUsize,
-    
+    ok_common: AtomicUsize,
+    ok_unique: AtomicUsize,
+    total_megapixels_x1_m: AtomicU64,
+
+    err_glitch_common: AtomicUsize,
+    err_glitch_unique: AtomicUsize,
+    err_bomb_common: AtomicUsize,
+    err_bomb_unique: AtomicUsize,
+    err_fake_common: AtomicUsize,
+    err_fake_unique: AtomicUsize,
+
+    res_thumb_common: AtomicUsize,
+    res_thumb_unique: AtomicUsize,
+    res_std_common: AtomicUsize,
+    res_std_unique: AtomicUsize,
+    res_high_common: AtomicUsize,
+    res_high_unique: AtomicUsize,
+
     /// Rozbicie `color_space` zwróconego przez [`analyze_image`] — REGRESJA
     /// (naprawiony błąd klasyfikacji): wcześniej `col_gray` był gałęzią
     /// domyślną (`else`), więc łapał NIE TYLKO prawdziwy Grayscale, ale też
@@ -259,13 +282,19 @@ pub(crate) struct LiveStats {
     /// jako gałąź domyślna dla prawdziwie niesklasyfikowanych przypadków
     /// (`"Inny/Mieszany"` z crate `image` lub DNG o nietypowej liczbie
     /// składowych).
-    col_rgb: AtomicUsize, col_rgba: AtomicUsize, col_gray: AtomicUsize,
-    col_raw: AtomicUsize, col_heic: AtomicUsize, col_other: AtomicUsize,
+    col_rgb: AtomicUsize,
+    col_rgba: AtomicUsize,
+    col_gray: AtomicUsize,
+    col_raw: AtomicUsize,
+    col_heic: AtomicUsize,
+    col_other: AtomicUsize,
 
     /// INFORMACYJNE: stosunek boków przekracza [`EXTREME_ASPECT_RATIO_THRESHOLD`].
-    extreme_ratio_common: AtomicUsize, extreme_ratio_unique: AtomicUsize,
+    extreme_ratio_common: AtomicUsize,
+    extreme_ratio_unique: AtomicUsize,
     /// INFORMACYJNE: próbka pikseli wyszła jednolita — patrz [`is_uniform_sample`].
-    uniform_common: AtomicUsize, uniform_unique: AtomicUsize,
+    uniform_common: AtomicUsize,
+    uniform_unique: AtomicUsize,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas dekodowania obrazu (`image::open` + próbkowanie
@@ -279,19 +308,35 @@ pub(crate) struct LiveStats {
 impl LiveStats {
     fn new(slot_count: usize) -> Self {
         Self {
-            processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
+            processed_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            errors: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
-            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0), total_megapixels_x1_m: AtomicU64::new(0),
-            err_glitch_common: AtomicUsize::new(0), err_glitch_unique: AtomicUsize::new(0),
-            err_bomb_common: AtomicUsize::new(0), err_bomb_unique: AtomicUsize::new(0),
-            err_fake_common: AtomicUsize::new(0), err_fake_unique: AtomicUsize::new(0),
-            res_thumb_common: AtomicUsize::new(0), res_thumb_unique: AtomicUsize::new(0),
-            res_std_common: AtomicUsize::new(0), res_std_unique: AtomicUsize::new(0),
-            res_high_common: AtomicUsize::new(0), res_high_unique: AtomicUsize::new(0),
-            col_rgb: AtomicUsize::new(0), col_rgba: AtomicUsize::new(0), col_gray: AtomicUsize::new(0),
-            col_raw: AtomicUsize::new(0), col_heic: AtomicUsize::new(0), col_other: AtomicUsize::new(0),
-            extreme_ratio_common: AtomicUsize::new(0), extreme_ratio_unique: AtomicUsize::new(0),
-            uniform_common: AtomicUsize::new(0), uniform_unique: AtomicUsize::new(0),
+            ok_common: AtomicUsize::new(0),
+            ok_unique: AtomicUsize::new(0),
+            total_megapixels_x1_m: AtomicU64::new(0),
+            err_glitch_common: AtomicUsize::new(0),
+            err_glitch_unique: AtomicUsize::new(0),
+            err_bomb_common: AtomicUsize::new(0),
+            err_bomb_unique: AtomicUsize::new(0),
+            err_fake_common: AtomicUsize::new(0),
+            err_fake_unique: AtomicUsize::new(0),
+            res_thumb_common: AtomicUsize::new(0),
+            res_thumb_unique: AtomicUsize::new(0),
+            res_std_common: AtomicUsize::new(0),
+            res_std_unique: AtomicUsize::new(0),
+            res_high_common: AtomicUsize::new(0),
+            res_high_unique: AtomicUsize::new(0),
+            col_rgb: AtomicUsize::new(0),
+            col_rgba: AtomicUsize::new(0),
+            col_gray: AtomicUsize::new(0),
+            col_raw: AtomicUsize::new(0),
+            col_heic: AtomicUsize::new(0),
+            col_other: AtomicUsize::new(0),
+            extreme_ratio_common: AtomicUsize::new(0),
+            extreme_ratio_unique: AtomicUsize::new(0),
+            uniform_common: AtomicUsize::new(0),
+            uniform_unique: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -300,7 +345,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA — prędkość MB/s i
@@ -311,57 +360,103 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
-    let speed_mp = (stats.total_megapixels_x1_m.load(Ordering::Relaxed) as f64 / 1_000_000.0) / elapsed;
+    let speed_mp =
+        (stats.total_megapixels_x1_m.load(Ordering::Relaxed) as f64 / 1_000_000.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza pikseli...".to_string() } else { top_ext };
+    let display_ext = if top_ext.is_empty() {
+        "Analiza pikseli...".to_string()
+    } else {
+        top_ext
+    };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     let ok_common = stats.ok_common.load(Ordering::Relaxed);
     let ok_unique = stats.ok_unique.load(Ordering::Relaxed);
     let ok_total = ok_common + ok_unique;
     let avg_mp = if ok_total > 0 {
         (stats.total_megapixels_x1_m.load(Ordering::Relaxed) as f64 / 1_000_000.0) / ok_total as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     format!(
         "[{}]\nPrędkość: {:.2} MB/s | {:.1} MP/s\nTop format: {}\nZdrowe: {} wspólne / {} unikalne\nŚr. megapikseli (zdrowe): {:.2} MP\nPrzestrzenie kolorów: RGB: {}, RGBA: {}, Szare: {}, RAW: {}, HEIC: {}, Inne: {}\nZepsute piksele: {} wspólne / {} unikalne\nFałszywe rozszerzenie: {} wspólne / {} unikalne\nBomba pikselowa: {} wspólne / {} unikalne\nEkstremalne proporcje: {} wspólne / {} unikalne\nZawartość jednolita (próbka): {} wspólne / {} unikalne\nWątki dekodowania (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb, speed_mp, display_ext,
-        ok_common, ok_unique,
+        label,
+        speed_mb,
+        speed_mp,
+        display_ext,
+        ok_common,
+        ok_unique,
         avg_mp,
-        stats.col_rgb.load(Ordering::Relaxed), stats.col_rgba.load(Ordering::Relaxed), stats.col_gray.load(Ordering::Relaxed),
-        stats.col_raw.load(Ordering::Relaxed), stats.col_heic.load(Ordering::Relaxed), stats.col_other.load(Ordering::Relaxed),
-        stats.err_glitch_common.load(Ordering::Relaxed), stats.err_glitch_unique.load(Ordering::Relaxed),
-        stats.err_fake_common.load(Ordering::Relaxed), stats.err_fake_unique.load(Ordering::Relaxed),
-        stats.err_bomb_common.load(Ordering::Relaxed), stats.err_bomb_unique.load(Ordering::Relaxed),
-        stats.extreme_ratio_common.load(Ordering::Relaxed), stats.extreme_ratio_unique.load(Ordering::Relaxed),
-        stats.uniform_common.load(Ordering::Relaxed), stats.uniform_unique.load(Ordering::Relaxed),
+        stats.col_rgb.load(Ordering::Relaxed),
+        stats.col_rgba.load(Ordering::Relaxed),
+        stats.col_gray.load(Ordering::Relaxed),
+        stats.col_raw.load(Ordering::Relaxed),
+        stats.col_heic.load(Ordering::Relaxed),
+        stats.col_other.load(Ordering::Relaxed),
+        stats.err_glitch_common.load(Ordering::Relaxed),
+        stats.err_glitch_unique.load(Ordering::Relaxed),
+        stats.err_fake_common.load(Ordering::Relaxed),
+        stats.err_fake_unique.load(Ordering::Relaxed),
+        stats.err_bomb_common.load(Ordering::Relaxed),
+        stats.err_bomb_unique.load(Ordering::Relaxed),
+        stats.extreme_ratio_common.load(Ordering::Relaxed),
+        stats.extreme_ratio_unique.load(Ordering::Relaxed),
+        stats.uniform_common.load(Ordering::Relaxed),
+        stats.uniform_unique.load(Ordering::Relaxed),
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
 }
 
 type ExtMap = HashMap<String, Vec<String>>;
-struct SourceAnomalies { ufs: ExtMap, script: ExtMap }
-impl SourceAnomalies { fn new() -> Self { Self { ufs: HashMap::new(), script: HashMap::new() } } }
+struct SourceAnomalies {
+    ufs: ExtMap,
+    script: ExtMap,
+}
+impl SourceAnomalies {
+    fn new() -> Self {
+        Self {
+            ufs: HashMap::new(),
+            script: HashMap::new(),
+        }
+    }
+}
 
 struct AnomalyCategory {
     name: &'static str,
     icon: &'static str,
-    common: SourceAnomalies, unique: SourceAnomalies,
+    common: SourceAnomalies,
+    unique: SourceAnomalies,
 }
 impl AnomalyCategory {
     fn new(name: &'static str, icon: &'static str) -> Self {
-        Self { name, icon, common: SourceAnomalies::new(), unique: SourceAnomalies::new() }
+        Self {
+            name,
+            icon,
+            common: SourceAnomalies::new(),
+            unique: SourceAnomalies::new(),
+        }
     }
 }
 
@@ -397,6 +492,22 @@ impl AnomalyCategory {
 /// (`"os error"`/`"no such file"`) jest przepuszczany jako `Err` (prawdziwy
 /// błąd I/O), nie jako nieważny obraz. Dla DNG brak analogicznego
 /// rozróżnienia błędów w `rawloader` — sprawdzamy istnienie pliku wprost.
+/// Nazywa, KTÓRA z trzech ścieżek dekodowania [`analyze_image`] obsłuży dany
+/// plik — czysta klasyfikacja po rozszerzeniu, bez samego dekodowania.
+/// Używana WYŁĄCZNIE do etykietowania logów (debug/dashboard) — duplikuje
+/// tanią, samą klasyfikację ekstensji (nie logikę dekodowania), więc nie ma
+/// ryzyka rozjazdu z faktyczną decyzją w `analyze_image`.
+fn decoding_method_for(path_str: &str) -> &'static str {
+    let lower = path_str.to_lowercase();
+    if crate::heic_image::is_heic_extension(&lower) {
+        "libheif (HEIC/HEIF/AVIF)"
+    } else if lower.ends_with(".dng") {
+        "rawloader (DNG)"
+    } else {
+        "crate image"
+    }
+}
+
 fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Error> {
     let path_lower = path.to_str().map(|s| s.to_lowercase()).unwrap_or_default();
     let is_dng = path_lower.ends_with(".dng");
@@ -404,7 +515,10 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
 
     if is_heic {
         if !path.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Błąd I/O"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Błąd I/O",
+            ));
         }
         return Ok(match crate::heic_image::decode_heic_file(path) {
             Some(info) => {
@@ -439,7 +553,10 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
 
     if is_dng {
         if !path.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Błąd I/O"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Błąd I/O",
+            ));
         }
         return Ok(match crate::raw_image::decode_raw_file(path) {
             Some(info) => {
@@ -483,9 +600,16 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
                 let h = img.height();
                 let mp = (w as f64 * h as f64) / 1_000_000.0;
                 let color = match img.color() {
-                    image::ColorType::Rgb8 | image::ColorType::Rgb16 | image::ColorType::Rgb32F => "RGB",
-                    image::ColorType::Rgba8 | image::ColorType::Rgba16 | image::ColorType::Rgba32F => "RGBA",
-                    image::ColorType::L8 | image::ColorType::L16 | image::ColorType::La8 | image::ColorType::La16 => "Grayscale",
+                    image::ColorType::Rgb8 | image::ColorType::Rgb16 | image::ColorType::Rgb32F => {
+                        "RGB"
+                    }
+                    image::ColorType::Rgba8
+                    | image::ColorType::Rgba16
+                    | image::ColorType::Rgba32F => "RGBA",
+                    image::ColorType::L8
+                    | image::ColorType::L16
+                    | image::ColorType::La8
+                    | image::ColorType::La16 => "Grayscale",
                     _ => "Inny/Mieszany",
                 };
 
@@ -494,20 +618,35 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
                 let has_uniform_content = is_uniform_sample(&samples);
 
                 Ok(ImageAnalysis {
-                    is_valid: true, reason: None, width: w, height: h, megapixels: mp, color_space: color.to_string(),
-                    has_extreme_aspect_ratio, has_uniform_content,
+                    is_valid: true,
+                    reason: None,
+                    width: w,
+                    height: h,
+                    megapixels: mp,
+                    color_space: color.to_string(),
+                    has_extreme_aspect_ratio,
+                    has_uniform_content,
                 })
             }
             Err(e) => {
                 let err_str = e.to_string().to_lowercase();
                 if err_str.contains("os error") || err_str.contains("no such file") {
-                    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Błąd I/O"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Błąd I/O",
+                    ));
                 }
                 let (_, reason) = classify_decode_error(&err_str);
 
                 Ok(ImageAnalysis {
-                    is_valid: false, reason: Some(reason.to_string()), width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
-                    has_extreme_aspect_ratio: false, has_uniform_content: false,
+                    is_valid: false,
+                    reason: Some(reason.to_string()),
+                    width: 0,
+                    height: 0,
+                    megapixels: 0.0,
+                    color_space: "Brak".to_string(),
+                    has_extreme_aspect_ratio: false,
+                    has_uniform_content: false,
                 })
             }
         }
@@ -521,9 +660,16 @@ fn analyze_image(path: &Path) -> std::result::Result<ImageAnalysis, std::io::Err
         // tylko jego treść łamie dekoder).
         None => Ok(ImageAnalysis {
             is_valid: false,
-            reason: Some("Dekoder obrazu spanikował na uszkodzonym pliku (przechwycone bezpiecznie)".to_string()),
-            width: 0, height: 0, megapixels: 0.0, color_space: "Brak".to_string(),
-            has_extreme_aspect_ratio: false, has_uniform_content: false,
+            reason: Some(
+                "Dekoder obrazu spanikował na uszkodzonym pliku (przechwycone bezpiecznie)"
+                    .to_string(),
+            ),
+            width: 0,
+            height: 0,
+            megapixels: 0.0,
+            color_space: "Brak".to_string(),
+            has_extreme_aspect_ratio: false,
+            has_uniform_content: false,
         }),
     }
 }
@@ -546,12 +692,26 @@ pub struct StreamCtx<'a> {
     pub start_time: Instant,
     pub log_anom: Arc<Mutex<File>>,
     pub log_info: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, start_time, log_anom, log_info } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        start_time,
+        log_anom,
+        log_info,
+        debug_log,
+    } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -563,12 +723,34 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         for task in chunk {
             if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
 
+            let metoda_start = debug_log.is_active().then(Instant::now);
             let full_path = base_path.join(&task.rel_path);
             let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
             let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
-            
+            if let Some(t) = metoda_start {
+                debug_log.log(side_label, "odczyt metadanych (fs::metadata)", &task.rel_path, t.elapsed(), "OK");
+            }
+
             *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size;
 
+            let metoda = decoding_method_for(&task.rel_path);
+
+            // Log info: linia "Start" PRZED wywołaniem dekodera — niezależnie
+            // od wyniku (zdrowy/uszkodzony), żeby operator widział ostatni
+            // plik dotknięty przez fazę, gdyby ta akurat zawiesiła się w
+            // środku (np. patologicznie duży/złożony plik).
+            if let Ok(mut f) = log_info.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            // `Instant::now()` jest tani, ale pomijamy go całkowicie, gdy log
+            // debug jest wyłączony (poziom logowania < DEBUG) - zero kosztu
+            // dla normalnego przebiegu fazy.
+            let call_start = debug_log.is_active().then(Instant::now);
             let (analysis, io_err) = match stats.thread_activity.track_current(|| analyze_image(&full_path)) {
                 Ok(ana) => {
                     let kategoria = if task.is_common { "Wspólne" } else { "Osobne" };
@@ -627,6 +809,31 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     }, Some(true))
                 }
             };
+            // Wynik jest teraz liczony BEZWARUNKOWO (nie tylko gdy log debug
+            // aktywny) — linia "Koniec" w logu info (patrz niżej) pokazuje go
+            // zawsze, niezależnie od poziomu logowania.
+            let wynik = if io_err == Some(true) {
+                "BŁĄD I/O".to_string()
+            } else if analysis.is_valid {
+                "OK".to_string()
+            } else {
+                format!("BŁĄD: {}", analysis.reason.as_deref().unwrap_or("Nieznany błąd"))
+            };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+            }
+
+            let zapis_start = debug_log.is_active().then(Instant::now);
+            if let Ok(mut f) = log_info.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
+            if let Some(t) = zapis_start {
+                debug_log.log(side_label, "zapis wyniku (log info)", &task.rel_path, t.elapsed(), "OK");
+            }
 
             stats.processed_files.fetch_add(1, Ordering::Relaxed);
             stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
@@ -643,7 +850,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now; 
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
 
@@ -655,7 +862,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 });
                 let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                     idx: bar_idx,
-                    path: full_path.to_string_lossy().to_string(),
+                    path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                 });
 
                 // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -669,7 +876,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
 
@@ -703,14 +910,32 @@ fn compute_half_threads(total_threads: usize) -> usize {
 /// równolegle na dwóch dedykowanych pulach Rayon lub sekwencyjnie; (3) koreluje
 /// wyniki w SQLite; (4) buduje hierarchiczny Dziennik Końcowy z kategoryzacją
 /// rozdzielczości i trzech kategorii błędów dekodowania.
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 13. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 13. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -724,10 +949,19 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_width_script INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_height_ufs INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_height_script INTEGER", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN img_extreme_ratio_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN img_extreme_ratio_script BOOLEAN", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN img_extreme_ratio_ufs BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN img_extreme_ratio_script BOOLEAN",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE files ADD COLUMN img_uniform_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN img_uniform_script BOOLEAN", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN img_uniform_script BOOLEAN",
+        [],
+    );
 
     // NAPRAWA (BŁĄD KRYTYCZNY): `media_decoded_ufs`/`media_decoded_script`
     // JUŻ ISTNIEJĄ w bazowym `CREATE TABLE` (patrz `db.rs`) - Faza 9
@@ -752,41 +986,80 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = conn.execute("UPDATE files SET media_decoded_script = pixels_ok_script WHERE media_decoded_script IS NULL AND pixels_ok_script IS NOT NULL", []);
 
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 13").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza13.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza13.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 13")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza13.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza13.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    let info_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza13_zdrowe_dekody.txt");
+
+    // REGRESJA (zgłoszenie użytkownika): `File::create` na stałej nazwie
+    // pliku nadpisywał raport poprzedniego uruchomienia tej samej fazy bez
+    // śladu. Jeden znacznik czasu na CAŁY przebieg `run()` — wszystkie pliki
+    // tej sesji (operacyjny, dziennik końcowy, info, debug) niosą ten sam
+    // znacznik, więc łatwo je ze sobą powiązać na dysku.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let info_path = Path::new(&raport_cfg.katalog).join(crate::utils::stamp_filename(
+        "raport_operacyjny_faza13_zdrowe_dekody.txt",
+        &stamp,
+    ));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza13.txt", &stamp),
+        &config.log_level,
+    );
 
     let log_anom = match File::create(&opr_path) {
         Ok(f) => Arc::new(Mutex::new(f)),
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie udało się utworzyć pliku raportu na dysku: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie udało się utworzyć pliku raportu na dysku: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
-    
+
     let log_info = match File::create(&info_path) {
         Ok(f) => Arc::new(Mutex::new(f)),
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie udało się utworzyć pliku statystyk: {}", e)));
-            return Ok(()); 
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie udało się utworzyć pliku statystyk: {}",
+                e
+            )));
+            return Ok(());
         }
     };
-    
+
     {
-        let mut f_anom = log_anom.lock().unwrap();
-        let _ = writeln!(f_anom, "=== RAPORT OPERACYJNY - FAZA 13 (ZEPSUTE DEKODOWANIA) ===");
-        let _ = writeln!(f_anom, "Zestawienie plików, które wywaliły procesor podczas próby renderowania. (Gray Banding, Ucięcia).\n");
-        
-        let mut f_info = log_info.lock().unwrap();
-        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 13 (ZDROWE WYRENDEROWANE RAMKI) ===");
-        let _ = writeln!(f_info, "Ekstrakcja śledcza: Szerokość, Wysokość, Megapiksele i Przestrzenie barw (RGB/RGBA).\n");
+        let mut f_anom = log_anom.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_anom,
+            "=== RAPORT OPERACYJNY - FAZA 13 (ZEPSUTE DEKODOWANIA) ==="
+        );
+        let _ = writeln!(
+            f_anom,
+            "Zestawienie plików, które wywaliły procesor podczas próby renderowania. (Gray Banding, Ucięcia).\n"
+        );
+
+        let mut f_info = log_info.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_info,
+            "=== RAPORT OPERACYJNY - FAZA 13 (ZDROWE WYRENDEROWANE RAMKI) ==="
+        );
+        let _ = writeln!(
+            f_info,
+            "Ekstrakcja śledcza: Szerokość, Wysokość, Megapiksele i Przestrzenie barw (RGB/RGBA).\n"
+        );
     }
 
     // --- ETAP 1: POBIERANIE ZADAŃ Z BAZY ---
@@ -794,7 +1067,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT id, relative_path, found_in_ufs, found_in_script, pixels_ok_ufs, pixels_ok_script, io_error_ufs, io_error_script 
          FROM files WHERE phase13_done = 0 OR phase13_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped_ufs = 0;
@@ -802,43 +1075,83 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, ok_ufs, ok_scr, err_ufs, err_scr) = r;
-        
+
         if is_decodable_extension(&rel) {
             let is_common = in_ufs && in_script;
             if in_ufs {
-                if ok_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); } 
-                else { skipped_ufs += 1; }
+                if ok_ufs.is_none() && err_ufs != Some(true) {
+                    ufs_tasks.push(Task {
+                        id,
+                        rel_path: rel.clone(),
+                        is_common,
+                    });
+                } else {
+                    skipped_ufs += 1;
+                }
             }
             if in_script {
-                if ok_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common }); } 
-                else { skipped_script += 1; }
+                if ok_scr.is_none() && err_scr != Some(true) {
+                    script_tasks.push(Task {
+                        id,
+                        rel_path: rel,
+                        is_common,
+                    });
+                } else {
+                    skipped_script += 1;
+                }
             }
         }
     }
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto zdjęcia z już wyrenderowaną macierzą. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto zdjęcia z już wyrenderowaną macierzą. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak wspieranych zdjęć do renderowania. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Dekodowanie klatek w pamięci RAM zakończone. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Brak `return Ok(());`. Kod przechodzi do Etapu 4,
+        // aby uleczyć bazę i zdjąć osierocone obrazy z radarów!
     }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Obrazy)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Obrazy)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Obrazy)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Obrazy)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = compute_half_threads(actual_threads);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -881,7 +1194,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         // nie jest ruszane).
                         let mut stmt = match &msg {
                             ScanMsg::UfsChunk(_) => tx_trans.prepare_cached(SQL_UPDATE_UFS)?,
-                            ScanMsg::ScriptChunk(_) => tx_trans.prepare_cached(SQL_UPDATE_SCRIPT)?,
+                            ScanMsg::ScriptChunk(_) => {
+                                tx_trans.prepare_cached(SQL_UPDATE_SCRIPT)?
+                            }
                         };
 
                         let chunk = match &msg {
@@ -891,17 +1206,40 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                         for res in chunk {
                             let (ok, reason, w, h, extreme, uniform) = if res.analysis.is_valid {
-                                (Some(true), None, Some(res.analysis.width as i64), Some(res.analysis.height as i64),
-                                 Some(res.analysis.has_extreme_aspect_ratio), Some(res.analysis.has_uniform_content))
+                                (
+                                    Some(true),
+                                    None,
+                                    Some(res.analysis.width as i64),
+                                    Some(res.analysis.height as i64),
+                                    Some(res.analysis.has_extreme_aspect_ratio),
+                                    Some(res.analysis.has_uniform_content),
+                                )
                             } else {
-                                (Some(false), res.analysis.reason.clone(), None, None, None, None)
+                                (
+                                    Some(false),
+                                    res.analysis.reason.clone(),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
                             };
                             // `media_decoded_*` (param ?8) reużywa DOKŁADNIE tę
                             // samą wartość `ok` co `pixels_ok_*` (param ?1) -
                             // identyczna semantyka: Some(true) = zdekodowano
                             // czysto, Some(false) = Gray Banding / ucięty obraz
                             // / błąd I/O.
-                            stmt.execute(params![ok, reason, w, h, extreme, uniform, res.io_error, ok, res.id])?;
+                            stmt.execute(params![
+                                ok,
+                                reason,
+                                w,
+                                h,
+                                extreme,
+                                uniform,
+                                res.io_error,
+                                ok,
+                                res.id
+                            ])?;
                         }
                     }
                     tx_trans.commit()?;
@@ -911,17 +1249,30 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let now = Instant::now();
                 if now.duration_since(last_db_update).as_millis() > 60 {
                     last_db_update = now;
-                    let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Zapisywanie wskaźników do bazy...".to_string() });
+                    let _ = tx_ui_ref.send(PhaseEvent::UpdateBar {
+                        idx: 2,
+                        current: db_inserted as u64,
+                        message: "Zapisywanie wskaźników do bazy...".to_string(),
+                    });
                 }
             }
-            let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { idx: 2, current: db_inserted as u64, message: "Wskaźniki renderowania bezpieczne w SQLite.".to_string() });
+            let _ = tx_ui_ref.send(PhaseEvent::UpdateBar {
+                idx: 2,
+                current: db_inserted as u64,
+                message: "Wskaźniki renderowania bezpieczne w SQLite.".to_string(),
+            });
             Ok(())
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -930,43 +1281,138 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             // pula per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
 
             s.spawn(move || {
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !ufs_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, log_anom: anom_u, log_info: info_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                start_time,
+                                log_anom: anom_u,
+                                log_info: info_u,
+                                debug_log: dbg_u,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, log_anom: anom_u, log_info: info_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            start_time,
+                            log_anom: anom_u,
+                            log_info: info_u,
+                            debug_log: dbg_u,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Renderowanie pikseli (UFS) zakończone.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Renderowanie pikseli (UFS) zakończone.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !script_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, log_anom: anom_s, log_info: info_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                start_time,
+                                log_anom: anom_s,
+                                log_info: info_s,
+                                debug_log: dbg_s,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, log_anom: anom_s, log_info: info_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            start_time,
+                            log_anom: anom_s,
+                            log_info: info_s,
+                            debug_log: dbg_s,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Renderowanie pikseli (Skrypt) zakończone.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Renderowanie pikseli (Skrypt) zakończone.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
+        } else {
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
-        } 
-            else 
-        {
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
-            
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, log_anom: anom_u, log_info: info_u, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Renderowanie pikseli (UFS) zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    start_time,
+                    log_anom: anom_u,
+                    log_info: info_u,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Renderowanie pikseli (UFS) zakończone.".to_string(),
+                ));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, log_anom: anom_s, log_info: info_s, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Renderowanie pikseli (Skrypt) zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    start_time,
+                    log_anom: anom_s,
+                    log_info: info_s,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Renderowanie pikseli (Skrypt) zakończone.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -989,12 +1435,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET phase13_done = CASE 
             WHEN (found_in_ufs = 0 OR pixels_ok_ufs IS NOT NULL OR io_error_ufs = 1) 
@@ -1007,7 +1457,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare(
         "SELECT relative_path, found_in_ufs, found_in_script, 
                 pixels_ok_ufs, pixels_ok_script, decode_reason_ufs, decode_reason_script
-         FROM files WHERE phase13_done = 1"
+         FROM files WHERE phase13_done = 1",
     )?;
 
     let mut cat_glitch = AnomalyCategory::new("Zepsute Piksele / Gray Banding", "✂️");
@@ -1016,68 +1466,165 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<bool>>(3)?, row.get::<_, Option<bool>>(4)?,
-            row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (rel_path, in_ufs, in_scr, u_ufs, u_scr, reason_ufs, reason_scr) = r;
         let is_common = in_ufs && in_scr;
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
 
         let add_to_cat = |cat: &mut AnomalyCategory, is_ufs_source: bool| {
-            let target = if is_common { &mut cat.common } else { &mut cat.unique };
-            let map = if is_ufs_source { &mut target.ufs } else { &mut target.script };
+            let target = if is_common {
+                &mut cat.common
+            } else {
+                &mut cat.unique
+            };
+            let map = if is_ufs_source {
+                &mut target.ufs
+            } else {
+                &mut target.script
+            };
             map.entry(ext.clone()).or_default().push(rel_path.clone());
         };
 
         let mut process_reason = |ok: Option<bool>, reason: Option<String>, is_ufs_source: bool| {
             if ok == Some(false) {
                 if let Some(r) = reason {
-                    if r.contains("Bomba") { add_to_cat(&mut cat_bomb, is_ufs_source); }
-                    else if r.contains("Nieobsługiwany") { add_to_cat(&mut cat_fake, is_ufs_source); }
-                    else { add_to_cat(&mut cat_glitch, is_ufs_source); }
+                    if r.contains("Bomba") {
+                        add_to_cat(&mut cat_bomb, is_ufs_source);
+                    } else if r.contains("Nieobsługiwany") {
+                        add_to_cat(&mut cat_fake, is_ufs_source);
+                    } else {
+                        add_to_cat(&mut cat_glitch, is_ufs_source);
+                    }
                 } else {
                     add_to_cat(&mut cat_glitch, is_ufs_source);
                 }
             }
         };
 
-        if in_ufs { process_reason(u_ufs, reason_ufs, true); }
-        if in_scr { process_reason(u_scr, reason_scr, false); }
+        if in_ufs {
+            process_reason(u_ufs, reason_ufs, true);
+        }
+        if in_scr {
+            process_reason(u_scr, reason_scr, false);
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 13 (DEKODOWANIE PIKSELI I RENDEROWANIE RAM)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 13 (DEKODOWANIE PIKSELI I RENDEROWANIE RAM)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let sum_mp = format!("{:.1} MP", (ufs_stats.total_megapixels_x1_m.load(Ordering::SeqCst) + script_stats.total_megapixels_x1_m.load(Ordering::SeqCst)) as f64 / 1_000_000.0);
-    
-    let _ = writeln!(&mut log_out, "[ 1 ] WYRENDEROWANE ZDJĘCIA (Przeszły test dekodowania bez szarych pasków):");
-    let _ = writeln!(&mut log_out, "   -> Poprawnie wyrenderowano {} zdjęć", ufs_stats.ok_common.load(Ordering::SeqCst) + ufs_stats.ok_unique.load(Ordering::SeqCst) + script_stats.ok_common.load(Ordering::SeqCst) + script_stats.ok_unique.load(Ordering::SeqCst));
+    let sum_mp = format!(
+        "{:.1} MP",
+        (ufs_stats.total_megapixels_x1_m.load(Ordering::SeqCst)
+            + script_stats.total_megapixels_x1_m.load(Ordering::SeqCst)) as f64
+            / 1_000_000.0
+    );
+
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] WYRENDEROWANE ZDJĘCIA (Przeszły test dekodowania bez szarych pasków):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Poprawnie wyrenderowano {} zdjęć",
+        ufs_stats.ok_common.load(Ordering::SeqCst)
+            + ufs_stats.ok_unique.load(Ordering::SeqCst)
+            + script_stats.ok_common.load(Ordering::SeqCst)
+            + script_stats.ok_unique.load(Ordering::SeqCst)
+    );
     let _ = writeln!(&mut log_out, "   -> Procesor obliczył łącznie: {}", sum_mp);
-    let _ = writeln!(&mut log_out, "   -> Ekstremalne proporcje boków (>{:.0}:1): {}", EXTREME_ASPECT_RATIO_THRESHOLD, ufs_stats.extreme_ratio_common.load(Ordering::SeqCst) + ufs_stats.extreme_ratio_unique.load(Ordering::SeqCst) + script_stats.extreme_ratio_common.load(Ordering::SeqCst) + script_stats.extreme_ratio_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Zawartość jednolita w próbce (orientacyjnie): {}\n", ufs_stats.uniform_common.load(Ordering::SeqCst) + ufs_stats.uniform_unique.load(Ordering::SeqCst) + script_stats.uniform_common.load(Ordering::SeqCst) + script_stats.uniform_unique.load(Ordering::SeqCst));
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Ekstremalne proporcje boków (>{:.0}:1): {}",
+        EXTREME_ASPECT_RATIO_THRESHOLD,
+        ufs_stats.extreme_ratio_common.load(Ordering::SeqCst)
+            + ufs_stats.extreme_ratio_unique.load(Ordering::SeqCst)
+            + script_stats.extreme_ratio_common.load(Ordering::SeqCst)
+            + script_stats.extreme_ratio_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zawartość jednolita w próbce (orientacyjnie): {}\n",
+        ufs_stats.uniform_common.load(Ordering::SeqCst)
+            + ufs_stats.uniform_unique.load(Ordering::SeqCst)
+            + script_stats.uniform_common.load(Ordering::SeqCst)
+            + script_stats.uniform_unique.load(Ordering::SeqCst)
+    );
 
-    let _ = writeln!(&mut log_out, "[ 2 ] KATEGORYZACJA ROZDZIELCZOŚCI (Zdrowe pliki):");
-    let _ = writeln!(&mut log_out, "   -> Miniatury i ikony (< 1.0 MP):  {} plików", ufs_stats.res_thumb_common.load(Ordering::SeqCst) + ufs_stats.res_thumb_unique.load(Ordering::SeqCst) + script_stats.res_thumb_common.load(Ordering::SeqCst) + script_stats.res_thumb_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Standardowa jakość (1 - 8 MP): {} plików", ufs_stats.res_std_common.load(Ordering::SeqCst) + ufs_stats.res_std_unique.load(Ordering::SeqCst) + script_stats.res_std_common.load(Ordering::SeqCst) + script_stats.res_std_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Wysoka jakość (> 8.0 MP):      {} plików", ufs_stats.res_high_common.load(Ordering::SeqCst) + ufs_stats.res_high_unique.load(Ordering::SeqCst) + script_stats.res_high_common.load(Ordering::SeqCst) + script_stats.res_high_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Algorytm Smart Merge w kolejnej Fazie wytypuje ostatecznie te zdjęcia, które po zdekodowaniu mają największą rozdzielczość (unika miniatur zapisanych pod oryginalną nazwą).\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 2 ] KATEGORYZACJA ROZDZIELCZOŚCI (Zdrowe pliki):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Miniatury i ikony (< 1.0 MP):  {} plików",
+        ufs_stats.res_thumb_common.load(Ordering::SeqCst)
+            + ufs_stats.res_thumb_unique.load(Ordering::SeqCst)
+            + script_stats.res_thumb_common.load(Ordering::SeqCst)
+            + script_stats.res_thumb_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Standardowa jakość (1 - 8 MP): {} plików",
+        ufs_stats.res_std_common.load(Ordering::SeqCst)
+            + ufs_stats.res_std_unique.load(Ordering::SeqCst)
+            + script_stats.res_std_common.load(Ordering::SeqCst)
+            + script_stats.res_std_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Wysoka jakość (> 8.0 MP):      {} plików",
+        ufs_stats.res_high_common.load(Ordering::SeqCst)
+            + ufs_stats.res_high_unique.load(Ordering::SeqCst)
+            + script_stats.res_high_common.load(Ordering::SeqCst)
+            + script_stats.res_high_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Algorytm Smart Merge w kolejnej Fazie wytypuje ostatecznie te zdjęcia, które po zdekodowaniu mają największą rozdzielczość (unika miniatur zapisanych pod oryginalną nazwą).\n"
+    );
 
     let write_section_txt = |out: &mut String, title: &str, is_common: bool| {
         let _ = writeln!(out, "[ KATEGORIA BŁĘDÓW: {} ]", title);
@@ -1088,14 +1635,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let src_anom = if is_common { &cat.common } else { &cat.unique };
             let ufs_total: usize = src_anom.ufs.values().map(|v| v.len()).sum();
             let scr_total: usize = src_anom.script.values().map(|v| v.len()).sum();
-            
+
             if ufs_total > 0 || scr_total > 0 {
                 has_any = true;
-                let _ = writeln!(out, "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})", cat.icon, cat.name, ufs_total, scr_total);
+                let _ = writeln!(
+                    out,
+                    "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})",
+                    cat.icon, cat.name, ufs_total, scr_total
+                );
                 if cat.name.contains("Glitche") || cat.name.contains("Zepsute") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Plik ma dobry nagłówek, ale dekoder zderzył się w środku z zanieczyszczonymi danymi (tzw. Gray Banding). Zdjęcie odrzucone.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Plik ma dobry nagłówek, ale dekoder zderzył się w środku z zanieczyszczonymi danymi (tzw. Gray Banding). Zdjęcie odrzucone."
+                    );
                 } else if cat.name.contains("Przepełnienie RAM") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Malicious Payload (Zip Bomb w zdjęciu). Niewielki plik na dysku, ale instrukcje nakazują procesorowi wygenerować np. 40 GB pustego tła. Plik zablokowany.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Malicious Payload (Zip Bomb w zdjęciu). Niewielki plik na dysku, ale instrukcje nakazują procesorowi wygenerować np. 40 GB pustego tła. Plik zablokowany."
+                    );
                 }
 
                 let mut print_exts = |map: &ExtMap, label: &str| {
@@ -1104,7 +1661,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         let mut sorted: Vec<_> = map.iter().collect();
                         sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
                         for (ext, paths) in sorted.into_iter().take(3) {
-                            let _ = writeln!(out, "         .{:<5} : {} plików (Przykł: {})", ext, paths.len(), paths[0]);
+                            let _ = writeln!(
+                                out,
+                                "         .{:<5} : {} plików (Przykł: {})",
+                                ext,
+                                paths.len(),
+                                paths[0]
+                            );
                         }
                     }
                 };
@@ -1119,32 +1682,67 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     };
 
     write_section_txt(&mut log_out, "Część Wspólna (Oba źródła)", true);
-    write_section_txt(&mut log_out, "Osobne ścieżki (Unikalne dla jednego źródła)", false);
+    write_section_txt(
+        &mut log_out,
+        "Osobne ścieżki (Unikalne dla jednego źródła)",
+        false,
+    );
 
     let _ = writeln!(&mut log_out, "[ ZESTAWIENIE WAGOWE ZESKNOWANYCH ZDJĘĆ ]");
     let print_all_exts = |out_str: &mut String, map: &HashMap<String, u64>, label: &str| {
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
     let _ = writeln!(&mut log_out);
 
     if total_io_errors > 0 {
         let _ = writeln!(&mut log_out, "[ 🚨 BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Błędy odczytu (I/O): {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy odczytu (I/O): {}",
+            total_io_errors
+        );
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}", opr_path.display(), info_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}",
+            opr_path.display(),
+            info_path.display()
+        )));
     }
 
     for line in log_out.lines() {
@@ -1249,6 +1847,30 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // decoding_method_for (etykieta metody dla logu debug/dashboardu)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_decoding_method_for_dng_is_rawloader() {
+        assert_eq!(decoding_method_for("zdjecie.dng"), "rawloader (DNG)");
+        assert_eq!(decoding_method_for("ZDJECIE.DNG"), "rawloader (DNG)");
+    }
+
+    #[test]
+    fn test_decoding_method_for_heic_family_is_libheif() {
+        assert_eq!(decoding_method_for("a.heic"), "libheif (HEIC/HEIF/AVIF)");
+        assert_eq!(decoding_method_for("a.heif"), "libheif (HEIC/HEIF/AVIF)");
+        assert_eq!(decoding_method_for("a.avif"), "libheif (HEIC/HEIF/AVIF)");
+    }
+
+    #[test]
+    fn test_decoding_method_for_everything_else_is_generic_crate() {
+        assert_eq!(decoding_method_for("a.jpg"), "crate image");
+        assert_eq!(decoding_method_for("a.png"), "crate image");
+        assert_eq!(decoding_method_for("a.gif"), "crate image");
+    }
+
+    // ------------------------------------------------------------------
     // is_extreme_aspect_ratio
     // ------------------------------------------------------------------
 
@@ -1310,9 +1932,11 @@ mod tests {
 
     #[test]
     fn test_sample_pixels_uniform_image() {
-        let img = image::DynamicImage::ImageRgba8(
-            image::RgbaImage::from_pixel(20, 20, image::Rgba([100, 150, 200, 255]))
-        );
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            20,
+            20,
+            image::Rgba([100, 150, 200, 255]),
+        ));
         let samples = sample_pixels(&img, UNIFORM_SAMPLE_POINTS);
         assert!(!samples.is_empty());
         assert!(is_uniform_sample(&samples));
@@ -1322,7 +1946,11 @@ mod tests {
     fn test_sample_pixels_checkerboard_not_uniform() {
         let mut buf = image::RgbaImage::new(20, 20);
         for (x, y, px) in buf.enumerate_pixels_mut() {
-            *px = if (x + y) % 2 == 0 { image::Rgba([255, 255, 255, 255]) } else { image::Rgba([0, 0, 0, 255]) };
+            *px = if (x + y) % 2 == 0 {
+                image::Rgba([255, 255, 255, 255])
+            } else {
+                image::Rgba([0, 0, 0, 255])
+            };
         }
         let img = image::DynamicImage::ImageRgba8(buf);
         let samples = sample_pixels(&img, UNIFORM_SAMPLE_POINTS);
@@ -1335,12 +1963,17 @@ mod tests {
 
     #[test]
     fn test_analyze_valid_png_decodes_successfully() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("test.png");
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 48, image::Rgb([10, 20, 30])));
-        img.save(&path).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            48,
+            image::Rgb([10, 20, 30]),
+        ));
+        img.save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(result.is_valid);
         assert_eq!(result.width, 64);
         assert_eq!(result.height, 48);
@@ -1349,52 +1982,72 @@ mod tests {
 
     #[test]
     fn test_analyze_valid_rgba_png_reports_rgba_color_space() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("test.png");
-        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(32, 32, image::Rgba([1, 2, 3, 128])));
-        img.save(&path).unwrap();
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            32,
+            32,
+            image::Rgba([1, 2, 3, 128]),
+        ));
+        img.save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(result.is_valid);
         assert_eq!(result.color_space, "RGBA");
     }
 
     #[test]
     fn test_analyze_valid_image_detects_uniform_content() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("uniform.png");
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(50, 50, image::Rgb([200, 200, 200])));
-        img.save(&path).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            50,
+            50,
+            image::Rgb([200, 200, 200]),
+        ));
+        img.save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(result.is_valid);
         assert!(result.has_uniform_content);
     }
 
     #[test]
     fn test_analyze_valid_image_detects_extreme_ratio() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("skinny.png");
         // Obraz techniczne poprawny, ale geometrycznie bezsensowny (1x200)
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 200, image::Rgb([0, 0, 0])));
-        img.save(&path).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            200,
+            image::Rgb([0, 0, 0]),
+        ));
+        img.save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
-        let result = analyze_image(&path).unwrap();
-        assert!(result.is_valid, "Dekodowanie powinno się powieść mimo dziwnej geometrii");
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
+        assert!(
+            result.is_valid,
+            "Dekodowanie powinno się powieść mimo dziwnej geometrii"
+        );
         assert!(result.has_extreme_aspect_ratio);
     }
 
     #[test]
     fn test_analyze_normal_image_not_flagged() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("normal.png");
         let mut buf = image::RgbImage::new(40, 40);
         for (x, y, px) in buf.enumerate_pixels_mut() {
             *px = image::Rgb([(x * 5) as u8, (y * 5) as u8, 128]);
         }
-        image::DynamicImage::ImageRgb8(buf).save(&path).unwrap();
+        image::DynamicImage::ImageRgb8(buf)
+            .save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(result.is_valid);
         assert!(!result.has_extreme_aspect_ratio);
         assert!(!result.has_uniform_content);
@@ -1402,13 +2055,19 @@ mod tests {
 
     #[test]
     fn test_analyze_corrupted_file_with_valid_extension_is_invalid_not_io_error() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("corrupted.png");
         // Nagłówek PNG (sygnatura) obecny, ale reszta to śmieci - dekoder
         // powinien zwrócić błąd sparsowania, NIE błąd braku pliku.
-        std::fs::write(&path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFF, 0xFF]).unwrap();
+        std::fs::write(
+            &path,
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFF, 0xFF,
+            ],
+        )
+        .expect("Nie można zapisać danych do pliku");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(!result.is_valid);
         assert!(result.reason.is_some());
     }
@@ -1416,16 +2075,20 @@ mod tests {
     #[test]
     fn test_analyze_nonexistent_file_is_io_error() {
         let result = analyze_image(Path::new("/nieistniejaca/sciezka/plik.png"));
-        assert!(result.is_err(), "Brak pliku powinien zwrócić Err, nie ImageAnalysis z is_valid=false");
+        assert!(
+            result.is_err(),
+            "Brak pliku powinien zwrócić Err, nie ImageAnalysis z is_valid=false"
+        );
     }
 
     #[test]
     fn test_analyze_text_file_with_image_extension_is_unsupported() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("nie_obraz.png");
-        std::fs::write(&path, b"To zwykly tekst, nie obraz PNG w ogole.").unwrap();
+        std::fs::write(&path, b"To zwykly tekst, nie obraz PNG w ogole.")
+            .expect("Nie można zapisać danych do pliku");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(!result.is_valid);
     }
 
@@ -1435,19 +2098,28 @@ mod tests {
 
     #[test]
     fn test_analyze_dng_garbage_is_invalid_not_panic() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("smieci.dng");
-        std::fs::write(&path, b"to na pewno nie jest plik RAW ani TIFF").unwrap();
+        std::fs::write(&path, b"to na pewno nie jest plik RAW ani TIFF")
+            .expect("Nie można zapisać danych do pliku");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(!result.is_valid);
-        assert!(result.reason.unwrap().contains("RAW"));
+        assert!(
+            result
+                .reason
+                .expect("Powód analizy powinien być obecny")
+                .contains("RAW")
+        );
     }
 
     #[test]
     fn test_analyze_dng_nonexistent_file_is_io_error() {
         let result = analyze_image(Path::new("/nieistniejaca/sciezka/plik.dng"));
-        assert!(result.is_err(), "Brak pliku DNG powinien zwrócić Err, tak samo jak dla innych formatów");
+        assert!(
+            result.is_err(),
+            "Brak pliku DNG powinien zwrócić Err, tak samo jak dla innych formatów"
+        );
     }
 
     #[test]
@@ -1470,19 +2142,28 @@ mod tests {
 
     #[test]
     fn test_analyze_heic_garbage_is_invalid_not_panic() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("smieci.heic");
-        std::fs::write(&path, b"to na pewno nie jest kontener HEIC").unwrap();
+        std::fs::write(&path, b"to na pewno nie jest kontener HEIC")
+            .expect("Nie można zapisać danych do pliku");
 
-        let result = analyze_image(&path).unwrap();
+        let result = analyze_image(&path).expect("Analiza obrazu nie powiodła się");
         assert!(!result.is_valid);
-        assert!(result.reason.unwrap().contains("HEIC"));
+        assert!(
+            result
+                .reason
+                .expect("Powód analizy powinien być obecny")
+                .contains("HEIC")
+        );
     }
 
     #[test]
     fn test_analyze_heic_nonexistent_file_is_io_error() {
         let result = analyze_image(Path::new("/nieistniejaca/sciezka/plik.heic"));
-        assert!(result.is_err(), "Brak pliku HEIC powinien zwrócić Err, tak samo jak dla innych formatów");
+        assert!(
+            result.is_err(),
+            "Brak pliku HEIC powinien zwrócić Err, tak samo jak dla innych formatów"
+        );
     }
 
     #[test]
@@ -1491,11 +2172,18 @@ mod tests {
                 pod `image/test_fixture.heic`. Uruchom: \
                 `cargo test analyze_image_via_heic_branch -- --ignored --nocapture`."]
     fn test_analyze_image_via_heic_branch_real_fixture() {
-        let result = analyze_image(Path::new("image/test_fixture.heic")).unwrap();
-        assert!(result.is_valid, "Prawdziwy plik HEIC powinien się odczytać przez gałąź HEIC w analyze_image");
+        let result = analyze_image(Path::new("image/test_fixture.heic"))
+            .expect("Analiza obrazu nie powiodła się");
+        assert!(
+            result.is_valid,
+            "Prawdziwy plik HEIC powinien się odczytać przez gałąź HEIC w analyze_image"
+        );
         assert!(result.width > 0 && result.height > 0);
         assert!(result.color_space.contains("HEIC"));
-        println!("✔ analyze_image (gałąź HEIC): {}x{}, {}", result.width, result.height, result.color_space);
+        println!(
+            "✔ analyze_image (gałąź HEIC): {}x{}, {}",
+            result.width, result.height, result.color_space
+        );
     }
 
     #[test]
@@ -1507,11 +2195,17 @@ mod tests {
                 Aby uruchomić: `cargo test analyze_image_via_dng_branch -- --ignored --nocapture`."]
     fn test_analyze_image_via_dng_branch_real_fixture() {
         let path = Path::new("image/test_fixture.dng");
-        let result = analyze_image(path).unwrap();
-        assert!(result.is_valid, "Prawdziwy plik DNG powinien się zdekodować poprawnie przez gałąź DNG w analyze_image");
+        let result = analyze_image(path).expect("Analiza obrazu nie powiodła się");
+        assert!(
+            result.is_valid,
+            "Prawdziwy plik DNG powinien się zdekodować poprawnie przez gałąź DNG w analyze_image"
+        );
         assert!(result.width > 0 && result.height > 0);
         assert_eq!(result.color_space, "RAW Bayer (1 składowa)");
-        println!("✔ analyze_image (gałąź DNG): {}x{}, {}", result.width, result.height, result.color_space);
+        println!(
+            "✔ analyze_image (gałąź DNG): {}x{}, {}",
+            result.width, result.height, result.color_space
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1548,7 +2242,9 @@ mod tests {
     fn test_build_source_block_reports_average_megapixels() {
         let stats = LiveStats::new(4);
         stats.ok_common.store(2, Ordering::Relaxed);
-        stats.total_megapixels_x1_m.store(20_000_000, Ordering::Relaxed); // 20.0 MP łącznie / 2 pliki = 10.0 MP
+        stats
+            .total_megapixels_x1_m
+            .store(20_000_000, Ordering::Relaxed); // 20.0 MP łącznie / 2 pliki = 10.0 MP
 
         let block = build_source_block("UFS Explorer", &stats, Instant::now());
         assert!(block.contains("Śr. megapikseli (zdrowe): 10.00 MP"));
@@ -1571,7 +2267,11 @@ mod tests {
         stats.col_other.store(4, Ordering::Relaxed);
 
         let block = build_source_block("UFS Explorer", &stats, Instant::now());
-        assert!(block.contains("Przestrzenie kolorów: RGB: 0, RGBA: 0, Szare: 1, RAW: 2, HEIC: 3, Inne: 4"));
+        assert!(
+            block.contains(
+                "Przestrzenie kolorów: RGB: 0, RGBA: 0, Szare: 1, RAW: 2, HEIC: 3, Inne: 4"
+            )
+        );
     }
 
     #[test]
@@ -1584,7 +2284,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki dekodowania")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki dekodowania"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki dekodowania (Wariant A): {G:1} {G:2}");
     }
 
@@ -1603,24 +2306,39 @@ mod tests {
 
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki dekodowania (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki dekodowania (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(2);
         let block = build_source_block("UFS Explorer", &stats, Instant::now());
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta \"{}\" z panelu Fazy 13 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+                "etykieta \"{}\" z panelu Fazy 13 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 8, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza13_dekodowanie.rs");
+        assert_eq!(
+            sprawdzonych, 8,
+            "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza13_dekodowanie.rs"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1635,52 +2353,90 @@ mod tests {
 
     #[test]
     fn test_media_decoded_written_alongside_pixels_ok_for_healthy_image() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (1, 'zdrowe.png', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         // Zdjęcie zdekodowane CZYSTO: `ok = Some(true)`, dokładnie tak jak
         // produkuje pętla zapisu w [`run`] dla `res.analysis.is_valid == true`.
         conn.execute(
             SQL_UPDATE_UFS,
-            params![Some(true), None::<String>, Some(1920i64), Some(1080i64), Some(false), Some(false), None::<bool>, Some(true), 1],
-        ).unwrap();
+            params![
+                Some(true),
+                None::<String>,
+                Some(1920i64),
+                Some(1080i64),
+                Some(false),
+                Some(false),
+                None::<bool>,
+                Some(true),
+                1
+            ],
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn.query_row(
-            "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn
+            .query_row(
+                "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
 
         assert_eq!(pixels_ok, Some(true));
-        assert_eq!(media_decoded, Some(true), "media_decoded_ufs musi być zapisane dla zdrowego zdjęcia - Faza 9/8 na tym polegają, nie na pixels_ok_ufs");
-        assert_eq!(pixels_ok, media_decoded, "obie kolumny muszą nieść IDENTYCZNĄ wartość - ta sama semantyka");
+        assert_eq!(
+            media_decoded,
+            Some(true),
+            "media_decoded_ufs musi być zapisane dla zdrowego zdjęcia - Faza 9/8 na tym polegają, nie na pixels_ok_ufs"
+        );
+        assert_eq!(
+            pixels_ok, media_decoded,
+            "obie kolumny muszą nieść IDENTYCZNĄ wartość - ta sama semantyka"
+        );
     }
 
     #[test]
     fn test_media_decoded_written_alongside_pixels_ok_for_gray_banded_image() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (2, 'gray_banding.jpg', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         // Gray Banding: `ok = Some(false)`, dokładnie tak jak produkuje pętla
         // zapisu w [`run`] dla `res.analysis.is_valid == false`.
         conn.execute(
             SQL_UPDATE_UFS,
-            params![Some(false), Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"), None::<i64>, None::<i64>, None::<bool>, None::<bool>, None::<bool>, Some(false), 2],
-        ).unwrap();
+            params![
+                Some(false),
+                Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"),
+                None::<i64>,
+                None::<i64>,
+                None::<bool>,
+                None::<bool>,
+                None::<bool>,
+                Some(false),
+                2
+            ],
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn.query_row(
-            "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 2",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (pixels_ok, media_decoded): (Option<bool>, Option<bool>) = conn
+            .query_row(
+                "SELECT pixels_ok_ufs, media_decoded_ufs FROM files WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
 
         assert_eq!(pixels_ok, Some(false));
         assert_eq!(
-            media_decoded, Some(false),
+            media_decoded,
+            Some(false),
             "media_decoded_ufs = Some(false) jest DOKŁADNIE tym, co sprawdza phase9::decide_winner \
              (`file.media_decoded_ufs == Some(false)`) przy odrzuceniu strony za Gray Banding - \
              bez tej naprawy kolumna zostawała NULL na zawsze i decyzja nigdy nie zapadała."
@@ -1692,23 +2448,41 @@ mod tests {
         // Wersja dla strony Skrypt Autorski - upewnia się, że `SQL_UPDATE_SCRIPT`
         // pisze do `_script`, nie przypadkiem do `_ufs` (kopiuj-wklej bug byłby
         // niewidoczny w powyższych dwóch testach, które sprawdzają tylko UFS).
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (3, 'skrypt.png', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         conn.execute(
             SQL_UPDATE_SCRIPT,
-            params![Some(false), Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"), None::<i64>, None::<i64>, None::<bool>, None::<bool>, None::<bool>, Some(false), 3],
-        ).unwrap();
+            params![
+                Some(false),
+                Some("Zepsute Piksele (Gray Banding / Ucięty obraz)"),
+                None::<i64>,
+                None::<i64>,
+                None::<bool>,
+                None::<bool>,
+                None::<bool>,
+                Some(false),
+                3
+            ],
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let (media_ufs, media_script): (Option<bool>, Option<bool>) = conn.query_row(
-            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 3",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (media_ufs, media_script): (Option<bool>, Option<bool>) = conn
+            .query_row(
+                "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
 
-        assert_eq!(media_ufs, None, "SQL_UPDATE_SCRIPT nie może dotykać kolumn _ufs");
+        assert_eq!(
+            media_ufs, None,
+            "SQL_UPDATE_SCRIPT nie może dotykać kolumn _ufs"
+        );
         assert_eq!(media_script, Some(false));
     }
 
@@ -1717,34 +2491,44 @@ mod tests {
         // Regresja dla baz, na których Faza 13 działała PRZED tą naprawą:
         // `pixels_ok_*` już wypełnione, `media_decoded_*` jeszcze NULL.
         // Odtwarza dokładnie ten stan i weryfikuje backfill z [`run`].
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, pixels_ok_ufs, pixels_ok_script)
              VALUES (1, 'stare.png', 1, 1, 1, 0)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         // Wiersz bez wcześniejszego przebiegu Fazy 13 - backfill nie powinien
         // go ruszać (pixels_ok_* jest NULL, więc warunek WHERE go pomija).
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (2, 'nietkniete.png', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        conn.execute("UPDATE files SET media_decoded_ufs = pixels_ok_ufs WHERE media_decoded_ufs IS NULL AND pixels_ok_ufs IS NOT NULL", []).unwrap();
-        conn.execute("UPDATE files SET media_decoded_script = pixels_ok_script WHERE media_decoded_script IS NULL AND pixels_ok_script IS NOT NULL", []).unwrap();
+        conn.execute("UPDATE files SET media_decoded_ufs = pixels_ok_ufs WHERE media_decoded_ufs IS NULL AND pixels_ok_ufs IS NOT NULL", []).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
+        conn.execute("UPDATE files SET media_decoded_script = pixels_ok_script WHERE media_decoded_script IS NULL AND pixels_ok_script IS NOT NULL", []).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let (m1_ufs, m1_scr): (Option<bool>, Option<bool>) = conn.query_row(
-            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (m1_ufs, m1_scr): (Option<bool>, Option<bool>) = conn
+            .query_row(
+                "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
         assert_eq!(m1_ufs, Some(true));
         assert_eq!(m1_scr, Some(false));
 
-        let (m2_ufs, m2_scr): (Option<bool>, Option<bool>) = conn.query_row(
-            "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 2",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!(m2_ufs, None, "wiersz bez wcześniejszego pixels_ok_ufs nie powinien zostać dotknięty przez backfill");
+        let (m2_ufs, m2_scr): (Option<bool>, Option<bool>) = conn
+            .query_row(
+                "SELECT media_decoded_ufs, media_decoded_script FROM files WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
+        assert_eq!(
+            m2_ufs, None,
+            "wiersz bez wcześniejszego pixels_ok_ufs nie powinien zostać dotknięty przez backfill"
+        );
         assert_eq!(m2_scr, None);
     }
 
@@ -1767,10 +2551,15 @@ mod tests {
         // przekazanym do `generic_image::decode_guarded` - udowadnia, że
         // panika w KTÓRYMKOLWIEK miejscu tego domknięcia (nie tylko w samym
         // `image::open`) zostaje bezpiecznie przechwycona, zamiast ubić wątek.
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let path = dir.path().join("test.png");
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3])));
-        img.save(&path).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            10,
+            10,
+            image::Rgb([1, 2, 3]),
+        ));
+        img.save(&path)
+            .expect("Zapis obrazu do pliku nie powiódł się");
 
         let guarded = crate::generic_image::decode_guarded(|| -> ImageAnalysis {
             let opened = image::open(&path).expect("plik testowy musi się otworzyć");
@@ -1778,8 +2567,14 @@ mod tests {
             panic!("symulowana panika PODCZAS przetwarzania już zdekodowanego bufora");
         });
 
-        assert!(guarded.is_none(), "Panika w domknięciu image::open+przetwarzanie musi zostać przechwycona, nie propagować dalej");
-        assert!(!crate::generic_image::is_expected_panic_in_progress(), "Flaga musi zostać zdjęta po obsłużonej panice");
+        assert!(
+            guarded.is_none(),
+            "Panika w domknięciu image::open+przetwarzanie musi zostać przechwycona, nie propagować dalej"
+        );
+        assert!(
+            !crate::generic_image::is_expected_panic_in_progress(),
+            "Flaga musi zostać zdjęta po obsłużonej panice"
+        );
     }
 
     #[test]
@@ -1790,9 +2585,11 @@ mod tests {
         // Gray Banding/glitch - NIE `Err` (to byłoby błędnie potraktowane jako
         // brak pliku / błąd I/O przez `process_side_stream`).
         let guarded: Option<std::result::Result<ImageAnalysis, std::io::Error>> =
-            crate::generic_image::decode_guarded(|| -> std::result::Result<ImageAnalysis, std::io::Error> {
-                panic!("symulowana panika dekodera");
-            });
+            crate::generic_image::decode_guarded(
+                || -> std::result::Result<ImageAnalysis, std::io::Error> {
+                    panic!("symulowana panika dekodera");
+                },
+            );
 
         let result = match guarded {
             Some(r) => r,
@@ -1806,6 +2603,164 @@ mod tests {
 
         let analysis = result.expect("panika NIGDY nie powinna być zwrócona jako Err/błąd I/O");
         assert!(!analysis.is_valid);
-        assert!(analysis.reason.unwrap().contains("Gray Banding"));
+        assert!(
+            analysis
+                .reason
+                .expect("Powód analizy powinien być obecny")
+                .contains("Gray Banding")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // run() end-to-end — znaczniki czasu w nazwach plików (zgłoszenie
+    // użytkownika: raporty/logi nadpisywały się między uruchomieniami),
+    // linia "Start" w logu info, log debug per faza.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_run_e2e_znaczniki_czasu_start_line_i_log_debug() {
+        use crate::settings::Ustawienia;
+
+        let ufs_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let log_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([10, 20, 30]),
+        ));
+        img.save(ufs_dir.path().join("zdrowe.png"))
+            .expect("Nie można zapisać pliku testowego");
+
+        let mut conn = crate::db::init_db(":memory:").expect("Nie można zainicjalizować bazy");
+        conn.execute(
+            "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('zdrowe.png', 1, 0)",
+            [],
+        )
+        .expect("Nie można wstawić wiersza testowego");
+
+        let mut config = Ustawienia {
+            ufs_path: ufs_dir.path().to_string_lossy().to_string(),
+            script_path: script_dir.path().to_string_lossy().to_string(),
+            log_path: log_dir.path().to_string_lossy().to_string(),
+            log_level: "DEBUG".to_string(),
+            io_mode: "SEQUENTIAL".to_string(),
+            max_threads: 1,
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+
+        let (tx_ui, rx_ui) = mpsc::channel();
+        std::thread::spawn(move || while rx_ui.recv().is_ok() {});
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
+
+        let mut nazwy: Vec<String> = std::fs::read_dir(log_dir.path())
+            .expect("Nie można odczytać katalogu logów")
+            .filter_map(|w| w.ok())
+            .map(|w| w.file_name().to_string_lossy().to_string())
+            .collect();
+        nazwy.sort();
+
+        // Znacznik czasu zaczyna się od 4 cyfr roku - sprawdzamy, że zaraz
+        // za "_" po rdzeniu nazwy stoi CYFRA, nie kolejny fragment nazwy
+        // bazowej (np. "raport_operacyjny_faza13_zdrowe..." nie może
+        // fałszywie zaliczyć się jako stemplowany "raport_operacyjny_faza13").
+        let ma_dopisany_znacznik = |rdzen: &str| {
+            let prefiks = format!("{}_", rdzen);
+            nazwy.iter().any(|n| {
+                n.strip_prefix(&prefiks)
+                    .and_then(|reszta| reszta.chars().next())
+                    .is_some_and(|c| c.is_ascii_digit())
+            })
+        };
+
+        assert!(
+            ma_dopisany_znacznik("raport_operacyjny_faza13_zdrowe_dekody"),
+            "brak stemplowanego pliku info wśród: {:?}",
+            nazwy
+        );
+        assert!(
+            ma_dopisany_znacznik("raport_operacyjny_faza13"),
+            "brak stemplowanego pliku operacyjnego wśród: {:?}",
+            nazwy
+        );
+        assert!(
+            ma_dopisany_znacznik("dziennik_koncowy_faza13"),
+            "brak stemplowanego dziennika końcowego wśród: {:?}",
+            nazwy
+        );
+        assert!(
+            ma_dopisany_znacznik("dziennik_debug_faza13"),
+            "brak stemplowanego logu debug wśród: {:?} (log_level=DEBUG powinien go aktywować)",
+            nazwy
+        );
+
+        let info_plik = nazwy
+            .iter()
+            .find(|n| n.starts_with("raport_operacyjny_faza13_zdrowe_dekody"))
+            .expect("plik info musi istnieć");
+        let info_tresc = std::fs::read_to_string(log_dir.path().join(info_plik))
+            .expect("Nie można odczytać pliku info");
+        assert!(
+            info_tresc.contains("[START ]"),
+            "log info musi zawierać linię \"Start\" PRZED wynikiem: {}",
+            info_tresc
+        );
+        assert!(
+            info_tresc.contains("[KONIEC]") && info_tresc.contains("[Wynik: OK]"),
+            "log info musi zawierać linię \"Koniec\" z wynikiem: {}",
+            info_tresc
+        );
+        assert!(info_tresc.contains("crate image"), "log info musi nazwać metodę dekodowania: {}", info_tresc);
+        assert!(info_tresc.contains("zdrowe.png"));
+
+        let debug_plik = nazwy
+            .iter()
+            .find(|n| n.starts_with("dziennik_debug_faza13"))
+            .expect("plik debug musi istnieć");
+        let debug_tresc = std::fs::read_to_string(log_dir.path().join(debug_plik))
+            .expect("Nie można odczytać pliku debug");
+        assert!(debug_tresc.contains("crate image"), "log debug musi nazwać metodę: {}", debug_tresc);
+        assert!(debug_tresc.contains(" ms "), "log debug musi zawierać czas trwania: {}", debug_tresc);
+        assert!(debug_tresc.contains("[OK]"), "log debug musi zawierać wynik (OK dla zdrowego pliku): {}", debug_tresc);
+        assert!(debug_tresc.contains("zdrowe.png"));
+    }
+
+    /// Kontrola negatywna: przy `log_level = "INFO"` (domyślny, produkcyjny)
+    /// log debug w ogóle NIE POWSTAJE na dysku - `DebugLog::maybe_open`
+    /// (patrz `src/debug_log.rs`) jest zerokosztowym no-opem poniżej DEBUG.
+    #[test]
+    fn test_run_e2e_log_debug_nie_powstaje_przy_poziomie_info() {
+        use crate::settings::Ustawienia;
+
+        let ufs_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let log_dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+
+        let mut conn = crate::db::init_db(":memory:").expect("Nie można zainicjalizować bazy");
+
+        let mut config = Ustawienia {
+            ufs_path: ufs_dir.path().to_string_lossy().to_string(),
+            script_path: script_dir.path().to_string_lossy().to_string(),
+            log_path: log_dir.path().to_string_lossy().to_string(),
+            log_level: "INFO".to_string(),
+            io_mode: "SEQUENTIAL".to_string(),
+            max_threads: 1,
+            ..Default::default()
+        };
+        config.raporty_faz.clear();
+
+        let (tx_ui, rx_ui) = mpsc::channel();
+        std::thread::spawn(move || while rx_ui.recv().is_ok() {});
+
+        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
+
+        let ma_plik_debug = std::fs::read_dir(log_dir.path())
+            .expect("Nie można odczytać katalogu logów")
+            .filter_map(|w| w.ok())
+            .any(|w| w.file_name().to_string_lossy().starts_with("dziennik_debug_faza13"));
+        assert!(!ma_plik_debug, "log debug nie powinien powstać przy log_level=INFO");
     }
 }

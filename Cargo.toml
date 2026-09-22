@@ -76,6 +76,7 @@ matroska = "0.30.1"
 # (jpeg_splice). Zapis ISOBMFF (dawniej `byteorder`) żyje teraz wyłącznie
 # w `mp4_engines`, który deklaruje tę zależność u siebie.
 memchr = "2.8.3"
+chrono = "0.4.45"
 
 [dev-dependencies]
 tempfile = "3.27.0"

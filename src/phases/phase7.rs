@@ -461,6 +461,7 @@ pub struct StreamCtx<'a> {
     pub start_time: Instant,
     // <--- DODANO BRAKUJĄCY ARGUMENT
     pub opr_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
@@ -477,7 +478,9 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         bar_idx,
         start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
         opr_log,
+        debug_log,
     } = ctx;
+    let metoda = "calculate_entropy (Shannon)";
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -502,6 +505,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             
             *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size;
 
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (entropy_opt, io_err) = match stats.thread_activity.track_current(|| calculate_entropy(&full_path)) {
                 Ok(ent) => {
                     let mut anomalies = Vec::new();
@@ -576,6 +588,23 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     }
                 }
             };
+            let wynik = if io_err == Some(true) {
+                "BŁĄD I/O".to_string()
+            } else if io_err.is_none() {
+                "PRZERWANO".to_string()
+            } else {
+                format!("OK (H={:.3})", entropy_opt.unwrap_or(0.0))
+            };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
 
             stats.processed_files.fetch_add(1, Ordering::Relaxed);
             stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
@@ -623,7 +652,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 });
                 let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                     idx: bar_idx,
-                    path: full_path.to_string_lossy().to_string(),
+                    path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                 });
 
                 // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -705,8 +734,19 @@ pub fn run(
         });
 
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza7.txt", &stamp),
+        &config.log_level,
+    );
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -918,6 +958,8 @@ pub fn run(
             let tx2 = tx_db.clone();
             let rep_u = opr_log.clone();
             let rep_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -947,6 +989,7 @@ pub fn run(
                                 bar_idx: 0,
                                 start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                                 opr_log: rep_u,
+                                debug_log: dbg_u.clone(),
                             });
                         });
                     } else {
@@ -961,6 +1004,7 @@ pub fn run(
                             bar_idx: 0,
                             start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                             opr_log: rep_u,
+                            debug_log: dbg_u.clone(),
                         });
                     }
                     let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -987,6 +1031,7 @@ pub fn run(
                                 bar_idx: 1,
                                 start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                                 opr_log: rep_s,
+                                debug_log: dbg_s.clone(),
                             });
                         });
                     } else {
@@ -1001,6 +1046,7 @@ pub fn run(
                             bar_idx: 1,
                             start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                             opr_log: rep_s,
+                            debug_log: dbg_s.clone(),
                         });
                     }
                     let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -1012,6 +1058,8 @@ pub fn run(
         } else {
             let rep_u = opr_log.clone();
             let rep_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             if !ufs_tasks.is_empty() {
                 process_side_stream(StreamCtx {
@@ -1025,6 +1073,7 @@ pub fn run(
                     bar_idx: 0,
                     start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                     opr_log: rep_u,
+                    debug_log: dbg_u,
                 });
                 let _ = tx_ui_ref.send(PhaseEvent::Log(
                     "✔ Analiza matematyczna (UFS Explorer) zakończona.".to_string(),
@@ -1043,6 +1092,7 @@ pub fn run(
                     bar_idx: 1,
                     start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
                     opr_log: rep_s,
+                    debug_log: dbg_s,
                 });
                 let _ = tx_ui_ref.send(PhaseEvent::Log(
                     "✔ Analiza matematyczna (Skrypt Autorski) zakończona.".to_string(),

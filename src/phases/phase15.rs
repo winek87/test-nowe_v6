@@ -27,10 +27,10 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -38,7 +38,7 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -78,11 +78,17 @@ fn get_file_category(ext: &str) -> &'static str {
 /// Safari/Spotlight — `kMDItemWhereFroms`, zawiera oryginalny URL),
 /// `"url_generic"` (dowolny inny klucz zawierający "url" w nazwie).
 fn classify_url_marker(key_lower: &str) -> Option<&'static str> {
-    if key_lower.contains("zone.identifier") { Some("zone_identifier") }
-    else if key_lower.contains("quarantine") { Some("quarantine") }
-    else if key_lower.contains("wherefroms") { Some("wherefroms") }
-    else if key_lower.contains("url") { Some("url_generic") }
-    else { None }
+    if key_lower.contains("zone.identifier") {
+        Some("zone_identifier")
+    } else if key_lower.contains("quarantine") {
+        Some("quarantine")
+    } else if key_lower.contains("wherefroms") {
+        Some("wherefroms")
+    } else if key_lower.contains("url") {
+        Some("url_generic")
+    } else {
+        None
+    }
 }
 
 /// Wyodrębnia przestrzeń nazw POSIX xattr (część klucza przed pierwszą
@@ -110,14 +116,46 @@ fn is_large_xattr(total_bytes: u64) -> bool {
 /// np. `CAP_SYS_ADMIN`/`CAP_SETUID` odzyskany z dysku to istotny sygnał
 /// (mechanizm eskalacji uprawnień przetrwał poza standardowym SUID).
 const CAPABILITY_NAMES: &[&str] = &[
-    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_FSETID",
-    "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_LINUX_IMMUTABLE",
-    "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK",
-    "CAP_IPC_OWNER", "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
-    "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE", "CAP_SYS_RESOURCE",
-    "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD", "CAP_LEASE", "CAP_AUDIT_WRITE",
-    "CAP_AUDIT_CONTROL", "CAP_SETFCAP", "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG",
-    "CAP_WAKE_ALARM", "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_KILL",
+    "CAP_SETGID",
+    "CAP_SETUID",
+    "CAP_SETPCAP",
+    "CAP_LINUX_IMMUTABLE",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_ADMIN",
+    "CAP_NET_RAW",
+    "CAP_IPC_LOCK",
+    "CAP_IPC_OWNER",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_RAWIO",
+    "CAP_SYS_CHROOT",
+    "CAP_SYS_PTRACE",
+    "CAP_SYS_PACCT",
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_NICE",
+    "CAP_SYS_RESOURCE",
+    "CAP_SYS_TIME",
+    "CAP_SYS_TTY_CONFIG",
+    "CAP_MKNOD",
+    "CAP_LEASE",
+    "CAP_AUDIT_WRITE",
+    "CAP_AUDIT_CONTROL",
+    "CAP_SETFCAP",
+    "CAP_MAC_OVERRIDE",
+    "CAP_MAC_ADMIN",
+    "CAP_SYSLOG",
+    "CAP_WAKE_ALARM",
+    "CAP_BLOCK_SUSPEND",
+    "CAP_AUDIT_READ",
+    "CAP_PERFMON",
+    "CAP_BPF",
     "CAP_CHECKPOINT_RESTORE",
 ];
 
@@ -135,18 +173,21 @@ const CAPABILITY_NAMES: &[&str] = &[
 /// Wejście zbyt krótkie/nierozpoznanej rewizji zwraca pustą listę (nigdy nie
 /// panikuje) — dane xattr na uszkodzonym/odzyskanym dysku mogą być ucięte.
 fn parse_capability_names(raw: &[u8]) -> Vec<&'static str> {
-    if raw.len() < 8 { return Vec::new(); }
+    if raw.len() < 8 {
+        return Vec::new();
+    }
     let magic_etc = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let revision = magic_etc & 0xFF000000;
 
     let permitted_low = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    let permitted_high: u32 = if (revision == 0x02000000 || revision == 0x03000000) && raw.len() >= 20 {
-        u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
-    } else if revision == 0x01000000 {
-        0
-    } else {
-        return Vec::new();
-    };
+    let permitted_high: u32 =
+        if (revision == 0x02000000 || revision == 0x03000000) && raw.len() >= 20 {
+            u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
+        } else if revision == 0x01000000 {
+            0
+        } else {
+            return Vec::new();
+        };
 
     let mask = (permitted_low as u64) | ((permitted_high as u64) << 32);
     (0..CAPABILITY_NAMES.len())
@@ -165,7 +206,10 @@ fn parse_capability_names(raw: &[u8]) -> Vec<&'static str> {
 /// `classify_url_marker`/`xattr_namespace`/`is_large_xattr` (patrz uwaga
 /// architektoniczna na początku modułu) — testowalna na syntetycznych
 /// mapach zliczeń, bez potrzeby prawdziwych xattr na dysku.
-fn format_namespace_section(ufs: &HashMap<String, usize>, script: &HashMap<String, usize>) -> Option<String> {
+fn format_namespace_section(
+    ufs: &HashMap<String, usize>,
+    script: &HashMap<String, usize>,
+) -> Option<String> {
     let mut merged: HashMap<String, usize> = HashMap::new();
     for (ns, count) in ufs.iter().chain(script.iter()) {
         *merged.entry(ns.clone()).or_insert(0) += count;
@@ -181,9 +225,17 @@ fn format_namespace_section(ufs: &HashMap<String, usize>, script: &HashMap<Strin
     use std::fmt::Write as FmtWrite;
     let _ = writeln!(&mut out, "[ 4 ] ROZKŁAD PRZESTRZENI NAZW XATTR:");
     for (ns, count) in &sorted {
-        let _ = writeln!(&mut out, "   -> {:<11} {} kluczy", format!("{}:", ns), count);
+        let _ = writeln!(
+            &mut out,
+            "   -> {:<11} {} kluczy",
+            format!("{}:", ns),
+            count
+        );
     }
-    let _ = writeln!(&mut out, "      [ ZNACZENIE ]: Przestrzenie 'trusted'/'system' zwykle wymagają podwyższonych uprawnień do odczytu/zapisu - ich obecność jest sama w sobie sygnałem wartym odnotowania.\n");
+    let _ = writeln!(
+        &mut out,
+        "      [ ZNACZENIE ]: Przestrzenie 'trusted'/'system' zwykle wymagają podwyższonych uprawnień do odczytu/zapisu - ich obecność jest sama w sobie sygnałem wartym odnotowania.\n"
+    );
     Some(out)
 }
 
@@ -249,21 +301,28 @@ pub(crate) enum ScanMsg {
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
-    found_attrs_common: AtomicUsize, found_attrs_unique: AtomicUsize,
-    found_urls_common: AtomicUsize, found_urls_unique: AtomicUsize,
+    found_attrs_common: AtomicUsize,
+    found_attrs_unique: AtomicUsize,
+    found_urls_common: AtomicUsize,
+    found_urls_unique: AtomicUsize,
     xattr_total_bytes: AtomicU64,
     errors: AtomicUsize,
     extensions: Mutex<HashMap<String, usize>>,
     top_owners: Mutex<HashMap<String, usize>>,
 
-    zone_identifier_common: AtomicUsize, zone_identifier_unique: AtomicUsize,
-    quarantine_common: AtomicUsize, quarantine_unique: AtomicUsize,
-    wherefroms_common: AtomicUsize, wherefroms_unique: AtomicUsize,
-    large_xattr_common: AtomicUsize, large_xattr_unique: AtomicUsize,
+    zone_identifier_common: AtomicUsize,
+    zone_identifier_unique: AtomicUsize,
+    quarantine_common: AtomicUsize,
+    quarantine_unique: AtomicUsize,
+    wherefroms_common: AtomicUsize,
+    wherefroms_unique: AtomicUsize,
+    large_xattr_common: AtomicUsize,
+    large_xattr_unique: AtomicUsize,
     namespace_counts: Mutex<HashMap<String, usize>>,
 
     /// Pliki z kluczem `security.capability` obecnym, wspólne/unikalne.
-    capability_common: AtomicUsize, capability_unique: AtomicUsize,
+    capability_common: AtomicUsize,
+    capability_unique: AtomicUsize,
     /// Zliczenia WYSTĄPIEŃ każdej nazwy uprawnienia ([`parse_capability_names`])
     /// w całej puli tej strony — zbiorcze (jak `namespace_counts`), bo to
     /// rozkład opisowy, nie licznik anomalii per-plik.
@@ -280,18 +339,25 @@ impl LiveStats {
         Self {
             processed_files: AtomicUsize::new(0),
             processed_bytes: AtomicU64::new(0),
-            found_attrs_common: AtomicUsize::new(0), found_attrs_unique: AtomicUsize::new(0),
-            found_urls_common: AtomicUsize::new(0), found_urls_unique: AtomicUsize::new(0),
+            found_attrs_common: AtomicUsize::new(0),
+            found_attrs_unique: AtomicUsize::new(0),
+            found_urls_common: AtomicUsize::new(0),
+            found_urls_unique: AtomicUsize::new(0),
             xattr_total_bytes: AtomicU64::new(0),
             errors: AtomicUsize::new(0),
             extensions: Mutex::new(HashMap::new()),
             top_owners: Mutex::new(HashMap::new()),
-            zone_identifier_common: AtomicUsize::new(0), zone_identifier_unique: AtomicUsize::new(0),
-            quarantine_common: AtomicUsize::new(0), quarantine_unique: AtomicUsize::new(0),
-            wherefroms_common: AtomicUsize::new(0), wherefroms_unique: AtomicUsize::new(0),
-            large_xattr_common: AtomicUsize::new(0), large_xattr_unique: AtomicUsize::new(0),
+            zone_identifier_common: AtomicUsize::new(0),
+            zone_identifier_unique: AtomicUsize::new(0),
+            quarantine_common: AtomicUsize::new(0),
+            quarantine_unique: AtomicUsize::new(0),
+            wherefroms_common: AtomicUsize::new(0),
+            wherefroms_unique: AtomicUsize::new(0),
+            large_xattr_common: AtomicUsize::new(0),
+            large_xattr_unique: AtomicUsize::new(0),
             namespace_counts: Mutex::new(HashMap::new()),
-            capability_common: AtomicUsize::new(0), capability_unique: AtomicUsize::new(0),
+            capability_common: AtomicUsize::new(0),
+            capability_unique: AtomicUsize::new(0),
             capability_names_counts: Mutex::new(HashMap::new()),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
@@ -301,7 +367,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA — prędkość w
@@ -315,58 +385,110 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_files = current as f64 / elapsed;
 
     let ext_str = {
-        let map = stats.extensions.lock().unwrap();
+        let map = stats.extensions.lock().unwrap_or_else(|e| e.into_inner());
         let mut s: Vec<_> = map.iter().collect();
         s.sort_by(|a, b| b.1.cmp(a.1));
-        s.into_iter().take(3).map(|(k, v)| format!(".{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+        s.into_iter()
+            .take(3)
+            .map(|(k, v)| format!(".{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if ext_str.is_empty() { "-".to_string() } else { ext_str };
+    let display_ext = if ext_str.is_empty() {
+        "-".to_string()
+    } else {
+        ext_str
+    };
 
     let own_str = {
-        let map = stats.top_owners.lock().unwrap();
+        let map = stats.top_owners.lock().unwrap_or_else(|e| e.into_inner());
         let mut s: Vec<_> = map.iter().collect();
         s.sort_by(|a, b| b.1.cmp(a.1));
-        s.into_iter().take(2).map(|(k, v)| format!("{} ({})", k, v)).collect::<Vec<_>>().join(", ")
+        s.into_iter()
+            .take(2)
+            .map(|(k, v)| format!("{} ({})", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_own = if own_str.is_empty() { "-".to_string() } else { own_str };
+    let display_own = if own_str.is_empty() {
+        "-".to_string()
+    } else {
+        own_str
+    };
 
     let ns_str = {
-        let map = stats.namespace_counts.lock().unwrap();
+        let map = stats
+            .namespace_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s: Vec<_> = map.iter().collect();
         s.sort_by(|a, b| b.1.cmp(a.1));
-        s.into_iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+        s.into_iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ns = if ns_str.is_empty() { "-".to_string() } else { ns_str };
+    let display_ns = if ns_str.is_empty() {
+        "-".to_string()
+    } else {
+        ns_str
+    };
 
     let cap_str = {
-        let map = stats.capability_names_counts.lock().unwrap();
+        let map = stats
+            .capability_names_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s: Vec<_> = map.iter().collect();
         s.sort_by(|a, b| b.1.cmp(a.1));
-        s.into_iter().take(5).map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+        s.into_iter()
+            .take(5)
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_cap = if cap_str.is_empty() { "-".to_string() } else { cap_str };
+    let display_cap = if cap_str.is_empty() {
+        "-".to_string()
+    } else {
+        cap_str
+    };
 
     let found_attrs_common = stats.found_attrs_common.load(Ordering::Relaxed);
     let found_attrs_unique = stats.found_attrs_unique.load(Ordering::Relaxed);
     let found_attrs_total = found_attrs_common + found_attrs_unique;
     let avg_xattr_bytes = if found_attrs_total > 0 {
         stats.xattr_total_bytes.load(Ordering::Relaxed) / found_attrs_total as u64
-    } else { 0 };
+    } else {
+        0
+    };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\nPrędkość: {:.0} plików/s\nXATTR znalezione: {} wspólne / {} unikalne ({})\nŚr. rozmiar xattr (pliki z atrybutami): {}\nTop rozszerzenia (xattr): {}\nTop właściciele (UID:GID): {}\nPrzestrzenie nazw xattr: {}\nZone.Identifier (Windows): {} wspólne / {} unikalne\nQuarantine (macOS): {} wspólne / {} unikalne\nWhereFroms (macOS): {} wspólne / {} unikalne\nURL ogólne: {} wspólne / {} unikalne\nAnomalia rozmiaru (>64KB): {} wspólne / {} unikalne\nLinux Capabilities (security.capability): {} wspólne / {} unikalne ({})\nWątki odczytu xattr (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_files,
-        found_attrs_common, found_attrs_unique, format_bytes(stats.xattr_total_bytes.load(Ordering::Relaxed)),
+        label,
+        speed_files,
+        found_attrs_common,
+        found_attrs_unique,
+        format_bytes(stats.xattr_total_bytes.load(Ordering::Relaxed)),
         format_bytes(avg_xattr_bytes),
-        display_ext, display_own, display_ns,
-        stats.zone_identifier_common.load(Ordering::Relaxed), stats.zone_identifier_unique.load(Ordering::Relaxed),
-        stats.quarantine_common.load(Ordering::Relaxed), stats.quarantine_unique.load(Ordering::Relaxed),
-        stats.wherefroms_common.load(Ordering::Relaxed), stats.wherefroms_unique.load(Ordering::Relaxed),
-        stats.found_urls_common.load(Ordering::Relaxed), stats.found_urls_unique.load(Ordering::Relaxed),
-        stats.large_xattr_common.load(Ordering::Relaxed), stats.large_xattr_unique.load(Ordering::Relaxed),
-        stats.capability_common.load(Ordering::Relaxed), stats.capability_unique.load(Ordering::Relaxed), display_cap,
+        display_ext,
+        display_own,
+        display_ns,
+        stats.zone_identifier_common.load(Ordering::Relaxed),
+        stats.zone_identifier_unique.load(Ordering::Relaxed),
+        stats.quarantine_common.load(Ordering::Relaxed),
+        stats.quarantine_unique.load(Ordering::Relaxed),
+        stats.wherefroms_common.load(Ordering::Relaxed),
+        stats.wherefroms_unique.load(Ordering::Relaxed),
+        stats.found_urls_common.load(Ordering::Relaxed),
+        stats.found_urls_unique.load(Ordering::Relaxed),
+        stats.large_xattr_common.load(Ordering::Relaxed),
+        stats.large_xattr_unique.load(Ordering::Relaxed),
+        stats.capability_common.load(Ordering::Relaxed),
+        stats.capability_unique.load(Ordering::Relaxed),
+        display_cap,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -388,13 +510,35 @@ struct CategoryStats {
     extensions: ExtMap,
 }
 impl CategoryStats {
-    fn new() -> Self { Self { count: 0, url_count: 0, total_xattr_bytes: 0, extensions: HashMap::new() } }
+    fn new() -> Self {
+        Self {
+            count: 0,
+            url_count: 0,
+            total_xattr_bytes: 0,
+            extensions: HashMap::new(),
+        }
+    }
     #[allow(clippy::too_many_arguments)]
-    fn add(&mut self, ext: &str, path: String, uid: u32, gid: u32, keys: String, bytes: u64, has_url: bool, side: String) {
+    fn add(
+        &mut self,
+        ext: &str,
+        path: String,
+        uid: u32,
+        gid: u32,
+        keys: String,
+        bytes: u64,
+        has_url: bool,
+        side: String,
+    ) {
         self.count += 1;
         self.total_xattr_bytes += bytes;
-        if has_url { self.url_count += 1; }
-        self.extensions.entry(ext.to_string()).or_default().push((path, uid, gid, keys, side));
+        if has_url {
+            self.url_count += 1;
+        }
+        self.extensions
+            .entry(ext.to_string())
+            .or_default()
+            .push((path, uid, gid, keys, side));
     }
 }
 
@@ -404,8 +548,12 @@ impl CategoryStats {
 
 #[cfg(not(unix))]
 trait DummyUnixMeta {
-    fn uid(&self) -> u32 { 0 }
-    fn gid(&self) -> u32 { 0 }
+    fn uid(&self) -> u32 {
+        0
+    }
+    fn gid(&self) -> u32 {
+        0
+    }
 }
 #[cfg(not(unix))]
 impl DummyUnixMeta for std::fs::Metadata {}
@@ -423,7 +571,7 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
     let metadata = std::fs::metadata(path)?;
     let uid = metadata.uid();
     let gid = metadata.gid();
-    
+
     let mut xattr_count = 0;
     let mut xattr_size_bytes = 0;
     let mut keys_vec = Vec::new();
@@ -441,13 +589,26 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
             let key_str = key.to_string_lossy().to_string();
             let k_lower = key_str.to_lowercase();
 
-            *namespace_counts.entry(xattr_namespace(&key_str)).or_insert(0) += 1;
+            *namespace_counts
+                .entry(xattr_namespace(&key_str))
+                .or_insert(0) += 1;
 
             match classify_url_marker(&k_lower) {
-                Some("zone_identifier") => { has_zone_identifier = true; has_url = true; }
-                Some("quarantine") => { has_quarantine = true; has_url = true; }
-                Some("wherefroms") => { has_wherefroms = true; has_url = true; }
-                Some(_) => { has_url = true; }
+                Some("zone_identifier") => {
+                    has_zone_identifier = true;
+                    has_url = true;
+                }
+                Some("quarantine") => {
+                    has_quarantine = true;
+                    has_url = true;
+                }
+                Some("wherefroms") => {
+                    has_wherefroms = true;
+                    has_url = true;
+                }
+                Some(_) => {
+                    has_url = true;
+                }
                 None => {}
             }
 
@@ -467,10 +628,19 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
     let has_large_xattr = is_large_xattr(xattr_size_bytes);
 
     Ok(MetadataAnalysis {
-        uid, gid, xattr_count, xattr_size_bytes,
+        uid,
+        gid,
+        xattr_count,
+        xattr_size_bytes,
         xattr_keys: keys_vec.join(", "),
-        has_url, has_zone_identifier, has_quarantine, has_wherefroms, has_large_xattr,
-        namespace_counts, has_capability, capability_names,
+        has_url,
+        has_zone_identifier,
+        has_quarantine,
+        has_wherefroms,
+        has_large_xattr,
+        namespace_counts,
+        has_capability,
+        capability_names,
     })
 }
 
@@ -479,24 +649,38 @@ fn extract_metadata(path: &Path) -> std::result::Result<MetadataAnalysis, std::i
 fn write_category_block(out: &mut String, stats: &CategoryStats) {
     use std::fmt::Write as FmtWrite;
     let mut sorted: Vec<_> = stats.extensions.iter().collect();
-    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len())); 
-    
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
+
     for (ext, paths) in sorted.into_iter().take(5) {
         let cat = get_file_category(ext);
         // REGRESJA (todo.faza15.md, Znalezisko 1): plik WSPÓLNY z xattr po
         // OBU stronach daje teraz DWA wpisy (po naprawie wyścigu zapisu -
         // każda fizyczna kopia ma swój własny wiersz) - stąd "wpisów", nie
         // "plików": liczba odzwierciedla POMIARY, nie unikalne ścieżki.
-        let _ = writeln!(out, "     - Typ Pliku: {:<12} [ {:<4} ]: {} wpisów", cat, ext, paths.len());
+        let _ = writeln!(
+            out,
+            "     - Typ Pliku: {:<12} [ {:<4} ]: {} wpisów",
+            cat,
+            ext,
+            paths.len()
+        );
 
         let (sample_path, s_uid, s_gid, s_keys, s_side) = &paths[0];
 
-        let _ = writeln!(out, "       [ 🔍 ] Przykładowy dowód z tej grupy ({}):", s_side);
+        let _ = writeln!(
+            out,
+            "       [ 🔍 ] Przykładowy dowód z tej grupy ({}):",
+            s_side
+        );
         let _ = writeln!(out, "         - Ścieżka:       \"{}\"", sample_path);
-        let _ = writeln!(out, "         - Właściciel:    UID: {}, GID: {}", s_uid, s_gid);
+        let _ = writeln!(
+            out,
+            "         - Właściciel:    UID: {}, GID: {}",
+            s_uid, s_gid
+        );
         let _ = writeln!(out, "         - Ukryte klucze: {}", s_keys);
     }
-    let _ = writeln!(out); 
+    let _ = writeln!(out);
 }
 
 // ============================================================================
@@ -522,12 +706,26 @@ pub struct StreamCtx<'a> {
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, start_time, tx_ui, bar_idx, opr_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        start_time,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        debug_log,
+    } = ctx;
+    let metoda = "extract_metadata (xattr)";
 
     let last_ui_update = Arc::new(AtomicU64::new(0));
 
@@ -547,6 +745,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
             let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
 
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (meta_opt, io_err) = match stats.thread_activity.track_current(|| extract_metadata(&full_path)) {
                 Ok(meta) => {
                     let kategoria = if is_ufs { "UFS" } else { "Skrypt" };
@@ -591,10 +798,21 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     (None, Some(true))
                 }
             };
+            let wynik = if io_err == Some(true) { "BŁĄD I/O" } else { "OK" };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
 
             stats.processed_files.fetch_add(1, Ordering::Relaxed);
             stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
-            
+
             let current = stats.processed_files.load(Ordering::Relaxed);
             let now_ms = start_time.elapsed().as_millis() as u64;
             let last_ms = last_ui_update.load(Ordering::Relaxed);
@@ -603,19 +821,19 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                     
                     if !local_exts.is_empty() {
-                        let mut g_ext = stats.extensions.lock().unwrap();
+                        let mut g_ext = stats.extensions.lock().unwrap_or_else(|e| e.into_inner());
                         for (k, v) in local_exts.drain() { *g_ext.entry(k).or_insert(0) += v; }
                     }
                     if !local_owners.is_empty() {
-                        let mut g_own = stats.top_owners.lock().unwrap();
+                        let mut g_own = stats.top_owners.lock().unwrap_or_else(|e| e.into_inner());
                         for (k, v) in local_owners.drain() { *g_own.entry(k).or_insert(0) += v; }
                     }
                     if !local_namespaces.is_empty() {
-                        let mut g_ns = stats.namespace_counts.lock().unwrap();
+                        let mut g_ns = stats.namespace_counts.lock().unwrap_or_else(|e| e.into_inner());
                         for (k, v) in local_namespaces.drain() { *g_ns.entry(k).or_insert(0) += v; }
                     }
                     if !local_capabilities.is_empty() {
-                        let mut g_cap = stats.capability_names_counts.lock().unwrap();
+                        let mut g_cap = stats.capability_names_counts.lock().unwrap_or_else(|e| e.into_inner());
                         for (k, v) in local_capabilities.drain() { *g_cap.entry(k).or_insert(0) += v; }
                     }
 
@@ -627,7 +845,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                     let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                         idx: bar_idx,
-                        path: full_path.to_string_lossy().to_string(),
+                        path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                     });
 
                     // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -641,19 +859,19 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_exts.is_empty() {
-            let mut g_ext = stats.extensions.lock().unwrap();
+            let mut g_ext = stats.extensions.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_exts.drain() { *g_ext.entry(k).or_insert(0) += v; }
         }
         if !local_owners.is_empty() {
-            let mut g_own = stats.top_owners.lock().unwrap();
+            let mut g_own = stats.top_owners.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_owners.drain() { *g_own.entry(k).or_insert(0) += v; }
         }
         if !local_namespaces.is_empty() {
-            let mut g_ns = stats.namespace_counts.lock().unwrap();
+            let mut g_ns = stats.namespace_counts.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_namespaces.drain() { *g_ns.entry(k).or_insert(0) += v; }
         }
         if !local_capabilities.is_empty() {
-            let mut g_cap = stats.capability_names_counts.lock().unwrap();
+            let mut g_cap = stats.capability_names_counts.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_capabilities.drain() { *g_cap.entry(k).or_insert(0) += v; }
         }
 
@@ -689,10 +907,16 @@ fn compute_half_threads(total_threads: usize) -> usize {
 /// (3) koreluje wyniki w SQLite; (4) buduje Dziennik Końcowy z podziałem
 /// wspólne/tylko-UFS/tylko-Skrypt (liczonym tu, z zapytania SQL — [`Task`]
 /// nie niesie tej informacji podczas samego skanowania).
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
-    let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 15: Rozszerzone Atrybuty (XATTR)".to_string()));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Uruchomiono Fazę 15: Rozszerzone Atrybuty (XATTR)".to_string(),
+    ));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -732,7 +956,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             has_large_xattr BOOLEAN,
             PRIMARY KEY(file_id, side),
             FOREIGN KEY(file_id) REFERENCES files(id)
-        )", []
+        )",
+        [],
     )?;
 
     // Migracja jednorazowa ze STAREGO kształtu tabeli (sprzed tej naprawy,
@@ -749,12 +974,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // re-hashowanie zawartości — koszt niewielki wobec poprawności dowodu).
     let ma_kolumne_side: bool = {
         let mut stmt = conn.prepare("PRAGMA table_info(phase15_analysis)")?;
-        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
         cols.iter().any(|c| c == "side")
     };
 
     if !ma_kolumne_side {
-        conn.execute("ALTER TABLE phase15_analysis RENAME TO phase15_analysis_legacy_wyscig_zapisu", [])?;
+        conn.execute(
+            "ALTER TABLE phase15_analysis RENAME TO phase15_analysis_legacy_wyscig_zapisu",
+            [],
+        )?;
         conn.execute(
             "CREATE TABLE phase15_analysis (
                 file_id INTEGER NOT NULL,
@@ -772,11 +1003,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 has_large_xattr BOOLEAN,
                 PRIMARY KEY(file_id, side),
                 FOREIGN KEY(file_id) REFERENCES files(id)
-            )", []
+            )",
+            [],
         )?;
         conn.execute(
             "UPDATE files SET has_xattr_ufs = NULL, has_xattr_script = NULL, phase15_done = 0
-             WHERE has_xattr_ufs IS NOT NULL OR has_xattr_script IS NOT NULL OR phase15_done = 1", []
+             WHERE has_xattr_ufs IS NOT NULL OR has_xattr_script IS NOT NULL OR phase15_done = 1",
+            [],
         )?;
         let _ = tx_ui.send(PhaseEvent::Log(
             "⚠️ Wykryto starszy schemat bazy Fazy 15 (znany wyścig zapisu UFS/Skrypt) - migruję do bezkolizyjnego schematu. \
@@ -785,15 +1018,30 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
 
     // INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 15").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza15.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza15.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 15")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza15.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza15.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza15.txt", &stamp),
+        &config.log_level,
+    );
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -802,58 +1050,111 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f_info = opr_log.lock().unwrap();
-        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 15: ROZSZERZONE ATRYBUTY XATTR ===");
-        let _ = writeln!(f_info, "Ewidencja ukrytych strumieni systemowych, właścicieli i-node (UID/GID) oraz śladów URL.\n");
+        let mut f_info = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_info,
+            "=== RAPORT OPERACYJNY - FAZA 15: ROZSZERZONE ATRYBUTY XATTR ==="
+        );
+        let _ = writeln!(
+            f_info,
+            "Ewidencja ukrytych strumieni systemowych, właścicieli i-node (UID/GID) oraz śladów URL.\n"
+        );
     }
 
     // --- ETAP 1A: POBIERANIE ZADAŃ DO SKANOWANIA ---
     let mut stmt = conn.prepare(
         "SELECT id, relative_path, found_in_ufs, found_in_script, has_xattr_ufs, has_xattr_script 
          FROM files 
-         WHERE phase15_done = 0 OR phase15_done IS NULL"
+         WHERE phase15_done = 0 OR phase15_done IS NULL",
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped = 0;
 
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?))
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+        ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_scr, x_ufs, x_scr) = r;
         let is_common = in_ufs && in_scr;
-        if in_ufs && x_ufs.is_none() { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); }
-        if in_scr && x_scr.is_none() { script_tasks.push(Task { id, rel_path: rel.clone(), is_common }); }
-        if (in_ufs && x_ufs.is_some()) || (in_scr && x_scr.is_some()) { skipped += 1; }
+        if in_ufs && x_ufs.is_none() {
+            ufs_tasks.push(Task {
+                id,
+                rel_path: rel.clone(),
+                is_common,
+            });
+        }
+        if in_scr && x_scr.is_none() {
+            script_tasks.push(Task {
+                id,
+                rel_path: rel.clone(),
+                is_common,
+            });
+        }
+        if (in_ufs && x_ufs.is_some()) || (in_scr && x_scr.is_some()) {
+            skipped += 1;
+        }
     }
     drop(stmt);
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
-    
+
     if skipped > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Wznowienie sesji: Pominięto {} plików z wyliczonymi już atrybutami xattr.", skipped)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Wznowienie sesji: Pominięto {} plików z wyliczonymi już atrybutami xattr.",
+            skipped
+        )));
     }
 
     if total_db_rows == 0 && skipped == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających inspekcji xattr. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Inspekcja atrybutów xattr jest kompletna. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Kod przechodzi do Etapu 4,
+        // aby uleczyć bazę i domknąć osierocone pliki z radaru!
     } else if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Wszystkie pliki zostały już zeskanowane. Przechodzę prosto do raportowania...".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Wszystkie pliki zostały już zeskanowane. Przechodzę prosto do raportowania..."
+                .to_string(),
+        ));
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE" } else { "SEKWENCYJNIE" };
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Metodyka pracy szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE"
+    } else {
+        "SEKWENCYJNIE"
+    };
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Metodyka pracy szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let half_threads = compute_half_threads(actual_threads);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -863,9 +1164,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 2 & 3: UI ORAZ PRZETWARZANIE STRUMIENIOWE (MPSC) ---
     if total_db_rows > 0 {
-        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (xattr)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (xattr)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-        let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+        let _ = tx_ui.send(PhaseEvent::SetBar {
+            idx: 0,
+            label: "UFS Explorer (xattr)".to_string(),
+            total: ufs_tasks.len() as u64,
+            color: Color::Cyan,
+        });
+        let _ = tx_ui.send(PhaseEvent::SetBar {
+            idx: 1,
+            label: "Skrypt Autorski (xattr)".to_string(),
+            total: script_tasks.len() as u64,
+            color: Color::Magenta,
+        });
+        let _ = tx_ui.send(PhaseEvent::SetBar {
+            idx: 2,
+            label: "Zapis SQLite".to_string(),
+            total: total_db_rows as u64,
+            color: Color::Green,
+        });
 
         let ufs_base = PathBuf::from(&config.ufs_path);
         let script_base = PathBuf::from(&config.script_path);
@@ -877,13 +1193,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         // zwraca `Result<()>`, panika jest przechwytywana przez `.join()` i
         // zamieniana na błąd domenowy.
         let wynik_zapisu: Result<()> = std::thread::scope(|s| {
-        let (tx_db, rx_db) = mpsc::sync_channel(200);
-        let conn_ref = &mut *conn;
+            let (tx_db, rx_db) = mpsc::sync_channel(200);
+            let conn_ref = &mut *conn;
 
-        // KLONUJEMY NADAJNIK UI DLA WĄTKU BAZY DANYCH
-        let tx_ui_db = tx_ui.clone();
+            // KLONUJEMY NADAJNIK UI DLA WĄTKU BAZY DANYCH
+            let tx_ui_db = tx_ui.clone();
 
-        let db_thread = s.spawn(move || -> Result<()> {
+            let db_thread = s.spawn(move || -> Result<()> {
             let mut db_inserted = 0;
             let mut last_db_update = Instant::now();
 
@@ -952,89 +1268,186 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             Ok(())
         });
 
-        if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let info_u = opr_log.clone(); let info_s = opr_log.clone();
-            
-            let stat_u = &ufs_stats;
-            let stat_s = &script_stats;
-            
-            // KLONUJEMY NADAJNIKI UI DLA WĄTKÓW I/O
-            let tx_ui_1 = tx_ui.clone();
-            let tx_ui_2 = tx_ui.clone();
+            if config.io_mode == "CONCURRENT" {
+                let tx1 = tx_db.clone();
+                let tx2 = tx_db.clone();
+                let info_u = opr_log.clone();
+                let info_s = opr_log.clone();
+                let dbg_u = debug_log.clone();
+                let dbg_s = debug_log.clone();
 
-            // NAPRAWA (ten sam bug jak w Fazie 5/6/7/10-14): dedykowana pula
-            // per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
+                let stat_u = &ufs_stats;
+                let stat_s = &script_stats;
 
-            s.spawn(move || { 
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
-                        pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, opr_log: info_u, });
-                        });
-                    } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, opr_log: info_u, });
+                // KLONUJEMY NADAJNIKI UI DLA WĄTKÓW I/O
+                let tx_ui_1 = tx_ui.clone();
+                let tx_ui_2 = tx_ui.clone();
+
+                // NAPRAWA (ten sam bug jak w Fazie 5/6/7/10-14): dedykowana pula
+                // per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
+
+                s.spawn(move || {
+                    if !ufs_tasks.is_empty() {
+                        if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                            .num_threads(half_threads)
+                            .build()
+                        {
+                            pool.install(|| {
+                                process_side_stream(StreamCtx {
+                                    base_path: &ufs_base,
+                                    tasks: &ufs_tasks,
+                                    side_label: "UFS Explorer",
+                                    stats: stat_u,
+                                    tx_db: tx1,
+                                    is_ufs: true,
+                                    start_time,
+                                    tx_ui: &tx_ui_1,
+                                    bar_idx: 0,
+                                    opr_log: info_u,
+                                    debug_log: dbg_u.clone(),
+                                });
+                            });
+                        } else {
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                start_time,
+                                tx_ui: &tx_ui_1,
+                                bar_idx: 0,
+                                opr_log: info_u,
+                                debug_log: dbg_u.clone(),
+                            });
+                        }
+                        let _ = tx_ui_1.send(PhaseEvent::Log(
+                            "✔ Skanowanie węzłów UFS zakończone.".to_string(),
+                        ));
                     }
-                    let _ = tx_ui_1.send(PhaseEvent::Log("✔ Skanowanie węzłów UFS zakończone.".to_string())); 
-                } 
-            });
-            s.spawn(move || { 
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
-                        pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, opr_log: info_s, });
-                        });
-                    } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, opr_log: info_s, });
+                });
+                s.spawn(move || {
+                    if !script_tasks.is_empty() {
+                        if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                            .num_threads(half_threads)
+                            .build()
+                        {
+                            pool.install(|| {
+                                process_side_stream(StreamCtx {
+                                    base_path: &script_base,
+                                    tasks: &script_tasks,
+                                    side_label: "Skrypt Autorski",
+                                    stats: stat_s,
+                                    tx_db: tx2,
+                                    is_ufs: false,
+                                    start_time,
+                                    tx_ui: &tx_ui_2,
+                                    bar_idx: 1,
+                                    opr_log: info_s,
+                                    debug_log: dbg_s.clone(),
+                                });
+                            });
+                        } else {
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                start_time,
+                                tx_ui: &tx_ui_2,
+                                bar_idx: 1,
+                                opr_log: info_s,
+                                debug_log: dbg_s.clone(),
+                            });
+                        }
+                        let _ = tx_ui_2.send(PhaseEvent::Log(
+                            "✔ Skanowanie węzłów Skrypt zakończone.".to_string(),
+                        ));
                     }
-                    let _ = tx_ui_2.send(PhaseEvent::Log("✔ Skanowanie węzłów Skrypt zakończone.".to_string())); 
-                } 
-            });
-            drop(tx_db); 
-        } else {
-            let info_u = opr_log.clone(); let info_s = opr_log.clone();
-            if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: &tx_ui, bar_idx: 0, opr_log: info_u, });
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów UFS zakończone.".to_string()));
+                });
+                drop(tx_db);
+            } else {
+                let info_u = opr_log.clone();
+                let info_s = opr_log.clone();
+                let dbg_u = debug_log.clone();
+                let dbg_s = debug_log.clone();
+                if !ufs_tasks.is_empty() {
+                    process_side_stream(StreamCtx {
+                        base_path: &ufs_base,
+                        tasks: &ufs_tasks,
+                        side_label: "UFS Explorer",
+                        stats: &ufs_stats,
+                        tx_db: tx_db.clone(),
+                        is_ufs: true,
+                        start_time,
+                        tx_ui: &tx_ui,
+                        bar_idx: 0,
+                        opr_log: info_u,
+                        debug_log: dbg_u,
+                    });
+                    let _ = tx_ui.send(PhaseEvent::Log(
+                        "✔ Skanowanie węzłów UFS zakończone.".to_string(),
+                    ));
+                }
+                if !script_tasks.is_empty() {
+                    process_side_stream(StreamCtx {
+                        base_path: &script_base,
+                        tasks: &script_tasks,
+                        side_label: "Skrypt Autorski",
+                        stats: &script_stats,
+                        tx_db: tx_db.clone(),
+                        is_ufs: false,
+                        start_time,
+                        tx_ui: &tx_ui,
+                        bar_idx: 1,
+                        opr_log: info_s,
+                        debug_log: dbg_s,
+                    });
+                    let _ = tx_ui.send(PhaseEvent::Log(
+                        "✔ Skanowanie węzłów Skrypt zakończone.".to_string(),
+                    ));
+                }
+                // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
+                // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
+                // przenoszony - kanał nie zamykał się, dopóki ta zmienna nie
+                // wyszła z zasięgu na końcu CAŁEGO domknięcia `thread::scope`,
+                // czyli PO `db_thread.join()` niżej - klasyczny deadlock (wątek
+                // czeka na zamknięcie kanału, który sam trzyma otwarty). Jawny
+                // `drop` zamyka kanał deterministycznie, zanim `.join()` zacznie
+                // czekać.
+                drop(tx_db);
             }
-            if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, opr_log: info_s, });
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie węzłów Skrypt zakończone.".to_string()));
-            }
-            // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
-            // `script_tasks` jest puste, oryginalny `tx_db` nigdy nie był
-            // przenoszony - kanał nie zamykał się, dopóki ta zmienna nie
-            // wyszła z zasięgu na końcu CAŁEGO domknięcia `thread::scope`,
-            // czyli PO `db_thread.join()` niżej - klasyczny deadlock (wątek
-            // czeka na zamknięcie kanału, który sam trzyma otwarty). Jawny
-            // `drop` zamyka kanał deterministycznie, zanim `.join()` zacznie
-            // czekać.
-            drop(tx_db);
-        }
 
-        match db_thread.join() {
-            Ok(wynik) => wynik,
-            // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
-            // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
-            // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
-            // dalej i żeby wywołujący nie uznał przebiegu za udany.
-            Err(_) => {
-                let _ = tx_ui.send(PhaseEvent::Log(
+            match db_thread.join() {
+                Ok(wynik) => wynik,
+                // `join` zwraca `Err` WYŁĄCZNIE gdy wątek spanikował. Sama panika
+                // jest już odnotowana przez globalny hook w `logging.rs`, więc tu
+                // zamieniamy ją na błąd domenowy, żeby nie rozprzestrzeniała się
+                // dalej i żeby wywołujący nie uznał przebiegu za udany.
+                Err(_) => {
+                    let _ = tx_ui.send(PhaseEvent::Log(
                     "✖ BŁĄD: wątek zapisu do bazy zakończył się paniką. Postęp Fazy 15 mógł nie zostać w pełni zapisany.".to_string()
                 ));
-                Err(rusqlite::Error::UnwindingPanic)
+                    Err(rusqlite::Error::UnwindingPanic)
+                }
             }
-        }
-    });
-    wynik_zapisu?;
-}
+        });
+        wynik_zapisu?;
+    }
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("🔄 Trwa wiązanie dowodów xattr w bazie danych...".to_string()));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "🔄 Trwa wiązanie dowodów xattr w bazie danych...".to_string(),
+    ));
     conn.execute(
         "UPDATE files SET phase15_done = CASE 
             WHEN (found_in_ufs = 0 OR has_xattr_ufs IS NOT NULL OR io_error_ufs = 1) 
@@ -1059,7 +1472,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 a.has_xattr, a.xattr_size, a.uid, a.gid, a.xattr_keys, a.has_url, a.side
          FROM files f
          JOIN phase15_analysis a ON f.id = a.file_id
-         WHERE f.phase15_done = 1 AND a.has_xattr = 1"
+         WHERE f.phase15_done = 1 AND a.has_xattr = 1",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -1079,61 +1492,167 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     for r in rows.filter_map(|r| r.ok()) {
         let (path, in_ufs, in_scr, _, size, uid, gid, keys, has_url, side) = r;
-        let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
         let is_common = in_ufs && in_scr;
-        let side_label = if side == "ufs" { "UFS Explorer".to_string() } else { "Skrypt Autorski".to_string() };
+        let side_label = if side == "ufs" {
+            "UFS Explorer".to_string()
+        } else {
+            "Skrypt Autorski".to_string()
+        };
 
-        if is_common { stats_common.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
-        else if in_ufs { stats_unique_ufs.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
-        else { stats_unique_scr.add(&ext, path, uid, gid, keys, size, has_url, side_label); }
+        if is_common {
+            stats_common.add(&ext, path, uid, gid, keys, size, has_url, side_label);
+        } else if in_ufs {
+            stats_unique_ufs.add(&ext, path, uid, gid, keys, size, has_url, side_label);
+        } else {
+            stats_unique_scr.add(&ext, path, uid, gid, keys, size, has_url, side_label);
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 15 (ROZSZERZONE ATRYBUTY XATTR)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 15 (ROZSZERZONE ATRYBUTY XATTR)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
     let sum_attrs = stats_common.count + stats_unique_ufs.count + stats_unique_scr.count;
-    let sum_bytes = stats_common.total_xattr_bytes + stats_unique_ufs.total_xattr_bytes + stats_unique_scr.total_xattr_bytes;
+    let sum_bytes = stats_common.total_xattr_bytes
+        + stats_unique_ufs.total_xattr_bytes
+        + stats_unique_scr.total_xattr_bytes;
     let sum_urls = stats_common.url_count + stats_unique_ufs.url_count + stats_unique_scr.url_count;
 
-    let avg_xattr_bytes_sum = if sum_attrs > 0 { sum_bytes / sum_attrs as u64 } else { 0 };
+    let avg_xattr_bytes_sum = if sum_attrs > 0 {
+        sum_bytes / sum_attrs as u64
+    } else {
+        0
+    };
 
-    let _ = writeln!(&mut log_out, "[ 1 ] NISKOPOZIOMOWA INSPEKCJA METADANYCH (Extended Attributes):");
-    let _ = writeln!(&mut log_out, "   -> Ocalono atrybuty z {} plików (Całkowita waga xattr: {}, średnio {} / plik)", sum_attrs, format_bytes(sum_bytes), format_bytes(avg_xattr_bytes_sum));
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Algorytm odzyskał metadane systemowe (niewchodzące w skład rozmiaru pliku). Służą one często jako flagi kwarantanny lub systemowe informacje użytkownika.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] NISKOPOZIOMOWA INSPEKCJA METADANYCH (Extended Attributes):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Ocalono atrybuty z {} plików (Całkowita waga xattr: {}, średnio {} / plik)",
+        sum_attrs,
+        format_bytes(sum_bytes),
+        format_bytes(avg_xattr_bytes_sum)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Algorytm odzyskał metadane systemowe (niewchodzące w skład rozmiaru pliku). Służą one często jako flagi kwarantanny lub systemowe informacje użytkownika.\n"
+    );
 
     let _ = writeln!(&mut log_out, "[ 2 ] ŚLADY SIECIOWE (Web Forensics):");
-    let _ = writeln!(&mut log_out, "   -> Wykryto ślady pobrania w {} plikach", sum_urls);
-    let _ = writeln!(&mut log_out, "      -> Windows Zone.Identifier: {}", ufs_stats.zone_identifier_common.load(Ordering::SeqCst) + ufs_stats.zone_identifier_unique.load(Ordering::SeqCst) + script_stats.zone_identifier_common.load(Ordering::SeqCst) + script_stats.zone_identifier_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      -> macOS Quarantine:        {}", ufs_stats.quarantine_common.load(Ordering::SeqCst) + ufs_stats.quarantine_unique.load(Ordering::SeqCst) + script_stats.quarantine_common.load(Ordering::SeqCst) + script_stats.quarantine_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      -> macOS WhereFroms:        {}", ufs_stats.wherefroms_common.load(Ordering::SeqCst) + ufs_stats.wherefroms_unique.load(Ordering::SeqCst) + script_stats.wherefroms_common.load(Ordering::SeqCst) + script_stats.wherefroms_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki te posiadają specjalne tagi, które zawierają oryginalny adres URL przeglądarki lub datę pobrania. Ekstremalnie cenne znalezisko.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Wykryto ślady pobrania w {} plikach",
+        sum_urls
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      -> Windows Zone.Identifier: {}",
+        ufs_stats.zone_identifier_common.load(Ordering::SeqCst)
+            + ufs_stats.zone_identifier_unique.load(Ordering::SeqCst)
+            + script_stats.zone_identifier_common.load(Ordering::SeqCst)
+            + script_stats.zone_identifier_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      -> macOS Quarantine:        {}",
+        ufs_stats.quarantine_common.load(Ordering::SeqCst)
+            + ufs_stats.quarantine_unique.load(Ordering::SeqCst)
+            + script_stats.quarantine_common.load(Ordering::SeqCst)
+            + script_stats.quarantine_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      -> macOS WhereFroms:        {}",
+        ufs_stats.wherefroms_common.load(Ordering::SeqCst)
+            + ufs_stats.wherefroms_unique.load(Ordering::SeqCst)
+            + script_stats.wherefroms_common.load(Ordering::SeqCst)
+            + script_stats.wherefroms_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Pliki te posiadają specjalne tagi, które zawierają oryginalny adres URL przeglądarki lub datę pobrania. Ekstremalnie cenne znalezisko.\n"
+    );
 
-    let sum_large = ufs_stats.large_xattr_common.load(Ordering::SeqCst) + ufs_stats.large_xattr_unique.load(Ordering::SeqCst) + script_stats.large_xattr_common.load(Ordering::SeqCst) + script_stats.large_xattr_unique.load(Ordering::SeqCst);
+    let sum_large = ufs_stats.large_xattr_common.load(Ordering::SeqCst)
+        + ufs_stats.large_xattr_unique.load(Ordering::SeqCst)
+        + script_stats.large_xattr_common.load(Ordering::SeqCst)
+        + script_stats.large_xattr_unique.load(Ordering::SeqCst);
     if sum_large > 0 {
         let _ = writeln!(&mut log_out, "[ 3 ] ANOMALIA ROZMIARU XATTR (>64KB):");
-        let _ = writeln!(&mut log_out, "   -> Pliki z nietypowo dużym blobem xattr: {}", sum_large);
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Normalne metadane systemowe to zwykle pojedyncze bajty/kilobajty. Znacznie większy blob może wskazywać na przemycone dane w rozszerzonym atrybucie.\n");
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Pliki z nietypowo dużym blobem xattr: {}",
+            sum_large
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Normalne metadane systemowe to zwykle pojedyncze bajty/kilobajty. Znacznie większy blob może wskazywać na przemycone dane w rozszerzonym atrybucie.\n"
+        );
     }
 
-    let sum_capability = ufs_stats.capability_common.load(Ordering::SeqCst) + ufs_stats.capability_unique.load(Ordering::SeqCst) + script_stats.capability_common.load(Ordering::SeqCst) + script_stats.capability_unique.load(Ordering::SeqCst);
+    let sum_capability = ufs_stats.capability_common.load(Ordering::SeqCst)
+        + ufs_stats.capability_unique.load(Ordering::SeqCst)
+        + script_stats.capability_common.load(Ordering::SeqCst)
+        + script_stats.capability_unique.load(Ordering::SeqCst);
     if sum_capability > 0 {
-        let _ = writeln!(&mut log_out, "[ 3b ] UPRAWNIENIA LINUX (security.capability):");
-        let _ = writeln!(&mut log_out, "   -> Pliki z ustawionymi uprawnieniami: {}", sum_capability);
+        let _ = writeln!(
+            &mut log_out,
+            "[ 3b ] UPRAWNIENIA LINUX (security.capability):"
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Pliki z ustawionymi uprawnieniami: {}",
+            sum_capability
+        );
         let mut merged_caps: HashMap<String, usize> = HashMap::new();
-        for (k, v) in ufs_stats.capability_names_counts.lock().unwrap().iter().chain(script_stats.capability_names_counts.lock().unwrap().iter()) {
+        for (k, v) in ufs_stats
+            .capability_names_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .chain(
+                script_stats
+                    .capability_names_counts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter(),
+            )
+        {
             *merged_caps.entry(k.clone()).or_insert(0) += v;
         }
         let mut sorted_caps: Vec<_> = merged_caps.iter().collect();
@@ -1141,7 +1660,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         for (name, count) in sorted_caps.into_iter().take(10) {
             let _ = writeln!(&mut log_out, "      -> {:<22} {} wystąpień", name, count);
         }
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Plik wykonywalny z ustawionymi uprawnieniami (np. CAP_SYS_ADMIN/CAP_SETUID/CAP_NET_RAW) przetrwał odzysk z tym mechanizmem eskalacji uprawnień nienaruszonym - wart priorytetowej analizy bezpieczeństwa.\n");
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Plik wykonywalny z ustawionymi uprawnieniami (np. CAP_SYS_ADMIN/CAP_SETUID/CAP_NET_RAW) przetrwał odzysk z tym mechanizmem eskalacji uprawnień nienaruszonym - wart priorytetowej analizy bezpieczeństwa.\n"
+        );
     }
 
     // REGRESJA (todo.faza15.md, Znalezisko 2): rozkład przestrzeni nazw
@@ -1152,8 +1674,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // po zakończeniu skanu, mimo że dokumentacja modułu reklamuje go jako
     // jedną z headline'owych funkcji tej rewizji.
     if let Some(sekcja) = format_namespace_section(
-        &ufs_stats.namespace_counts.lock().unwrap(),
-        &script_stats.namespace_counts.lock().unwrap(),
+        &ufs_stats
+            .namespace_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        &script_stats
+            .namespace_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
     ) {
         log_out.push_str(&sekcja);
     }
@@ -1166,17 +1694,32 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     };
 
     write_section_txt(&mut log_out, "Część Wspólna (Oba źródła)", &stats_common);
-    write_section_txt(&mut log_out, "Osobne ścieżki (Tylko UFS Explorer)", &stats_unique_ufs);
-    write_section_txt(&mut log_out, "Osobne ścieżki (Tylko Skrypt Autorski)", &stats_unique_scr);
+    write_section_txt(
+        &mut log_out,
+        "Osobne ścieżki (Tylko UFS Explorer)",
+        &stats_unique_ufs,
+    );
+    write_section_txt(
+        &mut log_out,
+        "Osobne ścieżki (Tylko Skrypt Autorski)",
+        &stats_unique_scr,
+    );
 
     if total_io_errors > 0 {
         let _ = writeln!(&mut log_out, "\n[ BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Pliki widma / Brak obsługi przez OS docelowy: {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Pliki widma / Brak obsługi przez OS docelowy: {}",
+            total_io_errors
+        );
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
     }
 
     for line in log_out.lines() {
@@ -1235,22 +1778,34 @@ mod tests {
 
     #[test]
     fn test_classify_url_marker_zone_identifier() {
-        assert_eq!(classify_url_marker("user.zone.identifier"), Some("zone_identifier"));
+        assert_eq!(
+            classify_url_marker("user.zone.identifier"),
+            Some("zone_identifier")
+        );
     }
 
     #[test]
     fn test_classify_url_marker_quarantine() {
-        assert_eq!(classify_url_marker("com.apple.quarantine"), Some("quarantine"));
+        assert_eq!(
+            classify_url_marker("com.apple.quarantine"),
+            Some("quarantine")
+        );
     }
 
     #[test]
     fn test_classify_url_marker_wherefroms() {
-        assert_eq!(classify_url_marker("com.apple.metadata:kmditemwherefroms"), Some("wherefroms"));
+        assert_eq!(
+            classify_url_marker("com.apple.metadata:kmditemwherefroms"),
+            Some("wherefroms")
+        );
     }
 
     #[test]
     fn test_classify_url_marker_generic_url() {
-        assert_eq!(classify_url_marker("user.download.url"), Some("url_generic"));
+        assert_eq!(
+            classify_url_marker("user.download.url"),
+            Some("url_generic")
+        );
     }
 
     #[test]
@@ -1263,7 +1818,10 @@ mod tests {
     fn test_classify_url_marker_quarantine_wins_over_generic_when_both_could_match() {
         // Klucz zawiera i "quarantine" - musi trafić do konkretnej kategorii,
         // nie do ogólnego "url_generic" (kolejność sprawdzeń w funkcji)
-        assert_eq!(classify_url_marker("com.apple.quarantine"), Some("quarantine"));
+        assert_eq!(
+            classify_url_marker("com.apple.quarantine"),
+            Some("quarantine")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1350,8 +1908,8 @@ mod tests {
         let raw: [u8; 20] = [
             0x00, 0x00, 0x00, 0x02, // magic_etc: rewizja 2
             0x00, 0x00, 0x00, 0x00, // data[0].permitted: brak bitów
-            0x00, 0x00, 0x00, 0x00,
-            0x01, 0x00, 0x00, 0x00, // data[1].permitted: bit 0 = bit 32 (CAP_MAC_OVERRIDE)
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, // data[1].permitted: bit 0 = bit 32 (CAP_MAC_OVERRIDE)
             0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(parse_capability_names(&raw), vec!["CAP_MAC_OVERRIDE"]);
@@ -1359,13 +1917,18 @@ mod tests {
 
     #[test]
     fn test_parse_capability_too_short_is_empty() {
-        assert_eq!(parse_capability_names(&[0x01, 0x00, 0x00]), Vec::<&str>::new());
+        assert_eq!(
+            parse_capability_names(&[0x01, 0x00, 0x00]),
+            Vec::<&str>::new()
+        );
         assert_eq!(parse_capability_names(&[]), Vec::<&str>::new());
     }
 
     #[test]
     fn test_parse_capability_unrecognized_revision_is_empty() {
-        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x99, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let raw: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x99, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
     }
 
@@ -1373,13 +1936,17 @@ mod tests {
     fn test_parse_capability_v3_too_short_for_high_word_is_empty() {
         // Rewizja 3 zadeklarowana, ale bufor ucięty przed słowem wysokim
         // (poniżej 20 B) - typowy ślad uszkodzonego/odzyskanego xattr.
-        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let raw: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
     }
 
     #[test]
     fn test_parse_capability_zero_mask_is_empty() {
-        let raw: [u8; 12] = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let raw: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert_eq!(parse_capability_names(&raw), Vec::<&str>::new());
     }
 
@@ -1389,7 +1956,10 @@ mod tests {
 
     #[test]
     fn test_format_namespace_section_puste_obie_strony_daje_none() {
-        assert_eq!(format_namespace_section(&HashMap::new(), &HashMap::new()), None);
+        assert_eq!(
+            format_namespace_section(&HashMap::new(), &HashMap::new()),
+            None
+        );
     }
 
     #[test]
@@ -1405,13 +1975,23 @@ mod tests {
         let sekcja = format_namespace_section(&ufs, &script).expect("niepuste mapy muszą dać Some");
 
         assert!(sekcja.contains("[ 4 ] ROZKŁAD PRZESTRZENI NAZW XATTR"));
-        assert!(sekcja.contains("user:       15 kluczy"), "user musi być sumą obu stron (10+5):\n{}", sekcja);
+        assert!(
+            sekcja.contains("user:       15 kluczy"),
+            "user musi być sumą obu stron (10+5):\n{}",
+            sekcja
+        );
 
         let pos_user = sekcja.find("user:").expect("brak user");
         let pos_security = sekcja.find("security:").expect("brak security");
         let pos_trusted = sekcja.find("trusted:").expect("brak trusted");
-        assert!(pos_user < pos_security, "user (15) musi być przed security (3)");
-        assert!(pos_security < pos_trusted, "security (3) musi być przed trusted (1)");
+        assert!(
+            pos_user < pos_security,
+            "user (15) musi być przed security (3)"
+        );
+        assert!(
+            pos_security < pos_trusted,
+            "security (3) musi być przed trusted (1)"
+        );
     }
 
     #[test]
@@ -1420,7 +2000,8 @@ mod tests {
         ufs.insert("system".to_string(), 2);
         let script = HashMap::new();
 
-        let sekcja = format_namespace_section(&ufs, &script).expect("jedna niepusta strona wystarczy do Some");
+        let sekcja = format_namespace_section(&ufs, &script)
+            .expect("jedna niepusta strona wystarczy do Some");
         assert!(sekcja.contains("system:     2 kluczy"));
     }
 
@@ -1431,13 +2012,38 @@ mod tests {
     #[test]
     fn test_category_stats_accumulates() {
         let mut stats = CategoryStats::new();
-        stats.add("jpg", "a.jpg".to_string(), 1000, 1000, "user.comment".to_string(), 128, false, "UFS Explorer".to_string());
-        stats.add("jpg", "b.jpg".to_string(), 0, 0, "com.apple.quarantine".to_string(), 256, true, "Skrypt Autorski".to_string());
+        stats.add(
+            "jpg",
+            "a.jpg".to_string(),
+            1000,
+            1000,
+            "user.comment".to_string(),
+            128,
+            false,
+            "UFS Explorer".to_string(),
+        );
+        stats.add(
+            "jpg",
+            "b.jpg".to_string(),
+            0,
+            0,
+            "com.apple.quarantine".to_string(),
+            256,
+            true,
+            "Skrypt Autorski".to_string(),
+        );
 
         assert_eq!(stats.count, 2);
         assert_eq!(stats.url_count, 1);
         assert_eq!(stats.total_xattr_bytes, 384);
-        assert_eq!(stats.extensions.get("jpg").unwrap().len(), 2);
+        assert_eq!(
+            stats
+                .extensions
+                .get("jpg")
+                .expect("Pobranie elementu z mapy lub słownika nie powiodło się")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1474,17 +2080,27 @@ mod tests {
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta \"{}\" z panelu Fazy 15 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+                "etykieta \"{}\" z panelu Fazy 15 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 11, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza15_xattr.rs");
+        assert_eq!(
+            sprawdzonych, 11,
+            "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza15_xattr.rs"
+        );
     }
 
     #[test]
@@ -1495,7 +2111,11 @@ mod tests {
         stats.quarantine_common.store(2, Ordering::Relaxed);
         stats.wherefroms_common.store(1, Ordering::Relaxed);
         stats.large_xattr_common.store(4, Ordering::Relaxed);
-        stats.namespace_counts.lock().unwrap().insert("user".to_string(), 10);
+        stats
+            .namespace_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("user".to_string(), 10);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
@@ -1542,10 +2162,16 @@ mod tests {
         let stats = LiveStats::new(4);
         stats.capability_common.store(1, Ordering::Relaxed);
         stats.capability_unique.store(2, Ordering::Relaxed);
-        stats.capability_names_counts.lock().unwrap().insert("CAP_NET_RAW".to_string(), 3);
+        stats
+            .capability_names_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("CAP_NET_RAW".to_string(), 3);
 
         let block = build_source_block("UFS Explorer", &stats, Instant::now());
-        assert!(block.contains("Linux Capabilities (security.capability): 1 wspólne / 2 unikalne (CAP_NET_RAW: 3)"));
+        assert!(block.contains(
+            "Linux Capabilities (security.capability): 1 wspólne / 2 unikalne (CAP_NET_RAW: 3)"
+        ));
     }
 
     #[test]
@@ -1557,7 +2183,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki odczytu xattr")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki odczytu xattr"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki odczytu xattr (Wariant A): {R:1} {G:2}");
     }
 
@@ -1585,18 +2214,30 @@ mod tests {
 
     #[test]
     fn test_run_plik_wspolny_dostaje_dwa_niekolidujace_wiersze_ufs_i_skrypt() {
-        let ufs_dir = tempfile::tempdir().unwrap();
-        let script_dir = tempfile::tempdir().unwrap();
-        let log_dir = tempfile::tempdir().unwrap();
-        std::fs::write(ufs_dir.path().join("wspolny.txt"), b"tresc ufs").unwrap();
-        std::fs::write(script_dir.path().join("wspolny.txt"), b"tresc skrypt").unwrap();
+        let ufs_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(ufs_dir.path().join("wspolny.txt"), b"tresc ufs")
+            .expect("Nie można zapisać danych do pliku");
+        std::fs::write(script_dir.path().join("wspolny.txt"), b"tresc skrypt")
+            .expect("Nie można zapisać danych do pliku");
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('wspolny.txt', 1, 1)",
             [],
-        ).unwrap();
-        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'wspolny.txt'", [], |r| r.get(0)).unwrap();
+        ).expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path = 'wspolny.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Pobranie elementu z mapy lub słownika nie powiodło się");
 
         let mut config = Ustawienia {
             ufs_path: ufs_dir.path().to_string_lossy().to_string(),
@@ -1609,9 +2250,13 @@ mod tests {
 
         run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
 
-        let liczba_wierszy: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)
-        ).unwrap();
+        let liczba_wierszy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .expect("Inicjalizacja bazy danych nie powiodła się");
         assert_eq!(
             liczba_wierszy, 2,
             "plik wspólny musi dać DWA niekolidujące wiersze (jeden na fizyczną kopię) - \
@@ -1619,9 +2264,19 @@ mod tests {
              bez rozróżnienia strony) bezpowrotnie nadpisywał pierwszy, zostawiając tylko 1 wiersz"
         );
 
-        let mut stmt = conn.prepare("SELECT side FROM phase15_analysis WHERE file_id = ?1 ORDER BY side").unwrap();
-        let sides: Vec<String> = stmt.query_map(params![file_id], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
-        assert_eq!(sides, vec!["script".to_string(), "ufs".to_string()], "obie strony muszą być obecne, każda pod własnym wierszem");
+        let mut stmt = conn
+            .prepare("SELECT side FROM phase15_analysis WHERE file_id = ?1 ORDER BY side")
+            .expect("Przygotowanie zapytania SQL nie powiodło się");
+        let sides: Vec<String> = stmt
+            .query_map(params![file_id], |r| r.get(0))
+            .expect("Pobranie elementu z mapy lub słownika nie powiodło się")
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            sides,
+            vec!["script".to_string(), "ufs".to_string()],
+            "obie strony muszą być obecne, każda pod własnym wierszem"
+        );
     }
 
     /// Plik UNIKALNY (tylko jedna strona) musi dać dokładnie JEDEN wiersz —
@@ -1629,17 +2284,28 @@ mod tests {
     /// nadmiarowych wierszy tam, gdzie druga strona w ogóle nie istnieje.
     #[test]
     fn test_run_plik_unikalny_dostaje_dokladnie_jeden_wiersz() {
-        let ufs_dir = tempfile::tempdir().unwrap();
-        let script_dir = tempfile::tempdir().unwrap();
-        let log_dir = tempfile::tempdir().unwrap();
-        std::fs::write(ufs_dir.path().join("tylko_ufs.txt"), b"tresc").unwrap();
+        let ufs_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(ufs_dir.path().join("tylko_ufs.txt"), b"tresc")
+            .expect("Nie można zapisać danych do pliku");
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('tylko_ufs.txt', 1, 0)",
             [],
-        ).unwrap();
-        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'tylko_ufs.txt'", [], |r| r.get(0)).unwrap();
+        ).expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path = 'tylko_ufs.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Pobranie elementu z mapy lub słownika nie powiodło się");
 
         let mut config = Ustawienia {
             ufs_path: ufs_dir.path().to_string_lossy().to_string(),
@@ -1652,12 +2318,22 @@ mod tests {
 
         run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok");
 
-        let liczba_wierszy: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)
-        ).unwrap();
+        let liczba_wierszy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM phase15_analysis WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .expect("Inicjalizacja bazy danych nie powiodła się");
         assert_eq!(liczba_wierszy, 1);
 
-        let side: String = conn.query_row("SELECT side FROM phase15_analysis WHERE file_id = ?1", params![file_id], |r| r.get(0)).unwrap();
+        let side: String = conn
+            .query_row(
+                "SELECT side FROM phase15_analysis WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .expect("Pobranie elementu z mapy lub słownika nie powiodło się");
         assert_eq!(side, "ufs");
     }
 
@@ -1666,35 +2342,49 @@ mod tests {
     /// zostać po cichu skasowane), a nowa tabela musi dostać kolumnę `side`.
     #[test]
     fn test_run_migruje_stary_ksztalt_tabeli_bez_utraty_danych() {
-        let ufs_dir = tempfile::tempdir().unwrap();
-        let script_dir = tempfile::tempdir().unwrap();
-        let log_dir = tempfile::tempdir().unwrap();
+        let ufs_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
 
         // `init_db` tworzy `phase15_analysis` już przy inicjalizacji, w
         // NOWYM (naprawionym) kształcie - patrz `db.rs::create_analysis_tables`.
         // Żeby wiarygodnie zasymulować bazę SPRZED tej naprawy, musimy
         // najpierw usunąć tę już-poprawną tabelę i odtworzyć ją w STARYM
         // kształcie - `file_id INTEGER PRIMARY KEY`, bez `side`.
-        conn.execute("DROP TABLE phase15_analysis", []).unwrap();
+        conn.execute("DROP TABLE phase15_analysis", [])
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
         conn.execute(
             "CREATE TABLE phase15_analysis (
                 file_id INTEGER PRIMARY KEY,
                 has_xattr BOOLEAN, xattr_count INTEGER, xattr_size INTEGER, xattr_keys TEXT,
                 uid INTEGER, gid INTEGER, has_url BOOLEAN,
                 FOREIGN KEY(file_id) REFERENCES files(id)
-            )", [],
-        ).unwrap();
+            )",
+            [],
+        )
+        .expect("Nie można utworzyć katalogu tymczasowego dla testu");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, has_xattr_ufs, phase15_done) VALUES ('stary.txt', 1, 0, 1, 1)",
             [],
-        ).unwrap();
-        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE relative_path = 'stary.txt'", [], |r| r.get(0)).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path = 'stary.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("Pobranie elementu z mapy lub słownika nie powiodło się");
         conn.execute(
             "INSERT INTO phase15_analysis (file_id, has_xattr, uid, gid) VALUES (?1, 1, 999, 999)",
             params![file_id],
-        ).unwrap();
+        )
+        .expect("Pobranie elementu z mapy lub słownika nie powiodło się");
 
         let mut config = Ustawienia {
             ufs_path: ufs_dir.path().to_string_lossy().to_string(),
@@ -1705,17 +2395,35 @@ mod tests {
         config.raporty_faz.clear();
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok mimo migracji w trakcie");
+        run(&mut conn, &config, tx_ui)
+            .expect("run() musi zakończyć się Ok mimo migracji w trakcie");
 
         // Stara tabela musi przetrwać pod inną nazwą - z oryginalnym wierszem nietkniętym.
-        let stary_uid: u32 = conn.query_row(
-            "SELECT uid FROM phase15_analysis_legacy_wyscig_zapisu WHERE file_id = ?1", params![file_id], |r| r.get(0)
-        ).expect("stare dane muszą przetrwać migrację pod inną nazwą, nie zniknąć");
-        assert_eq!(stary_uid, 999, "stary wiersz musi zostać zachowany bez zmian");
+        let stary_uid: u32 = conn
+            .query_row(
+                "SELECT uid FROM phase15_analysis_legacy_wyscig_zapisu WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .expect("stare dane muszą przetrwać migrację pod inną nazwą, nie zniknąć");
+        assert_eq!(
+            stary_uid, 999,
+            "stary wiersz musi zostać zachowany bez zmian"
+        );
 
         // Nowa tabela musi mieć kolumnę `side`.
-        let mut stmt = conn.prepare("PRAGMA table_info(phase15_analysis)").unwrap();
-        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().filter_map(|r| r.ok()).collect();
-        assert!(cols.contains(&"side".to_string()), "nowa tabela musi mieć kolumnę side: {:?}", cols);
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(phase15_analysis)")
+            .expect("Przygotowanie zapytania SQL nie powiodło się");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("Wykonanie procedury głównej nie powiodło się")
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            cols.contains(&"side".to_string()),
+            "nowa tabela musi mieć kolumnę side: {:?}",
+            cols
+        );
     }
 }

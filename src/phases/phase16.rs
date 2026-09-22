@@ -92,21 +92,21 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
+use colored::Colorize;
+use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{error, info, instrument, warn};
-use yara::{Compiler, Rules};
-use colored::Colorize;
+use yara::{Compiler, Rules, YaraErrorKind};
 
 const CHUNK_SIZE: usize = 100;
 
@@ -133,21 +133,37 @@ pub(crate) enum ScanMsg {
     ScriptChunk(Vec<SideYaraResult>),
 }
 
-/// Liczniki live dla JEDNEJ strony. `top_rules` i `multi_rule_files` to
-/// nowe liczniki: reguły są już zbierane w `matches` od zawsze, tylko
-/// wcześniej agregowane WYŁĄCZNIE w raporcie końcowym, nie pokazywane na
-/// żywo w trakcie skanowania.
+/// Liczniki live dla JEDNEJ strony. `clean`/`infected`/`multi_rule_files`
+/// rozbite wspólne/unikalne — `Task::is_common` jest już liczone i używane
+/// do tagowania wpisów logu operacyjnego ("Wspólne"/"Unikalne"), ale panel
+/// live dotąd tego nie wykorzystywał (mirror wzorca z Fazy 11-15). `top_rules`
+/// i `tag_counts` pozostają zbiorcze (jak `namespace_counts`/
+/// `capability_names_counts` w Fazie 15) — to rozkład opisowy po nazwie/tagu,
+/// nie licznik anomalii per-plik. `tag_counts` jest CELOWO mapą otwartą, nie
+/// listą znanych tagów na sztywno — dowolny tag zdefiniowany w DOWOLNYM
+/// załadowanym pliku `.yar` (nawet dodanym po tej rewizji) trafia do niej
+/// automatycznie, bez potrzeby aktualizacji kodu.
 pub(crate) struct LiveStats {
     processed_files: AtomicUsize,
     processed_bytes: AtomicU64,
-    clean: AtomicUsize,
-    infected: AtomicUsize,
+    clean_common: AtomicUsize,
+    clean_unique: AtomicUsize,
+    infected_common: AtomicUsize,
+    infected_unique: AtomicUsize,
     errors: AtomicUsize,
+    /// Timeouty silnika YARA (limit 10s/plik) — ODRÓŻNIONE od zwykłych
+    /// błędów I/O (`errors`): patologicznie wolna reguła/plik to inny
+    /// problem diagnostyczny niż uszkodzony dysk/brak pliku.
+    timeouts: AtomicUsize,
     /// Zliczenia wystąpień per NAZWA reguły — do "Top reguły" w panelu live.
     top_rules: Mutex<HashMap<String, usize>>,
+    /// Zliczenia wystąpień per TAG reguły (`Rule::tags`, np. "malware"/"pii"/
+    /// "ransomware") — patrz uwaga o otwartej mapie wyżej.
+    tag_counts: Mutex<HashMap<String, usize>>,
     /// Pliki, które wyzwoliły WIĘCEJ NIŻ JEDNĄ regułę jednocześnie —
     /// silniejszy sygnał zagrożenia niż pojedyncze trafienie.
-    multi_rule_files: AtomicUsize,
+    multi_rule_files_common: AtomicUsize,
+    multi_rule_files_unique: AtomicUsize,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas skanowania YARA (`scan_file_yara`) — patrz moduł
@@ -160,11 +176,16 @@ impl LiveStats {
         Self {
             processed_files: AtomicUsize::new(0),
             processed_bytes: AtomicU64::new(0),
-            clean: AtomicUsize::new(0),
-            infected: AtomicUsize::new(0),
+            clean_common: AtomicUsize::new(0),
+            clean_unique: AtomicUsize::new(0),
+            infected_common: AtomicUsize::new(0),
+            infected_unique: AtomicUsize::new(0),
             errors: AtomicUsize::new(0),
+            timeouts: AtomicUsize::new(0),
             top_rules: Mutex::new(HashMap::new()),
-            multi_rule_files: AtomicUsize::new(0),
+            tag_counts: Mutex::new(HashMap::new()),
+            multi_rule_files_common: AtomicUsize::new(0),
+            multi_rule_files_unique: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -181,12 +202,22 @@ impl LiveStats {
     fn top_rules(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
         self.top_rules.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Odpowiednik [`Self::top_rules`] dla `tag_counts` — ten sam wzorzec
+    /// odporności na zatruty mutex.
+    fn tag_counts(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.tag_counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA — prędkość MB/s,
@@ -201,20 +232,53 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         let map = stats.top_rules();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(r, c)| format!("{} ({})", r, c)).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(r, c)| format!("{} ({})", r, c))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_rules = if top_rules_str.is_empty() { "-".to_string() } else { top_rules_str };
+    let display_rules = if top_rules_str.is_empty() {
+        "-".to_string()
+    } else {
+        top_rules_str
+    };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let top_tags_str = {
+        let map = stats.tag_counts();
+        let mut sorted: Vec<_> = map.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        sorted
+            .into_iter()
+            .take(5)
+            .map(|(t, c)| format!("{} ({})", t, c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let display_tags = if top_tags_str.is_empty() {
+        "-".to_string()
+    } else {
+        top_tags_str
+    };
+
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
-        "[{}]\nPrędkość: {:.2} MB/s\nCzyste: {}\nZainfekowane: {}\nTop reguły (live): {}\nWiele reguł jednocześnie: {}\nWątki YARA (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb,
-        stats.clean.load(Ordering::Relaxed),
-        stats.infected.load(Ordering::Relaxed),
+        "[{}]\nPrędkość: {:.2} MB/s\nCzyste: {} wspólne / {} unikalne\nZainfekowane: {} wspólne / {} unikalne\nTop reguły (live): {}\nTop tagi reguł (live): {}\nWiele reguł jednocześnie: {} wspólne / {} unikalne\nWątki YARA (Wariant A): {}\nTimeout silnika (>10s): {}\nBłędy I/O: {}",
+        label,
+        speed_mb,
+        stats.clean_common.load(Ordering::Relaxed),
+        stats.clean_unique.load(Ordering::Relaxed),
+        stats.infected_common.load(Ordering::Relaxed),
+        stats.infected_unique.load(Ordering::Relaxed),
         display_rules,
-        stats.multi_rule_files.load(Ordering::Relaxed),
+        display_tags,
+        stats.multi_rule_files_common.load(Ordering::Relaxed),
+        stats.multi_rule_files_unique.load(Ordering::Relaxed),
         activity_markup,
+        stats.timeouts.load(Ordering::Relaxed),
         stats.errors.load(Ordering::Relaxed),
     )
 }
@@ -228,7 +292,12 @@ struct CategoryStats {
     rules: RuleMap,
 }
 impl CategoryStats {
-    fn new() -> Self { Self { count: 0, rules: HashMap::new() } }
+    fn new() -> Self {
+        Self {
+            count: 0,
+            rules: HashMap::new(),
+        }
+    }
     fn add(&mut self, rule_name: &str, path: String) {
         self.count += 1;
         let entry = self.rules.entry(rule_name.to_string()).or_insert((0, path));
@@ -263,9 +332,29 @@ where
 /// YARA (w tym timeout) lub PANIKI wewnątrz `rules.scan_file` przechwyconej
 /// przez [`catch_yara_panic`] (patrz dokumentacja modułu — NAPRAWIONY BUG
 /// WYSOKI).
-fn scan_file_yara(path: &Path, rel_path: &str, side_label: &str, rules: &Rules) -> std::result::Result<Option<String>, std::io::Error> {
+/// Wynik trafienia — nazwy reguł (jak dotąd, do zapisu w bazie/logu) PLUS
+/// zdeduplikowana lista tagów (`Rule::tags`) zebrana ze WSZYSTKICH
+/// dopasowanych reguł. Reguły YARA same deklarują swoje tagi w pliku `.yar`
+/// (`rule x : tag1 tag2 { ... }`) — ta lista jest więc z definicji otwarta na
+/// dowolny tag z dowolnej (także przyszłej) reguły, bez twardego wyliczenia
+/// znanych wartości w kodzie.
+#[derive(Debug, PartialEq)]
+struct YaraMatch {
+    rule_names: String,
+    tags: Vec<String>,
+}
+
+fn scan_file_yara(
+    path: &Path,
+    rel_path: &str,
+    side_label: &str,
+    rules: &Rules,
+) -> std::result::Result<Option<YaraMatch>, std::io::Error> {
     if !path.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Plik nie istnieje"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Plik nie istnieje",
+        ));
     }
 
     match catch_yara_panic(|| rules.scan_file(path, 10)) {
@@ -273,13 +362,34 @@ fn scan_file_yara(path: &Path, rel_path: &str, side_label: &str, rules: &Rules) 
             if matches.is_empty() {
                 Ok(None)
             } else {
-                let rule_names: Vec<String> = matches.iter().map(|m| m.identifier.to_string()).collect();
-                Ok(Some(rule_names.join(", ")))
+                let rule_names: Vec<String> =
+                    matches.iter().map(|m| m.identifier.to_string()).collect();
+                let mut tags: Vec<String> = matches
+                    .iter()
+                    .flat_map(|m| m.tags.iter().map(|t| t.to_string()))
+                    .collect();
+                tags.sort_unstable();
+                tags.dedup();
+                Ok(Some(YaraMatch {
+                    rule_names: rule_names.join(", "),
+                    tags,
+                }))
             }
         }
         Ok(Err(e)) => {
             warn!(path = rel_path, side = side_label, error = %e, "Błąd I/O lub Timeout YARA");
-            Err(std::io::Error::other("YARA Scan Error"))
+            // Timeout (limit 10s/plik) dostaje WŁASNY `ErrorKind::TimedOut`,
+            // odróżnialny od zwykłego błędu I/O/silnika przez wywołującego —
+            // patologicznie wolna reguła/plik to inny problem diagnostyczny
+            // niż uszkodzony dysk/brak pliku.
+            let is_timeout =
+                matches!(&e, yara::Error::Yara(inner) if inner.kind == YaraErrorKind::ScanTimeout);
+            let kind = if is_timeout {
+                std::io::ErrorKind::TimedOut
+            } else {
+                std::io::ErrorKind::Other
+            };
+            Err(std::io::Error::new(kind, "YARA Scan Error"))
         }
         Err(panika) => {
             let opis = panika
@@ -288,7 +398,9 @@ fn scan_file_yara(path: &Path, rel_path: &str, side_label: &str, rules: &Rules) 
                 .or_else(|| panika.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "nieznana przyczyna".to_string());
             error!(path = rel_path, side = side_label, panika = %opis, "PANIKA silnika YARA (scan_file) - przechwycona, plik traktowany jak błąd I/O");
-            Err(std::io::Error::other("Panika silnika YARA (przechwycona przez catch_unwind)"))
+            Err(std::io::Error::other(
+                "Panika silnika YARA (przechwycona przez catch_unwind)",
+            ))
         }
     }
 }
@@ -309,69 +421,172 @@ pub struct StreamCtx<'a> {
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
     pub bar_idx: usize,
     pub log_infected: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, rules, stats, tx_db, is_ufs, start_time, tx_ui, bar_idx, log_infected } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        rules,
+        stats,
+        tx_db,
+        is_ufs,
+        start_time,
+        tx_ui,
+        bar_idx,
+        log_infected,
+        debug_log,
+    } = ctx;
+    let metoda = "scan_file_yara";
 
     let last_ui_update = Arc::new(AtomicU64::new(0));
 
-    tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
-        if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
+    tasks
+        .par_chunks(CHUNK_SIZE)
+        .for_each_with(tx_db, |tx_db, chunk| {
+            if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                return;
+            }
 
-        let mut results = Vec::with_capacity(chunk.len());
-        let mut local_rules: HashMap<String, usize> = HashMap::new();
+            let mut results = Vec::with_capacity(chunk.len());
+            let mut local_rules: HashMap<String, usize> = HashMap::new();
+            let mut local_tags: HashMap<String, usize> = HashMap::new();
 
-        for task in chunk {
-            if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
-
-            let full_path = base_path.join(&task.rel_path);
-            let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
-
-            let (matches_opt, io_err) = match stats.thread_activity.track_current(|| scan_file_yara(&full_path, &task.rel_path, side_label, rules)) {
-                Ok(Some(m)) => {
-                    stats.infected.fetch_add(1, Ordering::Relaxed);
-                    let kategoria = if task.is_common { "Wspólne" } else { "Unikalne" };
-
-                    let rule_names: Vec<&str> = m.split(", ").collect();
-                    if rule_names.len() > 1 {
-                        stats.multi_rule_files.fetch_add(1, Ordering::Relaxed);
-                    }
-                    for rn in &rule_names {
-                        *local_rules.entry(rn.to_string()).or_insert(0) += 1;
-                    }
-                    
-                    if let Ok(mut f) = log_infected.lock() {
-                        let _ = writeln!(f, "[{:<15}] [{:<8}] [Reguły: {}] -> \"{}\"", side_label, kategoria, m, full_path.display());
-                    }
-                    (Some(m), Some(false))
-                },
-                Ok(None) => {
-                    stats.clean.fetch_add(1, Ordering::Relaxed);
-                    (None, Some(false))
-                },
-                Err(_) => {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                    (None, Some(true))
+            for task in chunk {
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
                 }
-            };
 
-            if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                let full_path = base_path.join(&task.rel_path);
+                let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
 
-            let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
-            stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
+                if let Ok(mut f) = log_infected.lock() {
+                    let _ = writeln!(
+                        f,
+                        "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                        crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                    );
+                }
 
-            let now_ms = start_time.elapsed().as_millis() as u64;
-            let last_ms = last_ui_update.load(Ordering::Relaxed);
-            
-            if now_ms - last_ms > 80
-                && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                let call_start = debug_log.is_active().then(Instant::now);
+                let (matches_opt, io_err) = match stats
+                    .thread_activity
+                    .track_current(|| scan_file_yara(&full_path, &task.rel_path, side_label, rules))
+                {
+                    Ok(Some(yara_match)) => {
+                        if task.is_common {
+                            stats.infected_common.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.infected_unique.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let kategoria = if task.is_common {
+                            "Wspólne"
+                        } else {
+                            "Unikalne"
+                        };
 
+                        let rule_names: Vec<&str> = yara_match.rule_names.split(", ").collect();
+                        if rule_names.len() > 1 {
+                            if task.is_common {
+                                stats
+                                    .multi_rule_files_common
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats
+                                    .multi_rule_files_unique
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        for rn in &rule_names {
+                            *local_rules.entry(rn.to_string()).or_insert(0) += 1;
+                        }
+                        for tag in &yara_match.tags {
+                            *local_tags.entry(tag.clone()).or_insert(0) += 1;
+                        }
+
+                        if let Ok(mut f) = log_infected.lock() {
+                            let tags_suffix = if yara_match.tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [Tagi: {}]", yara_match.tags.join(", "))
+                            };
+                            let _ = writeln!(
+                                f,
+                                "[{:<15}] [{:<8}] [Reguły: {}]{} -> \"{}\"",
+                                side_label,
+                                kategoria,
+                                yara_match.rule_names,
+                                tags_suffix,
+                                full_path.display()
+                            );
+                        }
+                        (Some(yara_match.rule_names), Some(false))
+                    }
+                    Ok(None) => {
+                        if task.is_common {
+                            stats.clean_common.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.clean_unique.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (None, Some(false))
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (None, Some(true))
+                    }
+                };
+                let wynik = match (io_err, &matches_opt) {
+                    (Some(true), _) => "BŁĄD/TIMEOUT".to_string(),
+                    (_, Some(regula)) => format!("WYKRYTO: {}", regula),
+                    _ => "OK (CZYSTY)".to_string(),
+                };
+                if let Some(t) = call_start {
+                    debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+                }
+                if let Ok(mut f) = log_infected.lock() {
+                    let _ = writeln!(
+                        f,
+                        "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                        crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                    );
+                }
+
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let current = stats.processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                stats
+                    .processed_bytes
+                    .fetch_add(file_size, Ordering::Relaxed);
+
+                let now_ms = start_time.elapsed().as_millis() as u64;
+                let last_ms = last_ui_update.load(Ordering::Relaxed);
+
+                if now_ms - last_ms > 80
+                    && last_ui_update
+                        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
                     if !local_rules.is_empty() {
                         let mut g_rules = stats.top_rules();
-                        for (k, v) in local_rules.drain() { *g_rules.entry(k).or_insert(0) += v; }
+                        for (k, v) in local_rules.drain() {
+                            *g_rules.entry(k).or_insert(0) += v;
+                        }
+                    }
+                    if !local_tags.is_empty() {
+                        let mut g_tags = stats.tag_counts();
+                        for (k, v) in local_tags.drain() {
+                            *g_tags.entry(k).or_insert(0) += v;
+                        }
                     }
 
                     // PASEK: wyłącznie postęp + bieżący plik (bez liczników)
@@ -382,7 +597,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                     let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                         idx: bar_idx,
-                        path: full_path.to_string_lossy().to_string(),
+                        path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                     });
 
                     // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -392,19 +607,34 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                 }
 
-            results.push(SideYaraResult { id: task.id, matches: matches_opt, io_error: io_err });
-        }
+                results.push(SideYaraResult {
+                    id: task.id,
+                    matches: matches_opt,
+                    io_error: io_err,
+                });
+            }
 
-        if !local_rules.is_empty() {
-            let mut g_rules = stats.top_rules();
-            for (k, v) in local_rules.drain() { *g_rules.entry(k).or_insert(0) += v; }
-        }
+            if !local_rules.is_empty() {
+                let mut g_rules = stats.top_rules();
+                for (k, v) in local_rules.drain() {
+                    *g_rules.entry(k).or_insert(0) += v;
+                }
+            }
+            if !local_tags.is_empty() {
+                let mut g_tags = stats.tag_counts();
+                for (k, v) in local_tags.drain() {
+                    *g_tags.entry(k).or_insert(0) += v;
+                }
+            }
 
-        if !results.is_empty() {
-            if is_ufs { let _ = tx_db.send(ScanMsg::UfsChunk(results)); } 
-            else { let _ = tx_db.send(ScanMsg::ScriptChunk(results)); }
-        }
-    });
+            if !results.is_empty() {
+                if is_ufs {
+                    let _ = tx_db.send(ScanMsg::UfsChunk(results));
+                } else {
+                    let _ = tx_db.send(ScanMsg::ScriptChunk(results));
+                }
+            }
+        });
 
     let _ = tx_ui.send(PhaseEvent::UpdateBar {
         idx: bar_idx,
@@ -417,22 +647,26 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 /// do Dziennika Końcowego: top 5 reguł wg liczby trafień z przykładową ścieżką.
 fn write_category_block(out: &mut String, stats: &CategoryStats) {
     use std::fmt::Write as FmtWrite;
-    if stats.count == 0 { 
+    if stats.count == 0 {
         let _ = writeln!(out, "   [ ✔ ] Brak wykrytych zagrożeń w tej puli.");
-        return; 
+        return;
     }
-    
+
     let _ = writeln!(out, "   [ 👇 ] Zidentyfikowane sygnatury YARA i próbki:");
-    
+
     let mut sorted: Vec<_> = stats.rules.iter().collect();
-    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.0)); 
-    
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.0));
+
     for (rule_name, (count, example_path)) in sorted.into_iter().take(5) {
-        let _ = writeln!(out, "     - 🦠 Sygnatura: {:<25} | Trafienia: {}", rule_name, count);
+        let _ = writeln!(
+            out,
+            "     - 🦠 Sygnatura: {:<25} | Trafienia: {}",
+            rule_name, count
+        );
         let _ = writeln!(out, "       [ 🔍 ] Przykładowy zainfekowany plik:");
         let _ = writeln!(out, "         - Ścieżka: \"{}\"", example_path);
     }
-    let _ = writeln!(out); 
+    let _ = writeln!(out);
 }
 
 /// Wylicza rozmiar prywatnej puli Rayon przypisywanej JEDNEJ stronie w
@@ -457,7 +691,10 @@ pub fn discover_rule_files() -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_file()
                 && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                    && (ext == "yar" || ext == "yara") { found.push(path); }
+                && (ext == "yar" || ext == "yara")
+            {
+                found.push(path);
+            }
         }
     }
     found
@@ -470,7 +707,10 @@ pub fn discover_rule_files() -> Vec<PathBuf> {
 fn compile_rule_files(rule_files: &[PathBuf]) -> Option<Rules> {
     let mut compiler = match Compiler::new() {
         Ok(c) => c,
-        Err(e) => { error!("Nie udało się zainicjalizować kompilatora YARA: {}", e); return None; }
+        Err(e) => {
+            error!("Nie udało się zainicjalizować kompilatora YARA: {}", e);
+            return None;
+        }
     };
     for rule_path in rule_files {
         compiler = match compiler.add_rules_file(rule_path) {
@@ -521,9 +761,20 @@ pub fn select_and_compile_rules() -> Option<Rules> {
         return None;
     }
 
-    let rule_names: Vec<String> = available_rules.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+    let rule_names: Vec<String> = available_rules
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .expect("Nie można pobrać nazwy pliku")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
 
-    println!("\n{}", "[ 🧰 ] ZNALEZIONO REGUŁY YARA NA DYSKU".cyan().bold());
+    println!(
+        "\n{}",
+        "[ 🧰 ] ZNALEZIONO REGUŁY YARA NA DYSKU".cyan().bold()
+    );
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Wybierz reguły do skompilowania (Spacja = zaznacz, ENTER = zatwierdź)")
         .items(&rule_names)
@@ -533,13 +784,22 @@ pub fn select_and_compile_rules() -> Option<Rules> {
     let selected_indices = match selections {
         Some(s) if !s.is_empty() => s,
         _ => {
-            println!("{}", "[ ℹ ] Nie wybrano żadnych reguł. Pomijam skanowanie YARA.".bright_black());
+            println!(
+                "{}",
+                "[ ℹ ] Nie wybrano żadnych reguł. Pomijam skanowanie YARA.".bright_black()
+            );
             return None;
         }
     };
 
-    println!("\n{}", "[ ⚙ ] Kompilacja wybranych reguł do pamięci RAM...".cyan());
-    let selected_files: Vec<PathBuf> = selected_indices.iter().map(|&idx| available_rules[idx].clone()).collect();
+    println!(
+        "\n{}",
+        "[ ⚙ ] Kompilacja wybranych reguł do pamięci RAM...".cyan()
+    );
+    let selected_files: Vec<PathBuf> = selected_indices
+        .iter()
+        .map(|&idx| available_rules[idx].clone())
+        .collect();
 
     // REGRESJA (todo.faza16.md): `.unwrap()` tutaj panikował na całym
     // procesie (jesteśmy PRZED wejściem w tryb Raw Ratatui, więc żaden
@@ -550,7 +810,11 @@ pub fn select_and_compile_rules() -> Option<Rules> {
     let mut compiler = match Compiler::new() {
         Ok(c) => c,
         Err(e) => {
-            println!("{} Nie udało się zainicjalizować kompilatora YARA: {}", "[ ✖ ]".red().bold(), e);
+            println!(
+                "{} Nie udało się zainicjalizować kompilatora YARA: {}",
+                "[ ✖ ]".red().bold(),
+                e
+            );
             error!("Nie udało się zainicjalizować kompilatora YARA: {}", e);
             return None;
         }
@@ -559,7 +823,12 @@ pub fn select_and_compile_rules() -> Option<Rules> {
         compiler = match compiler.add_rules_file(rule_path) {
             Ok(c) => c,
             Err(e) => {
-                println!("{} Błąd składni w pliku {:?}: {}", "[ ✖ ]".red().bold(), rule_path.file_name().unwrap(), e);
+                println!(
+                    "{} Błąd składni w pliku {:?}: {}",
+                    "[ ✖ ]".red().bold(),
+                    rule_path.file_name().expect("Nie można pobrać nazwy pliku"),
+                    e
+                );
                 error!("Błąd kompilacji reguł YARA: {}", e);
                 return None;
             }
@@ -583,11 +852,18 @@ pub fn select_and_compile_rules() -> Option<Rules> {
 /// [`compile_all_available_rules`] wołane przez wywołującego PRZED wejściem
 /// w tryb Raw) — ta funkcja sama nie robi już żadnej interakcji z użytkownikiem.
 #[instrument(skip(conn, config, tx_ui, rules), fields(ufs_path = %config.ufs_path, script_path = %config.script_path))]
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>, rules: Rules) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+    rules: Rules,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // START FAZY RATATUI
-    let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 16. Silnik YARA zintegrowany z pamięcią RAM.".to_string()));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Uruchomiono Fazę 16. Silnik YARA zintegrowany z pamięcią RAM.".to_string(),
+    ));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -603,7 +879,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             yara_matched BOOLEAN,
             rules_triggered TEXT,
             FOREIGN KEY(file_id) REFERENCES files(id)
-        )", []
+        )",
+        [],
     )?;
 
     // NAPRAWA BUGU KRYTYCZNEGO (patrz dokumentacja modułu): dodatkowa para
@@ -615,18 +892,36 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // co w innych fazach (patrz `db.rs::migrate_schema` i np.
     // `phase18_smart_splice::run`).
     let _ = conn.execute("ALTER TABLE files ADD COLUMN yara_scanned_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN yara_scanned_script BOOLEAN", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN yara_scanned_script BOOLEAN",
+        [],
+    );
 
     // INICJALIZACJA DUAL-LOGGING
-    let raport_cfg = config.raporty_faz.get("Faza 16").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza16.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza16.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 16")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza16.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza16.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza16.txt", &stamp),
+        &config.log_level,
+    );
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -635,15 +930,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let log_infected_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let log_infected = Arc::new(Mutex::new(log_infected_file));
     {
-        let mut f = log_infected.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 16: WYKRYTE ZAGROŻENIA YARA ===");
-        let _ = writeln!(f, "Ewidencja plików, które wyzwoliły reguły skanowania antywirusowego na żywo.\n");
+        let mut f = log_infected.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 16: WYKRYTE ZAGROŻENIA YARA ==="
+        );
+        let _ = writeln!(
+            f,
+            "Ewidencja plików, które wyzwoliły reguły skanowania antywirusowego na żywo.\n"
+        );
     }
 
     // --- ETAP 1: POBIERANIE ZADAŃ ---
@@ -668,21 +972,43 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?,
-            row.get::<_, Option<bool>>(8)?, row.get::<_, Option<bool>>(9)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
+            row.get::<_, Option<bool>>(8)?,
+            row.get::<_, Option<bool>>(9)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel, in_ufs, in_script, y_ufs, y_scr, err_ufs, err_scr, scanned_ufs, scanned_scr) = r;
+        let (id, rel, in_ufs, in_script, y_ufs, y_scr, err_ufs, err_scr, scanned_ufs, scanned_scr) =
+            r;
         if in_ufs {
-            if y_ufs.is_none() && err_ufs != Some(true) && scanned_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common: in_ufs && in_script }); }
-            else { skipped += 1; }
+            if y_ufs.is_none() && err_ufs != Some(true) && scanned_ufs != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                    is_common: in_ufs && in_script,
+                });
+            } else {
+                skipped += 1;
+            }
         }
         if in_script {
-            if y_scr.is_none() && err_scr != Some(true) && scanned_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common: in_ufs && in_script }); }
-            else { skipped += 1; }
+            if y_scr.is_none() && err_scr != Some(true) && scanned_scr != Some(true) {
+                script_tasks.push(Task {
+                    id,
+                    rel_path: rel,
+                    is_common: in_ufs && in_script,
+                });
+            } else {
+                skipped += 1;
+            }
         }
     }
     drop(stmt);
@@ -690,23 +1016,58 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
 
     if skipped > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto {} plików już przeskanowanych YARA.", skipped)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto {} plików już przeskanowanych YARA.",
+            skipped
+        )));
     }
 
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających skanowania YARA. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Skanowanie antywirusowe YARA zostało ukończone. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Kod gładko przechodzi
+        // do Etapu 4, by zamknąć status osieroconych plików z radaru!
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE" } else { "SEKWENCYJNIE" };
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Metodyka pracy szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE"
+    } else {
+        "SEKWENCYJNIE"
+    };
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Metodyka pracy szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     // --- ETAP 2: INICJALIZACJA UI ---
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (YARA)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (YARA)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (YARA)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (YARA)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = compute_half_threads(actual_threads);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -781,9 +1142,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let inf_u = log_infected.clone(); let inf_s = log_infected.clone();
-            
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let inf_u = log_infected.clone();
+            let inf_s = log_infected.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             // TWORZYMY REFERENCJE PRZED WĄTKIEM
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -796,40 +1161,132 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             // NAPRAWA (ten sam bug jak w Fazie 5/6/7/10-15): dedykowana pula
             // per strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
 
-            s.spawn(move || { 
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+            s.spawn(move || {
+                if !ufs_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", rules: rules_ref, stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, log_infected: inf_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                rules: rules_ref,
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                start_time,
+                                tx_ui: &tx_ui_1,
+                                bar_idx: 0,
+                                log_infected: inf_u,
+                                debug_log: dbg_u.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", rules: rules_ref, stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: &tx_ui_1, bar_idx: 0, log_infected: inf_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            rules: rules_ref,
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            start_time,
+                            tx_ui: &tx_ui_1,
+                            bar_idx: 0,
+                            log_infected: inf_u,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_1.send(PhaseEvent::Log("✔ Skanowanie UFS zakończone.".to_string())); 
-                } 
+                    let _ =
+                        tx_ui_1.send(PhaseEvent::Log("✔ Skanowanie UFS zakończone.".to_string()));
+                }
             });
-            s.spawn(move || { 
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+            s.spawn(move || {
+                if !script_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", rules: rules_ref, stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, log_infected: inf_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                rules: rules_ref,
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                start_time,
+                                tx_ui: &tx_ui_2,
+                                bar_idx: 1,
+                                log_infected: inf_s,
+                                debug_log: dbg_s.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", rules: rules_ref, stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: &tx_ui_2, bar_idx: 1, log_infected: inf_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            rules: rules_ref,
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            start_time,
+                            tx_ui: &tx_ui_2,
+                            bar_idx: 1,
+                            log_infected: inf_s,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_2.send(PhaseEvent::Log("✔ Skanowanie Skrypt zakończone.".to_string())); 
-                } 
+                    let _ = tx_ui_2.send(PhaseEvent::Log(
+                        "✔ Skanowanie Skrypt zakończone.".to_string(),
+                    ));
+                }
             });
-            drop(tx_db); 
+            drop(tx_db);
         } else {
-            let inf_u = log_infected.clone(); let inf_s = log_infected.clone();
+            let inf_u = log_infected.clone();
+            let inf_s = log_infected.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", rules: &rules, stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: &tx_ui, bar_idx: 0, log_infected: inf_u, });
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    rules: &rules,
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    start_time,
+                    tx_ui: &tx_ui,
+                    bar_idx: 0,
+                    log_infected: inf_u,
+                    debug_log: dbg_u,
+                });
                 let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie UFS zakończone.".to_string()));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", rules: &rules, stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: &tx_ui, bar_idx: 1, log_infected: inf_s, });
-                let _ = tx_ui.send(PhaseEvent::Log("✔ Skanowanie Skrypt zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    rules: &rules,
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    start_time,
+                    tx_ui: &tx_ui,
+                    bar_idx: 1,
+                    log_infected: inf_s,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui.send(PhaseEvent::Log(
+                    "✔ Skanowanie Skrypt zakończone.".to_string(),
+                ));
             }
             // REGRESJA (measure twice — druga weryfikacja Gemini): gdy
             // `script_tasks` jest puste (np. plik istnieje tylko po stronie
@@ -863,11 +1320,15 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa wiązanie macierzy sygnatur w bazie SQLite...".to_string()));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa wiązanie macierzy sygnatur w bazie SQLite...".to_string(),
+    ));
     conn.execute(
         "UPDATE files SET phase16_done = CASE
             WHEN (found_in_ufs = 0 OR yara_match_ufs IS NOT NULL OR io_error_ufs = 1 OR yara_scanned_ufs = 1)
@@ -890,13 +1351,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare(
         "SELECT relative_path, found_in_ufs, found_in_script, yara_match_ufs, yara_match_script 
          FROM files 
-         WHERE phase16_done = 1 AND (yara_match_ufs IS NOT NULL OR yara_match_script IS NOT NULL)"
+         WHERE phase16_done = 1 AND (yara_match_ufs IS NOT NULL OR yara_match_script IS NOT NULL)",
     )?;
-    
+
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
 
@@ -906,42 +1370,77 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
         if let Some(r_list) = rules_ufs {
             for r_name in r_list.split(", ") {
-                if is_common { stats_common_ufs.add(r_name, path.clone()); }
-                else { stats_unique_ufs.add(r_name, path.clone()); }
+                if is_common {
+                    stats_common_ufs.add(r_name, path.clone());
+                } else {
+                    stats_unique_ufs.add(r_name, path.clone());
+                }
             }
         }
         if let Some(r_list) = rules_scr {
             for r_name in r_list.split(", ") {
-                if is_common { stats_common_scr.add(r_name, path.clone()); }
-                else { stats_unique_scr.add(r_name, path.clone()); }
+                if is_common {
+                    stats_common_scr.add(r_name, path.clone());
+                } else {
+                    stats_unique_scr.add(r_name, path.clone());
+                }
             }
         }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO (Z ZAPISEM DO PLIKU) --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 16 (DETEKCJA SYGNATUR YARA)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 16 (DETEKCJA SYGNATUR YARA)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let total_infected = stats_common_ufs.count + stats_unique_ufs.count + stats_common_scr.count + stats_unique_scr.count;
+    let total_infected = stats_common_ufs.count
+        + stats_unique_ufs.count
+        + stats_common_scr.count
+        + stats_unique_scr.count;
 
     if total_infected == 0 {
-        let _ = writeln!(&mut log_out, "[ ✔ ] Brak wykrytych zagrożeń. System nie odnalazł plików pasujących do wybranych reguł YARA.\n");
+        let _ = writeln!(
+            &mut log_out,
+            "[ ✔ ] Brak wykrytych zagrożeń. System nie odnalazł plików pasujących do wybranych reguł YARA.\n"
+        );
     } else {
-        let _ = writeln!(&mut log_out, "[ 🚨 ] UWAGA! ODNALEZIONO {} ZAINFEKOWANYCH PLIKÓW:", total_infected);
-        let _ = writeln!(&mut log_out, "   [ ZNACZENIE ]: Pliki wyzwoliły reguły YARA. Wskazuje to na potencjalną obecność kodu Malware, złośliwych makr lub skompilowanych skryptów.\n");
-        
+        let _ = writeln!(
+            &mut log_out,
+            "[ 🚨 ] UWAGA! ODNALEZIONO {} ZAINFEKOWANYCH PLIKÓW:",
+            total_infected
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   [ ZNACZENIE ]: Pliki wyzwoliły reguły YARA. Wskazuje to na potencjalną obecność kodu Malware, złośliwych makr lub skompilowanych skryptów.\n"
+        );
+
         let write_section_txt = |out: &mut String, title: &str, stats: &CategoryStats| {
             if stats.count > 0 {
                 let _ = writeln!(out, "[ KATEGORIA ZNALEZISK: {} ]", title);
@@ -949,21 +1448,60 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
         };
 
-        write_section_txt(&mut log_out, "Część Wspólna (UFS Explorer)", &stats_common_ufs);
-        write_section_txt(&mut log_out, "Część Wspólna (Skrypt Autorski)", &stats_common_scr);
-        write_section_txt(&mut log_out, "Osobne ścieżki (Tylko UFS Explorer)", &stats_unique_ufs);
-        write_section_txt(&mut log_out, "Osobne ścieżki (Tylko Skrypt Autorski)", &stats_unique_scr);
+        write_section_txt(
+            &mut log_out,
+            "Część Wspólna (UFS Explorer)",
+            &stats_common_ufs,
+        );
+        write_section_txt(
+            &mut log_out,
+            "Część Wspólna (Skrypt Autorski)",
+            &stats_common_scr,
+        );
+        write_section_txt(
+            &mut log_out,
+            "Osobne ścieżki (Tylko UFS Explorer)",
+            &stats_unique_ufs,
+        );
+        write_section_txt(
+            &mut log_out,
+            "Osobne ścieżki (Tylko Skrypt Autorski)",
+            &stats_unique_scr,
+        );
     }
 
-    if total_io_errors > 0 {
+    let total_timeouts =
+        ufs_stats.timeouts.load(Ordering::SeqCst) + script_stats.timeouts.load(Ordering::SeqCst);
+    if total_io_errors > 0 || total_timeouts > 0 {
         let _ = writeln!(&mut log_out, "\n[ BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Błędy odczytu dysku: {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy odczytu dysku: {}",
+            total_io_errors
+        );
+        if total_timeouts > 0 {
+            let _ = writeln!(
+                &mut log_out,
+                "   -> Timeout silnika YARA (>10s/plik): {}",
+                total_timeouts
+            );
+            let _ = writeln!(
+                &mut log_out,
+                "      [ ZNACZENIE ]: Plik przekroczył limit czasu skanowania - patologicznie wolna reguła lub bardzo duży/złożony plik, nie uszkodzony dysk."
+            );
+        }
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -1017,8 +1555,22 @@ mod tests {
         stats.add("Trojan.Generic", "c.exe".to_string());
 
         assert_eq!(stats.count, 3);
-        assert_eq!(stats.rules.get("EICAR_Test").unwrap().0, 2);
-        assert_eq!(stats.rules.get("Trojan.Generic").unwrap().0, 1);
+        assert_eq!(
+            stats
+                .rules
+                .get("EICAR_Test")
+                .expect("Pobranie elementu z mapy lub słownika nie powiodło się")
+                .0,
+            2
+        );
+        assert_eq!(
+            stats
+                .rules
+                .get("Trojan.Generic")
+                .expect("Pobranie elementu z mapy lub słownika nie powiodło się")
+                .0,
+            1
+        );
     }
 
     #[test]
@@ -1027,7 +1579,14 @@ mod tests {
         stats.add("RuleA", "pierwszy.exe".to_string());
         stats.add("RuleA", "drugi.exe".to_string());
         // or_insert ustawia przykładową ścieżkę TYLKO przy pierwszym wystąpieniu
-        assert_eq!(stats.rules.get("RuleA").unwrap().1, "pierwszy.exe");
+        assert_eq!(
+            stats
+                .rules
+                .get("RuleA")
+                .expect("Pobranie elementu z mapy lub słownika nie powiodło się")
+                .1,
+            "pierwszy.exe"
+        );
     }
 
     #[test]
@@ -1062,7 +1621,10 @@ mod tests {
 
         let pos_czesta = out.find("Czesta").expect("powinno zawierać Czesta");
         let pos_rzadka = out.find("Rzadka").expect("powinno zawierać Rzadka");
-        assert!(pos_czesta < pos_rzadka, "Reguła z większą liczbą trafień powinna być wymieniona pierwsza");
+        assert!(
+            pos_czesta < pos_rzadka,
+            "Reguła z większą liczbą trafień powinna być wymieniona pierwsza"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1090,37 +1652,97 @@ mod tests {
 
         let stats_w_watku = Arc::clone(&stats);
         let _ = std::thread::spawn(move || {
-            let _guard = stats_w_watku.top_rules.lock().unwrap();
+            let _guard = stats_w_watku
+                .top_rules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             panic!("celowa panika testowa trzymając blokadę");
         })
         .join();
 
-        assert!(stats.top_rules.is_poisoned(), "Setup testu: muteks MUSI być zatruty");
+        assert!(
+            stats.top_rules.is_poisoned(),
+            "Setup testu: muteks MUSI być zatruty"
+        );
 
         stats.top_rules().insert("EICAR_Test".to_string(), 1);
-        assert_eq!(stats.top_rules().get("EICAR_Test"), Some(&1), "akcesor musi działać mimo zatrutego muteksu");
+        assert_eq!(
+            stats.top_rules().get("EICAR_Test"),
+            Some(&1),
+            "akcesor musi działać mimo zatrutego muteksu"
+        );
     }
 
     #[test]
     fn test_build_source_block_reports_top_rules_and_multi_rule_count() {
         use std::time::Duration;
         let stats = LiveStats::new(4);
-        stats.clean.store(100, Ordering::Relaxed);
-        stats.infected.store(5, Ordering::Relaxed);
-        stats.multi_rule_files.store(2, Ordering::Relaxed);
+        stats.clean_common.store(100, Ordering::Relaxed);
+        stats.infected_common.store(5, Ordering::Relaxed);
+        stats.multi_rule_files_common.store(2, Ordering::Relaxed);
         stats.top_rules().insert("EICAR_Test".to_string(), 3);
         stats.top_rules().insert("Trojan.Generic".to_string(), 8);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        assert!(block.contains("Czyste: 100"));
-        assert!(block.contains("Zainfekowane: 5"));
-        assert!(block.contains("Wiele reguł jednocześnie: 2"));
+        assert!(block.contains("Czyste: 100 wspólne / 0 unikalne"));
+        assert!(block.contains("Zainfekowane: 5 wspólne / 0 unikalne"));
+        assert!(block.contains("Wiele reguł jednocześnie: 2 wspólne / 0 unikalne"));
         // Trojan.Generic (8) powinien pojawić się przed EICAR_Test (3)
-        let pos_trojan = block.find("Trojan.Generic (8)").expect("powinien zawierać Trojan.Generic");
-        let pos_eicar = block.find("EICAR_Test (3)").expect("powinien zawierać EICAR_Test");
+        let pos_trojan = block
+            .find("Trojan.Generic (8)")
+            .expect("powinien zawierać Trojan.Generic");
+        let pos_eicar = block
+            .find("EICAR_Test (3)")
+            .expect("powinien zawierać EICAR_Test");
         assert!(pos_trojan < pos_eicar);
+    }
+
+    #[test]
+    fn test_build_source_block_splits_clean_infected_multi_common_unique() {
+        let stats = LiveStats::new(4);
+        stats.clean_common.store(10, Ordering::Relaxed);
+        stats.clean_unique.store(3, Ordering::Relaxed);
+        stats.infected_unique.store(2, Ordering::Relaxed);
+        stats.multi_rule_files_unique.store(1, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Czyste: 10 wspólne / 3 unikalne"));
+        assert!(block.contains("Zainfekowane: 0 wspólne / 2 unikalne"));
+        assert!(block.contains("Wiele reguł jednocześnie: 0 wspólne / 1 unikalne"));
+    }
+
+    #[test]
+    fn test_build_source_block_reports_timeouts_separately_from_io_errors() {
+        let stats = LiveStats::new(4);
+        stats.timeouts.store(3, Ordering::Relaxed);
+        stats.errors.store(5, Ordering::Relaxed);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Timeout silnika (>10s): 3"));
+        assert!(block.contains("Błędy I/O: 5"));
+    }
+
+    #[test]
+    fn test_build_source_block_shows_top_tags() {
+        let stats = LiveStats::new(4);
+        stats.tag_counts().insert("malware".to_string(), 4);
+        stats.tag_counts().insert("pii".to_string(), 1);
+
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        let pos_malware = block
+            .find("malware (4)")
+            .expect("powinien zawierać tag malware");
+        let pos_pii = block.find("pii (1)").expect("powinien zawierać tag pii");
+        assert!(pos_malware < pos_pii);
+    }
+
+    #[test]
+    fn test_build_source_block_placeholder_when_no_tags() {
+        let stats = LiveStats::new(4);
+        let block = build_source_block("UFS Explorer", &stats, Instant::now());
+        assert!(block.contains("Top tagi reguł (live): -"));
     }
 
     #[test]
@@ -1133,7 +1755,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki YARA")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki YARA"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki YARA (Wariant A): {G:1} {G:2}");
     }
 
@@ -1152,16 +1777,20 @@ mod tests {
 
     #[test]
     fn test_compile_rule_files_valid_rule_succeeds() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let rule_path = dir.path().join("test.yar");
-        std::fs::write(&rule_path, r#"
+        std::fs::write(
+            &rule_path,
+            r#"
             rule valid_rule {
                 strings:
                     $a = "TESTOWY_LADUNEK"
                 condition:
                     $a
             }
-        "#).unwrap();
+        "#,
+        )
+        .expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         let result = compile_rule_files(&[rule_path]);
         assert!(result.is_some(), "Poprawna reguła powinna się skompilować");
@@ -1169,12 +1798,16 @@ mod tests {
 
     #[test]
     fn test_compile_rule_files_syntax_error_returns_none() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let rule_path = dir.path().join("zla_skladnia.yar");
-        std::fs::write(&rule_path, "to nie jest poprawna regula yara { } (((").unwrap();
+        std::fs::write(&rule_path, "to nie jest poprawna regula yara { } (((")
+            .expect("Nie można zapisać danych do pliku");
 
         let result = compile_rule_files(&[rule_path]);
-        assert!(result.is_none(), "Błędna składnia powinna zwrócić None, nie panikować");
+        assert!(
+            result.is_none(),
+            "Błędna składnia powinna zwrócić None, nie panikować"
+        );
     }
 
     #[test]
@@ -1200,36 +1833,85 @@ mod tests {
                     $a
             }
         "#;
-        let compiler = Compiler::new().unwrap();
-        let compiler = compiler.add_rules_str(rule_src).expect("Reguła testowa powinna się skompilować");
-        compiler.compile_rules().expect("Kompilacja reguł powinna się powieść")
+        let compiler = Compiler::new().expect("Inicjalizacja kompilatora reguł nie powiodła się");
+        let compiler = compiler
+            .add_rules_str(rule_src)
+            .expect("Reguła testowa powinna się skompilować");
+        compiler
+            .compile_rules()
+            .expect("Kompilacja reguł powinna się powieść")
     }
 
     #[test]
     fn test_scan_file_yara_detects_matching_content() {
         let rules = compile_test_rule();
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"jakas tresc przed MALWARE_TEST_MARKER_XYZ i po nim").unwrap();
+        let mut f = NamedTempFile::new().expect("Nie można utworzyć tymczasowego pliku dla testu");
+        f.write_all(b"jakas tresc przed MALWARE_TEST_MARKER_XYZ i po nim")
+            .expect("Zapis danych do pliku nie powiódł się");
 
         let result = scan_file_yara(f.path(), "test.bin", "UFS Explorer", &rules);
-        let matched = result.expect("Skanowanie nie powinno zwrócić błędu");
-        assert_eq!(matched, Some("test_marker".to_string()));
+        let matched = result
+            .expect("Skanowanie nie powinno zwrócić błędu")
+            .expect("plik powinien wyzwolić regułę");
+        assert_eq!(matched.rule_names, "test_marker");
+        assert!(
+            matched.tags.is_empty(),
+            "reguła testowa nie deklaruje żadnych tagów"
+        );
+    }
+
+    #[test]
+    fn test_scan_file_yara_collects_deduplicated_sorted_tags() {
+        // Reguła z tagami - dowodzi, że parse_capability_names... err, że
+        // scan_file_yara wyciąga `Rule::tags` z DOWOLNEJ reguły w pliku,
+        // bez twardego wyliczenia nazw w kodzie tej fazy.
+        let rule_src = r#"
+            rule tagged_malware : malware pii {
+                strings:
+                    $a = "MALWARE_TEST_MARKER_XYZ"
+                condition:
+                    $a
+            }
+        "#;
+        let compiler = Compiler::new().expect("Inicjalizacja kompilatora reguł nie powiodła się");
+        let compiler = compiler
+            .add_rules_str(rule_src)
+            .expect("Dodanie reguł YARA z tekstu nie powiodło się");
+        let rules = compiler
+            .compile_rules()
+            .expect("Kompilacja reguł YARA nie powiodła się");
+
+        let mut f = NamedTempFile::new().expect("Nie można utworzyć tymczasowego pliku dla testu");
+        f.write_all(b"MALWARE_TEST_MARKER_XYZ")
+            .expect("Zapis danych do pliku nie powiódł się");
+
+        let result = scan_file_yara(f.path(), "test.bin", "UFS Explorer", &rules);
+        let matched = result
+            .expect("Skanowanie nie powinno zwrócić błędu")
+            .expect("plik powinien wyzwolić regułę");
+        assert_eq!(matched.tags, vec!["malware".to_string(), "pii".to_string()]);
     }
 
     #[test]
     fn test_scan_file_yara_clean_file_returns_none() {
         let rules = compile_test_rule();
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"zupelnie niewinna zawartosc pliku bez zadnych sygnatur").unwrap();
+        let mut f = NamedTempFile::new().expect("Nie można utworzyć tymczasowego pliku dla testu");
+        f.write_all(b"zupelnie niewinna zawartosc pliku bez zadnych sygnatur")
+            .expect("Zapis danych do pliku nie powiódł się");
 
         let result = scan_file_yara(f.path(), "test.bin", "UFS Explorer", &rules);
-        assert_eq!(result.unwrap(), None);
+        assert_eq!(result.expect("Wynik operacji powinien być obecny"), None);
     }
 
     #[test]
     fn test_scan_file_yara_nonexistent_file_is_error() {
         let rules = compile_test_rule();
-        let result = scan_file_yara(Path::new("/nieistniejaca/sciezka/plik.exe"), "plik.exe", "UFS Explorer", &rules);
+        let result = scan_file_yara(
+            Path::new("/nieistniejaca/sciezka/plik.exe"),
+            "plik.exe",
+            "UFS Explorer",
+            &rules,
+        );
         assert!(result.is_err());
     }
 
@@ -1245,22 +1927,31 @@ mod tests {
     fn audit_verify_clean_file_gets_scanned_flag_and_is_not_rescanned() {
         use crate::settings::Ustawienia;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let ufs_dir = dir.path().join("ufs");
         let script_dir = dir.path().join("script");
-        std::fs::create_dir_all(&ufs_dir).unwrap();
-        std::fs::create_dir_all(&script_dir).unwrap();
-        std::fs::write(ufs_dir.join("czysty.txt"), b"zupelnie niewinna zawartosc, bez zadnych sygnatur").unwrap();
+        std::fs::create_dir_all(&ufs_dir).expect("Nie można utworzyć katalogów nadrzędnych");
+        std::fs::create_dir_all(&script_dir).expect("Nie można utworzyć katalogów nadrzędnych");
+        std::fs::write(
+            ufs_dir.join("czysty.txt"),
+            b"zupelnie niewinna zawartosc, bez zadnych sygnatur",
+        )
+        .expect("Nie można zapisać danych do pliku");
 
         let log_dir = dir.path().join("logi");
-        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).expect("Nie można utworzyć katalogów nadrzędnych");
 
         let db_path = dir.path().join("audit.sqlite");
-        let mut conn = crate::db::init_db(db_path.to_str().unwrap()).unwrap();
+        let mut conn = crate::db::init_db(
+            db_path
+                .to_str()
+                .expect("Inicjalizacja bazy danych nie powiodła się"),
+        )
+        .expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script) VALUES ('czysty.txt', 1, 0)",
             [],
-        ).unwrap();
+        ).expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         let mut cfg = Ustawienia::default();
         cfg.ufs_path = ufs_dir.to_string_lossy().to_string();
@@ -1269,18 +1960,21 @@ mod tests {
         cfg.io_mode = "SEQUENTIAL".to_string();
         cfg.max_threads = 1;
 
-        let rules1 = compile_rule_files(&[]).unwrap();
+        let rules1 = compile_rule_files(&[]).expect("Inicjalizacja bazy danych nie powiodła się");
         let (tx1, rx1) = mpsc::channel();
-        std::thread::spawn(move || { while rx1.recv().is_ok() {} });
-        run(&mut conn, &cfg, tx1, rules1).unwrap();
+        std::thread::spawn(move || while rx1.recv().is_ok() {});
+        run(&mut conn, &cfg, tx1, rules1).expect("Wykonanie procedury głównej nie powiodło się");
 
         let (scanned_ufs, phase16_done, yara_match_ufs): (Option<bool>, Option<bool>, Option<String>) = conn.query_row(
             "SELECT yara_scanned_ufs, phase16_done, yara_match_ufs FROM files WHERE relative_path = 'czysty.txt'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
+        ).expect("Wykonanie procedury głównej nie powiodło się");
 
-        eprintln!("PO 1. PRZEBIEGU: yara_scanned_ufs={:?} phase16_done={:?} yara_match_ufs={:?}", scanned_ufs, phase16_done, yara_match_ufs);
+        eprintln!(
+            "PO 1. PRZEBIEGU: yara_scanned_ufs={:?} phase16_done={:?} yara_match_ufs={:?}",
+            scanned_ufs, phase16_done, yara_match_ufs
+        );
 
         // Uruchamiamy DRUGI raz na tej samej bazie - jeśli bug NIE jest naprawiony,
         // plik czysty wpadnie ponownie do ufs_tasks (widoczne po zerowym total_db_rows
@@ -1288,14 +1982,32 @@ mod tests {
         let mut stmt = conn.prepare(
             "SELECT id, relative_path, found_in_ufs, found_in_script, yara_match_ufs, yara_match_script, io_error_ufs, io_error_script, yara_scanned_ufs, yara_scanned_script
              FROM files WHERE phase16_done = 0 OR phase16_done IS NULL"
-        ).unwrap();
-        let would_rescan_count = stmt.query_map([], |row| row.get::<_, i32>(0)).unwrap().filter_map(|r| r.ok()).count();
+        ).expect("Wykonanie procedury głównej nie powiodło się");
+        let would_rescan_count = stmt
+            .query_map([], |row| row.get::<_, i32>(0))
+            .expect("Wykonanie procedury głównej nie powiodło się")
+            .filter_map(|r| r.ok())
+            .count();
         drop(stmt);
 
-        eprintln!("LICZBA WIERSZY KTÓRE ZOSTANĄ PONOWNIE ZAKOLEJKOWANE (phase16_done != 1): {}", would_rescan_count);
+        eprintln!(
+            "LICZBA WIERSZY KTÓRE ZOSTANĄ PONOWNIE ZAKOLEJKOWANE (phase16_done != 1): {}",
+            would_rescan_count
+        );
 
-        assert_eq!(scanned_ufs, Some(true), "yara_scanned_ufs powinno być ustawione na 1 po przebiegu skanowania pliku czystego");
-        assert_eq!(phase16_done, Some(true), "phase16_done powinno być 1 dla pliku czystego po zakończeniu skanowania jego jedynej strony");
-        assert_eq!(would_rescan_count, 0, "Plik czysty NIE powinien zostać ponownie zakolejkowany do skanowania w kolejnym przebiegu");
+        assert_eq!(
+            scanned_ufs,
+            Some(true),
+            "yara_scanned_ufs powinno być ustawione na 1 po przebiegu skanowania pliku czystego"
+        );
+        assert_eq!(
+            phase16_done,
+            Some(true),
+            "phase16_done powinno być 1 dla pliku czystego po zakończeniu skanowania jego jedynej strony"
+        );
+        assert_eq!(
+            would_rescan_count, 0,
+            "Plik czysty NIE powinien zostać ponownie zakolejkowany do skanowania w kolejnym przebiegu"
+        );
     }
 }

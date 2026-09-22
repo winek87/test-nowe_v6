@@ -1,18 +1,18 @@
 // src/utils.rs
 //! Moduł z centralnymi narzędziami (utilities) dla silnika walidacji.
-//! 
+//!
 //! Posiada turbodoładowany strumień kryptograficzny (BLAKE3 + mmap),
-//! Hybrydowy Silnik Walidacji (infer + exiftool-rs + fast-text-check) 
+//! Hybrydowy Silnik Walidacji (infer + exiftool-rs + fast-text-check)
 //! do wykrywania fałszerstw rozszerzeń oraz globalne formatowanie danych.
 
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-use tracing::{debug, error, info, instrument, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, error, info, instrument, warn};
 
-/// Globalna flaga bezpiecznego przerwania (Ctrl+C). 
+/// Globalna flaga bezpiecznego przerwania (Ctrl+C).
 /// Jeśli true, wszystkie fazy natychmiast przerywają pracę i zapisują postęp.
 pub static CANCEL_SIGNAL: AtomicBool = AtomicBool::new(false);
 
@@ -46,15 +46,19 @@ pub fn zdejmij_przerwanie() {
 // FORMATOWANIE UI I DANYCH
 // ============================================================================
 
-/// Przygotowuje pełną ścieżkę do wyświetlenia na ekranie terminala. 
+/// Przygotowuje pełną ścieżkę do wyświetlenia na ekranie terminala.
 /// Posiada zabezpieczenie przed emotikonami i znakami kontrolnymi ukrytymi w nazwach plików,
 /// które mogłyby zepsuć bufor rysowania (Anti-Terminal-Breaking).
 pub fn format_display_path(full_path: &str) -> String {
     let sanitize = |c: char| {
-        if c.is_control() { return '_'; }
+        if c.is_control() {
+            return '_';
+        }
 
         let cp = c as u32;
-        if cp <= 0x25FF { return c; }
+        if cp <= 0x25FF {
+            return c;
+        }
 
         // REGRESJA (todo.core_infra.md): próg `> 0x25FF` blokował WSZYSTKO
         // powyżej tej wartości bez rozróżnienia - w tym całe legalne
@@ -65,8 +69,7 @@ pub fn format_display_path(full_path: &str) -> String {
         // dopuszczamy te bloki, zachowując blokadę dla wszystkiego innego
         // powyżej progu (w tym emoji, które nadal ma zostać zablokowane -
         // stąd próg pozostaje, nie jest usuwany całkowicie).
-        let jest_dopuszczonym_alfabetem =
-            (0x1100..=0x11FF).contains(&cp)    // Hangul Jamo
+        let jest_dopuszczonym_alfabetem = (0x1100..=0x11FF).contains(&cp)    // Hangul Jamo
             || (0x3000..=0x303F).contains(&cp) // Interpunkcja CJK (、。「」)
             || (0x3040..=0x30FF).contains(&cp) // Hiragana + Katakana
             || (0x3400..=0x4DBF).contains(&cp) // CJK Unified Ideographs Extension A
@@ -87,11 +90,55 @@ pub fn format_bytes(bytes: u64) -> String {
     const GB: u64 = MB * 1024;
     const TB: u64 = GB * 1024;
 
-    if bytes >= TB { format!("{:.2} TB", bytes as f64 / TB as f64) }
-    else if bytes >= GB { format!("{:.2} GB", bytes as f64 / GB as f64) }
-    else if bytes >= MB { format!("{:.2} MB", bytes as f64 / MB as f64) }
-    else if bytes >= KB { format!("{:.2} KB", bytes as f64 / KB as f64) }
-    else { format!("{} B", bytes) }
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+// ============================================================================
+// ZNAKOWANIE CZASOWE RAPORTÓW I LOGÓW
+// ============================================================================
+
+/// Zwraca znacznik bieżącej chwili (czas lokalny) w formacie bezpiecznym dla
+/// nazw plików na każdym systemie plików — bez dwukropków. Wołane RAZ na
+/// początku `run()` każdej fazy i przekazywane do [`stamp_filename`] dla
+/// każdej ścieżki raportu/logu tej samej fazy, żeby wszystkie pliki jednego
+/// przebiegu (operacyjny, dziennik końcowy, info, debug) niosły IDENTYCZNY
+/// znacznik.
+pub fn run_timestamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
+}
+
+/// Znacznik czasu DO WNĘTRZA linii logu (nie do nazwy pliku) — milisekundowa
+/// precyzja, żeby dało się odróżnić kolejne pliki przetworzone w ułamku
+/// sekundy. Współdzielony format między liniami "Start"/"Koniec" logu info
+/// (patrz `process_side_stream` w poszczególnych fazach) i `DebugLog::log`.
+pub fn log_timestamp() -> String {
+    chrono::Local::now().format("%H:%M:%S%.3f").to_string()
+}
+
+/// Wstawia znacznik czasu PRZED rozszerzeniem nazwy pliku — np.
+/// `stamp_filename("raport_operacyjny_faza11.txt", "2026-09-22_18-42-05")`
+/// daje `"raport_operacyjny_faza11_2026-09-22_18-42-05.txt"`.
+///
+/// REGRESJA (zgłoszenie użytkownika): każde uruchomienie fazy nadpisywało
+/// `File::create` poprzedni raport tej samej fazy bez śladu — druga sesja
+/// skanowania tego samego korpusu bezpowrotnie kasowała dowód z pierwszej.
+/// Znacznik czasu w nazwie pliku sprawia, że KAŻDE uruchomienie dostaje
+/// własny, odrębny plik; stare przebiegi zostają obok, nic nie znika.
+pub fn stamp_filename(base: &str, stamp: &str) -> String {
+    match base.rfind('.') {
+        Some(pos) if pos > 0 => format!("{}_{}{}", &base[..pos], stamp, &base[pos..]),
+        _ => format!("{}_{}", base, stamp),
+    }
 }
 
 // ============================================================================
@@ -104,7 +151,7 @@ pub fn format_bytes(bytes: u64) -> String {
 const CANCEL_CHECK_CHUNK: usize = 8 * 1024 * 1024; // 8 MB
 
 /// Weryfikuje integralność danych z prędkością fizycznego nośnika.
-/// Dla małych plików używa szybkiego bufora w RAM, 
+/// Dla małych plików używa szybkiego bufora w RAM,
 /// dla dużych (>16MB) używa Zero-Copy (mmap) oraz akceleracji SIMD / Rayon.
 ///
 /// UWAGA: Sprawdza globalny `CANCEL_SIGNAL` cyklicznie w trakcie hashowania
@@ -124,22 +171,27 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
     let file_size = meta.len();
 
     // Próg odcięcia: 16 MB. Powyżej tej wagi opłaca się alokować stronę wirtualną (mmap).
-    const MMAP_THRESHOLD: u64 = 16 * 1024 * 1024; 
+    const MMAP_THRESHOLD: u64 = 16 * 1024 * 1024;
 
     if file_size >= MMAP_THRESHOLD {
         debug!("Plik >16MB. Aktywacja Memory Mapping (mmap) i wielowątkowości Rayon.");
         // Używamy mmap by ominąć narzut kopiowania jądra systemu (Syscall -> RAM -> User Space)
-        let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| {
-            error!(error = %e, "Krytyczny błąd alokacji mmap. Dysk odłączony?");
-            e
-        })? };
+        let mmap = unsafe {
+            MmapOptions::new().map(&file).map_err(|e| {
+                error!(error = %e, "Krytyczny błąd alokacji mmap. Dysk odłączony?");
+                e
+            })?
+        };
 
         // Dzielimy mmap na segmenty, żeby móc sprawdzić CANCEL_SIGNAL między nimi.
         // Nadal Zero-Copy — to tylko granice pętli po tym samym buforze pamięci.
         for segment in mmap.chunks(CANCEL_CHECK_CHUNK) {
             if CANCEL_SIGNAL.load(Ordering::Relaxed) {
                 warn!("Hashowanie przerwane przez użytkownika (Ctrl+C) w trakcie mmap.");
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "Hashowanie anulowane przez użytkownika"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Hashowanie anulowane przez użytkownika",
+                ));
             }
             hasher.update(segment);
         }
@@ -147,18 +199,23 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
         // Dla drobnicy używamy standardowego odczytu by nie zaśmiecać tablicy stron (Page Table)
         let mut buffer = [0u8; 131_072]; // 128KB pakiety dyskowe (I/O na sterydach)
         let mut reader = io::BufReader::with_capacity(262_144, file);
-        
+
         loop {
             if CANCEL_SIGNAL.load(Ordering::Relaxed) {
                 warn!("Hashowanie przerwane przez użytkownika (Ctrl+C) w trakcie odczytu bufora.");
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "Hashowanie anulowane przez użytkownika"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Hashowanie anulowane przez użytkownika",
+                ));
             }
 
             let count = reader.read(&mut buffer).map_err(|e| {
                 warn!(error = %e, "Przerwano strumieniowanie. Potencjalny błąd sektora dysku.");
                 e
             })?;
-            if count == 0 { break; }
+            if count == 0 {
+                break;
+            }
             hasher.update(&buffer[..count]);
         }
     }
@@ -174,7 +231,8 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
 /// Weryfikuje strukturę i prawdziwe pochodzenie pliku na podstawie nagłówków.
 #[instrument(level = "debug", skip(path), fields(path = %path.display()))]
 pub fn check_magic(path: &Path) -> Option<bool> {
-    let file_name = path.file_name()
+    let file_name = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
@@ -202,31 +260,67 @@ pub fn check_magic(path: &Path) -> Option<bool> {
     }
 
     let parts: Vec<&str> = file_name.split('.').filter(|s| !s.is_empty()).collect();
-    let ext_parts = if parts.len() > 1 { &parts[1..] } else { &parts[0..] };
+    let ext_parts = if parts.len() > 1 {
+        &parts[1..]
+    } else {
+        &parts[0..]
+    };
 
     // ETAP 1: Szybki rzut okiem do wbudowanej bazy (biblioteka `infer`)
     match infer::get_from_path(path) {
         Ok(Some(kind)) => {
             let kind_ext = kind.extension();
             let matches = ext_parts.iter().any(|&ext| {
-                kind_ext == ext || matches!((kind_ext, ext), 
-                    ("jpg", "jpeg") | ("jpeg", "jpg") |
-                    ("tif", "tiff") | ("tiff", "tif") |
-                    ("tif", "dng") | ("tiff", "dng") | ("tif", "cr2") | ("tif", "nef") | ("tif", "arw") |
-                    ("heic", "heif") | ("heif", "heic") | ("heic", "hef") | ("heif", "hef") |
-                    ("mp4", "m4v") | ("mov", "mp4") | ("mp4", "mov") |
-                    ("mkv", "webm") | ("webm", "mkv") |
-                    ("mpeg", "mpg") | ("mpg", "mpeg") | ("mpeg", "ts") | ("mpg", "ts") |
-                    ("ogg", "ogv") | ("ogg", "oga") | ("ogg", "ogx") |
-                    ("flv", "f4v") |
-                    ("zip", "docx") | ("zip", "xlsx") | ("zip", "pptx") |
-                    ("zip", "odt") | ("zip", "ods") | ("zip", "odp") |
-                    ("zip", "epub") | ("zip", "apk") | ("zip", "jar") |
-                    ("gz", "tar") | ("bz2", "tar") | ("7z", "tar") | ("rar", "tar") |
-                    ("sqlite", "db") | ("sqlite", "sqlite3") | ("sqlite3", "db") |
-                    ("htm", "html") | ("html", "htm") |
-                    ("mid", "midi") | ("midi", "mid")
-                )
+                kind_ext == ext
+                    || matches!(
+                        (kind_ext, ext),
+                        ("jpg", "jpeg")
+                            | ("jpeg", "jpg")
+                            | ("tif", "tiff")
+                            | ("tiff", "tif")
+                            | ("tif", "dng")
+                            | ("tiff", "dng")
+                            | ("tif", "cr2")
+                            | ("tif", "nef")
+                            | ("tif", "arw")
+                            | ("heic", "heif")
+                            | ("heif", "heic")
+                            | ("heic", "hef")
+                            | ("heif", "hef")
+                            | ("mp4", "m4v")
+                            | ("mov", "mp4")
+                            | ("mp4", "mov")
+                            | ("mkv", "webm")
+                            | ("webm", "mkv")
+                            | ("mpeg", "mpg")
+                            | ("mpg", "mpeg")
+                            | ("mpeg", "ts")
+                            | ("mpg", "ts")
+                            | ("ogg", "ogv")
+                            | ("ogg", "oga")
+                            | ("ogg", "ogx")
+                            | ("flv", "f4v")
+                            | ("zip", "docx")
+                            | ("zip", "xlsx")
+                            | ("zip", "pptx")
+                            | ("zip", "odt")
+                            | ("zip", "ods")
+                            | ("zip", "odp")
+                            | ("zip", "epub")
+                            | ("zip", "apk")
+                            | ("zip", "jar")
+                            | ("gz", "tar")
+                            | ("bz2", "tar")
+                            | ("7z", "tar")
+                            | ("rar", "tar")
+                            | ("sqlite", "db")
+                            | ("sqlite", "sqlite3")
+                            | ("sqlite3", "db")
+                            | ("htm", "html")
+                            | ("html", "htm")
+                            | ("mid", "midi")
+                            | ("midi", "mid")
+                    )
             });
 
             if !matches {
@@ -245,7 +339,12 @@ pub fn check_magic(path: &Path) -> Option<bool> {
                     if bytes_read == 0 {
                         return Some(true); // Pusty plik to wciąż poprawny plik
                     }
-                    let printable = buf[..bytes_read].iter().filter(|&&b| (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t').count();
+                    let printable = buf[..bytes_read]
+                        .iter()
+                        .filter(|&&b| {
+                            (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t'
+                        })
+                        .count();
                     if (printable as f32 / bytes_read as f32) > 0.90 {
                         info!("Oszczędzono procesor: Wykryto bezpieczny kod źródłowy/tekst.");
                         return Some(true);
@@ -254,19 +353,25 @@ pub fn check_magic(path: &Path) -> Option<bool> {
             }
 
             // ETAP 3: Ciężki Parser (exiftool_rs)
-            debug!("Zupa binarna nierozpoznana przez 'infer'. Odpalam ciężki analizator exiftool_rs.");
+            debug!(
+                "Zupa binarna nierozpoznana przez 'infer'. Odpalam ciężki analizator exiftool_rs."
+            );
             if let Ok(meta) = exiftool_rs::image_info(path.to_str().unwrap_or(""))
-                && let Some(mime) = meta.get("MIMEType") {
-                    let mime_str = mime.to_lowercase();
-                    if mime_str.starts_with("text/") || mime_str == "application/json" || mime_str == "application/xml" {
-                        return Some(true);
-                    } else {
-                        warn!(
-                            wykryte_mime = %mime_str,
-                            "Zapisano w dzienniku: Plik posiada wadliwe formatowanie systemowe."
-                        );
-                    }
+                && let Some(mime) = meta.get("MIMEType")
+            {
+                let mime_str = mime.to_lowercase();
+                if mime_str.starts_with("text/")
+                    || mime_str == "application/json"
+                    || mime_str == "application/xml"
+                {
+                    return Some(true);
+                } else {
+                    warn!(
+                        wykryte_mime = %mime_str,
+                        "Zapisano w dzienniku: Plik posiada wadliwe formatowanie systemowe."
+                    );
                 }
+            }
             Some(true)
         }
         Err(e) => {
@@ -299,10 +404,26 @@ mod tests {
     /// urządzeń japońskich/koreańskich) i muszą przechodzić bez zmian.
     #[test]
     fn test_znaki_cjk_i_hangul_przechodza_bez_zmian() {
-        assert_eq!(format_display_path("/dane/写真.jpg"), "/dane/写真.jpg", "CJK Unified Ideographs");
-        assert_eq!(format_display_path("/dane/ひらがな.jpg"), "/dane/ひらがな.jpg", "Hiragana");
-        assert_eq!(format_display_path("/dane/カタカナ.jpg"), "/dane/カタカナ.jpg", "Katakana");
-        assert_eq!(format_display_path("/dane/한글파일.jpg"), "/dane/한글파일.jpg", "Hangul Syllables");
+        assert_eq!(
+            format_display_path("/dane/写真.jpg"),
+            "/dane/写真.jpg",
+            "CJK Unified Ideographs"
+        );
+        assert_eq!(
+            format_display_path("/dane/ひらがな.jpg"),
+            "/dane/ひらがな.jpg",
+            "Hiragana"
+        );
+        assert_eq!(
+            format_display_path("/dane/カタカナ.jpg"),
+            "/dane/カタカナ.jpg",
+            "Katakana"
+        );
+        assert_eq!(
+            format_display_path("/dane/한글파일.jpg"),
+            "/dane/한글파일.jpg",
+            "Hangul Syllables"
+        );
     }
 
     /// Kontrola pozytywna: naprawa nie może wyłączyć blokady w ogóle -
@@ -311,7 +432,11 @@ mod tests {
     #[test]
     fn test_prawdziwe_emoji_nadal_jest_blokowane() {
         let wynik = format_display_path("/dane/plik😀.jpg");
-        assert!(!wynik.contains('😀'), "emoji musi zostać zablokowane: {}", wynik);
+        assert!(
+            !wynik.contains('😀'),
+            "emoji musi zostać zablokowane: {}",
+            wynik
+        );
         assert_eq!(wynik, "/dane/plik_.jpg");
     }
 
@@ -329,10 +454,47 @@ mod tests {
         assert_eq!(format_bytes(1073741824), "1.00 GB");
     }
 
+    // ------------------------------------------------------------------
+    // stamp_filename / run_timestamp
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_stamp_filename_inserts_before_extension() {
+        assert_eq!(
+            stamp_filename("raport_operacyjny_faza11.txt", "2026-09-22_18-42-05"),
+            "raport_operacyjny_faza11_2026-09-22_18-42-05.txt"
+        );
+    }
+
+    #[test]
+    fn test_stamp_filename_without_extension_appends_at_end() {
+        assert_eq!(stamp_filename("bez_rozszerzenia", "STAMP"), "bez_rozszerzenia_STAMP");
+    }
+
+    #[test]
+    fn test_stamp_filename_leading_dot_not_treated_as_extension_boundary() {
+        // Plik zaczynający się od kropki (ukryty w konwencji Unix) - kropka
+        // na pozycji 0 nie jest granicą rozszerzenia, znacznik trafia na koniec.
+        assert_eq!(stamp_filename(".gitignore", "STAMP"), ".gitignore_STAMP");
+    }
+
+    #[test]
+    fn test_run_timestamp_has_no_colons_and_expected_shape() {
+        let stamp = run_timestamp();
+        assert!(!stamp.contains(':'), "znacznik w nazwie pliku nie może zawierać dwukropków: {}", stamp);
+        // "YYYY-MM-DD_HH-MM-SS" = dokładnie 19 znaków.
+        assert_eq!(stamp.len(), 19, "nieoczekiwany kształt znacznika: {}", stamp);
+        assert_eq!(stamp.matches('-').count(), 4);
+        assert_eq!(stamp.matches('_').count(), 1);
+    }
+
     #[test]
     fn test_hash_file_correctness() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"Weryfikator3a Kryminalistyka").unwrap();
+        let mut temp_file =
+            NamedTempFile::new().expect("Nie udało się utworzyć pliku tymczasowego");
+        temp_file
+            .write_all(b"Weryfikator3a Kryminalistyka")
+            .expect("Nie udało się zapisać danych do pliku tymczasowego");
         let hash = hash_file(temp_file.path()).expect("Nie udało się zhashować");
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64);
@@ -348,8 +510,11 @@ mod tests {
         // Weryfikuje, że hash_file() natychmiast przerywa pracę i zwraca
         // ErrorKind::Interrupted, gdy globalny CANCEL_SIGNAL jest już ustawiony
         // przed rozpoczęciem odczytu (ścieżka buforowana, plik < 16MB).
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"Dane testowe do przerwanego hashowania").unwrap();
+        let mut temp_file =
+            NamedTempFile::new().expect("Nie udało się utworzyć pliku tymczasowego");
+        temp_file
+            .write_all(b"Dane testowe do przerwanego hashowania")
+            .expect("Nie udało się zapisać danych do pliku tymczasowego");
 
         CANCEL_SIGNAL.store(true, Ordering::SeqCst);
         let result = hash_file(temp_file.path());
@@ -363,10 +528,14 @@ mod tests {
 
     #[test]
     fn test_fast_text_heuristic_bypasses_exiftool() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"{\"status\": \"ok\", \"value\": 1}").unwrap();
+        let mut temp_file =
+            NamedTempFile::new().expect("Nie udało się utworzyć pliku tymczasowego");
+        temp_file
+            .write_all(b"{\"status\": \"ok\", \"value\": 1}")
+            .expect("Nie udało się zapisać danych do pliku tymczasowego");
         let new_path = temp_file.path().with_extension("nietypowe_rozszerzenie");
-        std::fs::rename(temp_file.path(), &new_path).unwrap();
+        std::fs::rename(temp_file.path(), &new_path)
+            .expect("Nie udało się zmienić nazwy pliku w teście");
 
         let is_ok = check_magic(&new_path);
         assert_eq!(is_ok, Some(true));
@@ -382,42 +551,80 @@ mod tests {
     /// dostać fałszywego alarmu "Spoofing", nawet gdy rozpoznawalna binarnie
     /// (dokładnie odwrotność tego, co narzędzie ma wykrywać).
     #[test]
-    fn test_ukryty_plik_bez_prawdziwego_rozszerzenia_nie_dostaje_falszywego_alarmu() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_ukryty_plik_bez_prawdziwego_rozszerzenia_nie_dostaje_falszywego_alarmu()
+    -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
         let sciezka = dir.path().join(".ukryty_bez_rozszerzenia");
-        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+        std::fs::write(&sciezka, GZIP_MAGIC)?;
 
         assert_eq!(
-            check_magic(&sciezka), Some(true),
+            check_magic(&sciezka),
+            Some(true),
             "plik ukryty BEZ prawdziwego rozszerzenia nie może dostać fałszywego alarmu spoofing"
         );
+        Ok(())
     }
+    //    #[test]
+    //    fn test_ukryty_plik_bez_prawdziwego_rozszerzenia_nie_dostaje_falszywego_alarmu() {
+    //        let dir = tempfile::tempdir().unwrap();
+    //        let sciezka = dir.path().join(".ukryty_bez_rozszerzenia");
+    //        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+    //
+    //        assert_eq!(
+    //            check_magic(&sciezka), Some(true),
+    //            "plik ukryty BEZ prawdziwego rozszerzenia nie może dostać fałszywego alarmu spoofing"
+    //        );
+    //    }
 
     /// Kontrola pozytywna: gdy ukryty plik MA realne (drugie) rozszerzenie,
     /// wykrywanie fałszerstwa musi nadal działać poprawnie - naprawa dotyczy
     /// wyłącznie przypadku "brak rozszerzenia", nie wyłącza detekcji w ogóle.
     #[test]
-    fn test_ukryty_plik_z_prawdziwym_zlym_rozszerzeniem_nadal_wykrywa_spoofing() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_ukryty_plik_z_prawdziwym_zlym_rozszerzeniem_nadal_wykrywa_spoofing() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
         let sciezka = dir.path().join(".ukryty.txt");
-        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+        std::fs::write(&sciezka, GZIP_MAGIC)?;
 
         assert_eq!(
-            check_magic(&sciezka), Some(false),
+            check_magic(&sciezka),
+            Some(false),
             "GZIP zadeklarowany jako .txt musi zostać wykryty jako spoofing, nawet dla pliku ukrytego"
         );
+        Ok(())
     }
+
+    //    #[test]
+    //    fn test_ukryty_plik_z_prawdziwym_zlym_rozszerzeniem_nadal_wykrywa_spoofing() {
+    //        let dir = tempfile::tempdir().unwrap();
+    //        let sciezka = dir.path().join(".ukryty.txt");
+    //        std::fs::write(&sciezka, GZIP_MAGIC).unwrap();
+    //
+    //        assert_eq!(
+    //            check_magic(&sciezka), Some(false),
+    //            "GZIP zadeklarowany jako .txt musi zostać wykryty jako spoofing, nawet dla pliku ukrytego"
+    //        );
+    //    }
 
     /// Skrajny przypadek: nazwa złożona z samych kropek nie może panikować
     /// (regresja od strony bezpieczeństwa naprawy - `parts` może wyjść puste).
     #[test]
-    fn test_nazwa_z_samych_kropek_nie_panikuje() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_nazwa_z_samych_kropek_nie_panikuje() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
         let sciezka = dir.path().join("...");
-        std::fs::write(&sciezka, b"cokolwiek").unwrap();
+        std::fs::write(&sciezka, b"cokolwiek")?;
 
         let _ = check_magic(&sciezka);
+        Ok(())
     }
+
+    //    #[test]
+    //    fn test_nazwa_z_samych_kropek_nie_panikuje() {
+    //        let dir = tempfile::tempdir().unwrap();
+    //        let sciezka = dir.path().join("...");
+    //        std::fs::write(&sciezka, b"cokolwiek").unwrap();
+    //
+    //        let _ = check_magic(&sciezka);
+    //    }
 
     // ------------------------------------------------------------------
     // POGODZENIE ZNACZNIKÓW PRZERWANIA MIĘDZY BIBLIOTEKAMI
@@ -443,14 +650,20 @@ mod tests {
         assert!(!mp4_doctor::SHUTDOWN_FLAG.load(Ordering::SeqCst));
 
         podnies_przerwanie();
-        assert!(CANCEL_SIGNAL.load(Ordering::SeqCst), "nasz znacznik musi zostać podniesiony");
+        assert!(
+            CANCEL_SIGNAL.load(Ordering::SeqCst),
+            "nasz znacznik musi zostać podniesiony"
+        );
         assert!(
             mp4_doctor::SHUTDOWN_FLAG.load(Ordering::SeqCst),
             "znacznik mp4_doctor też - inaczej jego wątki pracują po Ctrl+C"
         );
 
         zdejmij_przerwanie();
-        assert!(!CANCEL_SIGNAL.load(Ordering::SeqCst), "zdjęcie musi działać w drugą stronę");
+        assert!(
+            !CANCEL_SIGNAL.load(Ordering::SeqCst),
+            "zdjęcie musi działać w drugą stronę"
+        );
         assert!(!mp4_doctor::SHUTDOWN_FLAG.load(Ordering::SeqCst));
 
         // Przywrócenie stanu wyjściowego procesu.
@@ -481,7 +694,7 @@ mod tests {
     /// więc oba możliwe wyniki wyścigu, zamiast zakładać jeden z nich.
     #[test]
     fn test_katalog_przestrzeni_mp4_doctor_daje_sie_wskazac() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie udało się utworzyć katalogu tymczasowego");
         let cel = dir.path().join("_mp4_doctor");
 
         let ustawiono = mp4_doctor::workspace::ustaw_katalog_przestrzeni(cel.clone());
@@ -496,17 +709,32 @@ mod tests {
                 !mp4_doctor::workspace::ustaw_katalog_przestrzeni(dir.path().join("inny")),
                 "drugie wskazanie musi zostać odrzucone"
             );
-            assert_eq!(mp4_doctor::workspace::katalog_przestrzeni(), cel, "katalog nie mógł się zmienić");
+            assert_eq!(
+                mp4_doctor::workspace::katalog_przestrzeni(),
+                cel,
+                "katalog nie mógł się zmienić"
+            );
 
             // I skutek praktyczny: przestrzeń robocza powstaje pod wskazanym
             // katalogiem, razem z plikiem bazy wiedzy.
             let ws = mp4_doctor::workspace::Workspace::init("sprawa_testowa")
                 .expect("przestrzeń robocza musi się utworzyć");
 
-            assert!(ws.root_dir.starts_with(&cel), "korzeń przestrzeni: {}", ws.root_dir.display());
-            assert!(ws.db_path.starts_with(&cel), "baza wiedzy: {}", ws.db_path.display());
+            assert!(
+                ws.root_dir.starts_with(&cel),
+                "korzeń przestrzeni: {}",
+                ws.root_dir.display()
+            );
+            assert!(
+                ws.db_path.starts_with(&cel),
+                "baza wiedzy: {}",
+                ws.db_path.display()
+            );
             assert!(ws.root_dir.exists(), "katalogi muszą powstać fizycznie");
-            assert!(cel.join("sprawa_testowa").exists(), "przestrzeń musi leżeć pod WSKAZANYM katalogiem");
+            assert!(
+                cel.join("sprawa_testowa").exists(),
+                "przestrzeń musi leżeć pod WSKAZANYM katalogiem"
+            );
         } else {
             // Przegraliśmy wyścig z innym testem tej samej binarki (np.
             // `phase17_repair`'owym `run()`) — katalog jest już zajęty przez
@@ -514,14 +742,20 @@ mod tests {
             // faktycznie istniejący katalog, a nie NASZ `cel` — bo `cel`
             // nigdy nie wygrał.
             let aktywny = mp4_doctor::workspace::katalog_przestrzeni();
-            assert_ne!(aktywny, cel, "skoro przegraliśmy, katalog NIE MOŻE być naszym `cel`");
+            assert_ne!(
+                aktywny, cel,
+                "skoro przegraliśmy, katalog NIE MOŻE być naszym `cel`"
+            );
 
             let ws = mp4_doctor::workspace::Workspace::init("sprawa_testowa_przegrany_wyscig")
                 .expect("przestrzeń robocza musi się utworzyć nawet po przegranym wyścigu");
-            assert!(ws.root_dir.starts_with(&aktywny), "korzeń przestrzeni: {}", ws.root_dir.display());
+            assert!(
+                ws.root_dir.starts_with(&aktywny),
+                "korzeń przestrzeni: {}",
+                ws.root_dir.display()
+            );
             assert!(ws.root_dir.exists(), "katalogi muszą powstać fizycznie");
         }
-
         // Asercję w formie „nic nie powstało w ./workspaces" świadomie
         // odrzuciłem: zależy od całej historii procesu i katalogu roboczego,
         // więc padała od śmiecia zostawionego przez inny przebieg. Forma

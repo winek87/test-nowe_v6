@@ -1,34 +1,34 @@
 // src/menu/actions.rs
 
 //! # Moduł Akcji (Wykonawca Zadań / Orkiestrator Ratatui)
-//! Serce systemu kryminalistycznego. Odbiera polecenia z Menu, uruchamia 
-//! poszczególne Fazy w tle na osobnych wątkach, nasłuchuje ich komunikatów MPSC 
+//! Serce systemu kryminalistycznego. Odbiera polecenia z Menu, uruchamia
+//! poszczególne Fazy w tle na osobnych wątkach, nasłuchuje ich komunikatów MPSC
 //! i na żywo rysuje złożony, podzielony na sekcje interfejs TUI.
 
-use crate::menu::state::AppState;
 use crate::menu::settings_actions::{self, SettingsUiState};
+use crate::menu::state::AppState;
 use crate::settings::Ustawienia;
-use crate::{diag, dng_repair, duplicate_finder, phases, reset, workspace_cleanup};
 use crate::tui::state::{PhaseEvent, PhaseUIState};
+use crate::{diag, dng_repair, duplicate_finder, phases, reset, workspace_cleanup};
 
 use colored::Colorize;
 use crossterm::{
     event::{self, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, TableState},
-    Terminal,
 };
 
 use rusqlite::Connection;
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -39,7 +39,10 @@ use tracing::{debug, info, warn};
 /// Fazy 16, albo listą aktywnych modułów naprawczych dla Fazy 17) trafiać
 /// do tego samego `run_phase_with_ui` co zwykłe `fn` wskaźniki pozostałych
 /// faz — każdy element `fn(...)` automatycznie spełnia ten typ.
-pub type PhaseFn = Box<dyn FnOnce(&mut Connection, &Ustawienia, mpsc::Sender<PhaseEvent>) -> rusqlite::Result<()> + Send>;
+pub type PhaseFn = Box<
+    dyn FnOnce(&mut Connection, &Ustawienia, mpsc::Sender<PhaseEvent>) -> rusqlite::Result<()>
+        + Send,
+>;
 
 /// Rozmiar "strony" dla PageUp/PageDown w panelu logów ekranu fazy (patrz
 /// `PhaseUIState::scroll_logs_up`/`_down`). Stała, niezależna od faktycznej
@@ -114,7 +117,10 @@ fn table_select_next(state: &mut TableState, liczba_wierszy: usize) {
         state.select(None);
         return;
     }
-    let nastepny = state.selected().map(|i| (i + 1).min(liczba_wierszy - 1)).unwrap_or(0);
+    let nastepny = state
+        .selected()
+        .map(|i| (i + 1).min(liczba_wierszy - 1))
+        .unwrap_or(0);
     state.select(Some(nastepny));
 }
 
@@ -135,7 +141,11 @@ fn table_select_page_down(state: &mut TableState, liczba_wierszy: usize, strona:
         state.select(None);
         return;
     }
-    let nastepny = state.selected().unwrap_or(0).saturating_add(strona).min(liczba_wierszy - 1);
+    let nastepny = state
+        .selected()
+        .unwrap_or(0)
+        .saturating_add(strona)
+        .min(liczba_wierszy - 1);
     state.select(Some(nastepny));
 }
 
@@ -156,7 +166,11 @@ fn table_select_home(state: &mut TableState, liczba_wierszy: usize) {
 
 /// Skok na ostatni wiersz (End).
 fn table_select_end(state: &mut TableState, liczba_wierszy: usize) {
-    state.select(if liczba_wierszy == 0 { None } else { Some(liczba_wierszy - 1) });
+    state.select(if liczba_wierszy == 0 {
+        None
+    } else {
+        Some(liczba_wierszy - 1)
+    });
 }
 
 // ============================================================================
@@ -171,7 +185,10 @@ pub fn execute_action(
     conn: &mut Connection,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> io::Result<()> {
-    info!("Orkiestrator odbiera zadanie. Wykonywanie akcji przypisanej do indeksu: {}", idx);
+    info!(
+        "Orkiestrator odbiera zadanie. Wykonywanie akcji przypisanej do indeksu: {}",
+        idx
+    );
     debug!("Wywołanie systemowe (Match) dla akcji: {}", idx);
 
     match idx {
@@ -179,23 +196,177 @@ pub fn execute_action(
         0 => run_autopilot(terminal, conn, app)?,
 
         // [ 2..18 ] WYWOŁANIA POJEDYNCZYCH FAZ (Wewnątrz Ratatui TUI)
-        2 => { let _ = run_phase_with_ui(terminal, conn, app, "[  🗺️  ]", "Faza 01: Mapowanie struktury", "Akwizycja", "Wczytuje ścieżki i buduje drzewo bazy danych.", Box::new(phases::phase1::run)); }
-        3 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📏  ]", "Faza 02: Akwizycja Metadanych", "Rozmiary", "Oblicza rozmiary i wagi plików, eliminuje puste wydmuszki.", Box::new(phases::phase2::run)); }
-        4 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 🧬  ]", "Faza 03: Hashe BLAKE3 (Zgodne pliki)", "Kryptografia", "Generuje z prędkością NVMe kryptograficzne skróty plików wspólnych.", Box::new(phases::phase3::run)); }
-        5 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 🧬  ]", "Faza 04: Hashe BLAKE3 (Brakujące)", "Kryptografia", "Skanuje pliki resztkowe i odrzuty.", Box::new(phases::phase4::run)); }
-        6 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📅  ]", "Faza 05: Czas modyfikacji i prawa", "i-node", "Ekstrakcja uprawnień Unix (SUID/ROOT) i Timestampów modyfikacji.", Box::new(phases::phase5::run)); }
-        7 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 👻  ]", "Faza 06: Detekcja Pustych Plików", "Zawartość", "Szuka uciętych ogonów (Brak EOF) oraz wydmuszek po TRIM.", Box::new(phases::phase6::run)); }
-        8 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 🎲  ]", "Faza 07: Analiza Entropii", "Matematyka", "Szum informacyjny, zaszyfrowanie Ransomware i zepsuta kompresja.", Box::new(phases::phase7::run)); }
-        9 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📜  ]", "Faza 10: Walidacja Tekstu (MIME)", "Semantyka", "Weryfikuje czystość znaków ASCII/UTF-8. Szuka ukrytych ładunków.", Box::new(phases::phase10::run)); }
-        10 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📦  ]", "Faza 11: Walidacja Archiwów", "Kontenery", "Sprawdza drzewa Central Directory i zwalcza Zip Bomby.", Box::new(phases::phase11::run)); }
-        11 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📸  ]", "Faza 12: Struktury Obrazów (EXIF)", "Multimedia", "Odzyskuje GPS, oryginalne daty wykonania i sprzęt foto/wideo.", Box::new(phases::phase12::run)); }
-        12 => { let _ = run_phase_with_ui(terminal, conn, app, "[  🖼️  ]", "Faza 13: Dekodowanie Mediów", "Multimedia", "Renderuje obrazy piksel po pikselu w poszukiwaniu Gray Banding.", Box::new(phases::phase13::run)); }
+        2 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[  🗺️  ]",
+                "Faza 01: Mapowanie struktury",
+                "Akwizycja",
+                "Wczytuje ścieżki i buduje drzewo bazy danych.",
+                Box::new(phases::phase1::run),
+            );
+        }
+        3 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📏  ]",
+                "Faza 02: Akwizycja Metadanych",
+                "Rozmiary",
+                "Oblicza rozmiary i wagi plików, eliminuje puste wydmuszki.",
+                Box::new(phases::phase2::run),
+            );
+        }
+        4 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 🧬  ]",
+                "Faza 03: Hashe BLAKE3 (Zgodne pliki)",
+                "Kryptografia",
+                "Generuje z prędkością NVMe kryptograficzne skróty plików wspólnych.",
+                Box::new(phases::phase3::run),
+            );
+        }
+        5 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 🧬  ]",
+                "Faza 04: Hashe BLAKE3 (Brakujące)",
+                "Kryptografia",
+                "Skanuje pliki resztkowe i odrzuty.",
+                Box::new(phases::phase4::run),
+            );
+        }
+        6 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📅  ]",
+                "Faza 05: Czas modyfikacji i prawa",
+                "i-node",
+                "Ekstrakcja uprawnień Unix (SUID/ROOT) i Timestampów modyfikacji.",
+                Box::new(phases::phase5::run),
+            );
+        }
+        7 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 👻  ]",
+                "Faza 06: Detekcja Pustych Plików",
+                "Zawartość",
+                "Szuka uciętych ogonów (Brak EOF) oraz wydmuszek po TRIM.",
+                Box::new(phases::phase6::run),
+            );
+        }
+        8 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 🎲  ]",
+                "Faza 07: Analiza Entropii",
+                "Matematyka",
+                "Szum informacyjny, zaszyfrowanie Ransomware i zepsuta kompresja.",
+                Box::new(phases::phase7::run),
+            );
+        }
+        9 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📜  ]",
+                "Faza 10: Walidacja Tekstu (MIME)",
+                "Semantyka",
+                "Weryfikuje czystość znaków ASCII/UTF-8. Szuka ukrytych ładunków.",
+                Box::new(phases::phase10::run),
+            );
+        }
+        10 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📦  ]",
+                "Faza 11: Walidacja Archiwów",
+                "Kontenery",
+                "Sprawdza drzewa Central Directory i zwalcza Zip Bomby.",
+                Box::new(phases::phase11::run),
+            );
+        }
+        11 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📸  ]",
+                "Faza 12: Struktury Obrazów (EXIF)",
+                "Multimedia",
+                "Odzyskuje GPS, oryginalne daty wykonania i sprzęt foto/wideo.",
+                Box::new(phases::phase12::run),
+            );
+        }
+        12 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[  🖼️  ]",
+                "Faza 13: Dekodowanie Mediów",
+                "Multimedia",
+                "Renderuje obrazy piksel po pikselu w poszukiwaniu Gray Banding.",
+                Box::new(phases::phase13::run),
+            );
+        }
         // [ 12 ] FAZA 19 - OSOBNA diagnostyka wideo, celowo NIE rozszerzenie
         // Fazy 13: pozwala przeskanować wideo bez ponownego przebiegu całej
         // diagnostyki obrazów na już przetworzonych plikach.
-        13 => { let _ = run_phase_with_ui(terminal, conn, app, "[  🎬  ]", "Faza 19: Diagnostyka Kontenerów Wideo", "Multimedia", "MP4/MOV/M4V, MKV/WebM, FLV oraz strumienie TS z dokładną analizą utraty pakietów.", Box::new(phases::phase19_video::run)); }
-        14 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 👯‍♂️ ]", "Faza 14: Rozmyte Hashowanie", "Korelacja", "Ssdeep. Łączy pofragmentowane i zmienione pliki (Zaginione bliźniaki).", Box::new(phases::phase14::run)); }
-        15 => { let _ = run_phase_with_ui(terminal, conn, app, "[  🏷️  ]", "Faza 15: Rozszerzone Atrybuty", "Metadane", "Analizuje ukryte strumienie systemowe XATTR i ślady pobrań z Sieci.", Box::new(phases::phase15::run)); }
+        13 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[  🎬  ]",
+                "Faza 19: Diagnostyka Kontenerów Wideo",
+                "Multimedia",
+                "MP4/MOV/M4V, MKV/WebM, FLV oraz strumienie TS z dokładną analizą utraty pakietów.",
+                Box::new(phases::phase19_video::run),
+            );
+        }
+        14 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 👯‍♂️ ]",
+                "Faza 14: Rozmyte Hashowanie",
+                "Korelacja",
+                "Ssdeep. Łączy pofragmentowane i zmienione pliki (Zaginione bliźniaki).",
+                Box::new(phases::phase14::run),
+            );
+        }
+        15 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[  🏷️  ]",
+                "Faza 15: Rozszerzone Atrybuty",
+                "Metadane",
+                "Analizuje ukryte strumienie systemowe XATTR i ślady pobrań z Sieci.",
+                Box::new(phases::phase15::run),
+            );
+        }
 
         // [ 15 ] FAZA 16 (YARA) - wybór reguł MUSI nastąpić PRZED trybem Raw
         // (patrz dokumentacja `phases::phase16::select_and_compile_rules` —
@@ -204,39 +375,88 @@ pub fn execute_action(
             let rules = suspend_tui_for_cli(terminal, phases::phase16::select_and_compile_rules);
             match rules {
                 Some(rules) => {
-                    let phase_fn: PhaseFn = Box::new(move |conn, u, tx| phases::phase16::run(conn, u, tx, rules));
-                    let _ = run_phase_with_ui(terminal, conn, app, "[  ☢  ]", "Faza 16: Skanowanie YARA", "Malware", "Rozpoznaje zagrożenia wirusowe, notatki hakerskie i skrypty.", phase_fn);
+                    let phase_fn: PhaseFn =
+                        Box::new(move |conn, u, tx| phases::phase16::run(conn, u, tx, rules));
+                    let _ = run_phase_with_ui(
+                        terminal,
+                        conn,
+                        app,
+                        "[  ☢  ]",
+                        "Faza 16: Skanowanie YARA",
+                        "Malware",
+                        "Rozpoznaje zagrożenia wirusowe, notatki hakerskie i skrypty.",
+                        phase_fn,
+                    );
                 }
                 None => info!("Faza 16 pominięta - nie wybrano żadnych reguł YARA."),
             }
         }
         // [ 16 ] NAPRAWA I REKONSTRUKCJA - podmenu grupujące Fazę 17, Fazę 18
         // i narzędzie Składania Strukturalnego DNG (patrz run_repair_submenu).
-        17 => { let _ = run_repair_submenu(terminal, app, conn); }
-        18 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 📝  ]", "Faza 08: Raport Końcowy (CSV)", "Eksport", "Agreguje wszystkie wskaźniki i wypuszcza arkusz decyzyjny Euro-CSV.", Box::new(phases::phase8::run)); }
-        19 => { let _ = run_phase_with_ui(terminal, conn, app, "[ 👑  ]", "Faza 09: Smart Merge (Złota Kopia)", "Fuzja", "Zlewa zrekonstruowane i zdrowe dane w wyczyszczoną kopię finalną.", Box::new(phases::phase9::run)); }
+        17 => {
+            let _ = run_repair_submenu(terminal, app, conn);
+        }
+        18 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 📝  ]",
+                "Faza 08: Raport Końcowy (CSV)",
+                "Eksport",
+                "Agreguje wszystkie wskaźniki i wypuszcza arkusz decyzyjny Euro-CSV.",
+                Box::new(phases::phase8::run),
+            );
+        }
+        19 => {
+            let _ = run_phase_with_ui(
+                terminal,
+                conn,
+                app,
+                "[ 👑  ]",
+                "Faza 09: Smart Merge (Złota Kopia)",
+                "Fuzja",
+                "Zlewa zrekonstruowane i zdrowe dane w wyczyszczoną kopię finalną.",
+                Box::new(phases::phase9::run),
+            );
+        }
 
         // [ 19 ] WYKRYWANIE DUPLIKATÓW TREŚCI - szybki, jednorazowy raport (bez
         // wątków/postępu, sama analiza SQL) - ten sam CLI-suspended wzorzec co diag/reset.
-        20 => execute_with_cli_suspension(terminal, || { let _ = duplicate_finder::run(conn, app.ustawienia); }),
+        20 => execute_with_cli_suspension(terminal, || {
+            let _ = duplicate_finder::run(conn, app.ustawienia);
+        }),
         // [ 21..22 ] ZAWIESZENIE TUI DO TRYBU CLI DLA MODUŁÓW ZEWNĘTRZNYCH (bez zmian)
-        22 => execute_with_cli_suspension(terminal, || { let _ = diag::run(conn); }),
-        23 => execute_with_cli_suspension(terminal, || { let _ = reset::run(conn, app.ustawienia); }),
+        22 => execute_with_cli_suspension(terminal, || {
+            let _ = diag::run(conn);
+        }),
+        23 => execute_with_cli_suspension(terminal, || {
+            let _ = reset::run(conn, app.ustawienia);
+        }),
         // [ 24 ] SPRZĄTANIE PRZESTRZENI ROBOCZEJ - raport zajętości katalogów
         // technicznych Faz 17/18 i usuwanie plików osieroconych. Ten sam
         // CLI-suspended wzorzec co diag/reset, bo operacja jest interaktywna.
-        24 => execute_with_cli_suspension(terminal, || { let _ = workspace_cleanup::run(conn, app.ustawienia); }),
+        24 => execute_with_cli_suspension(terminal, || {
+            let _ = workspace_cleanup::run(conn, app.ustawienia);
+        }),
         // [ 25 ] MP4 DOCTOR - interfejs zewnętrznego projektu, prowadzony w
         // NASZYM terminalu (patrz `run_mp4_doctor_with_ui`).
-        25 => { let _ = run_mp4_doctor_with_ui(terminal, app); }
+        25 => {
+            let _ = run_mp4_doctor_with_ui(terminal, app);
+        }
         // [ 26 ] USTAWIENIA - PEŁNY EKRAN RATATUI (spójny z resztą aplikacji, bez zawieszania TUI)
-        26 => { let _ = run_settings_with_ui(terminal, app); }
+        26 => {
+            let _ = run_settings_with_ui(terminal, app);
+        }
         _ => {
             warn!("Nieznany indeks akcji ({}). Opcja nieistniejąca.", idx);
         }
     }
 
-    info!("Akcja o indeksie {} zakończyła działanie. Powrót do menu głównego.", idx);
+    info!(
+        "Akcja o indeksie {} zakończyła działanie. Powrót do menu głównego.",
+        idx
+    );
     Ok(())
 }
 
@@ -244,7 +464,7 @@ pub fn execute_action(
 // ASYNCHRONICZNY ORKIESTRATOR POJEDYNCZEJ FAZY (RATATUI)
 // ============================================================================
 
-/// Otwiera sub-ekran Fazy w TUI Ratatui, uruchamia proces Fazy w tle i na żywo renderuje 
+/// Otwiera sub-ekran Fazy w TUI Ratatui, uruchamia proces Fazy w tle i na żywo renderuje
 /// wielopanelowy układ ekranu (Sprzęt z lewej, Faza z prawej, Ścieżki na dole).
 /// Uruchamia fazę i po zakończeniu CZEKA na potwierdzenie użytkownika.
 ///
@@ -261,7 +481,9 @@ fn run_phase_with_ui(
     desc: &str,
     phase_fn: PhaseFn,
 ) -> rusqlite::Result<Duration> {
-    run_phase_z_opcjami(terminal, conn, app, icon, title, category, desc, phase_fn, true)
+    run_phase_z_opcjami(
+        terminal, conn, app, icon, title, category, desc, phase_fn, true,
+    )
 }
 
 /// Uruchamia fazę i wraca NATYCHMIAST po jej zakończeniu.
@@ -285,7 +507,85 @@ fn run_phase_bez_czekania(
     desc: &str,
     phase_fn: PhaseFn,
 ) -> rusqlite::Result<Duration> {
-    run_phase_z_opcjami(terminal, conn, app, icon, title, category, desc, phase_fn, false)
+    run_phase_z_opcjami(
+        terminal, conn, app, icon, title, category, desc, phase_fn, false,
+    )
+}
+
+/// Sprawdza dostępność folderów PRZED uruchomieniem jakiejkolwiek fazy —
+/// źródłowe (`ufs_path`/`script_path`) wymagają minimum odczytu, docelowy
+/// (`target_path`) minimum zapisu. Wołane raz, na samym starcie
+/// [`run_phase_z_opcjami`] — jedyne miejsce, przez które przechodzi
+/// uruchomienie KAŻDEJ fazy (menu ręczne i autopilot).
+///
+/// Zgłoszenie użytkownika: bez tego brakujący/odłączony wolumin (rozłączony
+/// dysk zewnętrzny, literówka w ścieżce z Ustawień, write-blocker na
+/// docelowym) nie przerywał fazy z jasnym komunikatem — zamiast tego KAŻDY
+/// plik lądował jako pojedynczy błąd I/O, zliczany tak samo jak prawdziwe
+/// uszkodzenie korpusu (fałszywie zawyżając statystyki uszkodzeń o całą
+/// zawartość dysku, który po prostu nie był podłączony). To "przypadkowe
+/// skanowanie" ma być teraz niemożliwe — faza w ogóle się nie zaczyna.
+fn sprawdz_dostepnosc_folderow(u: &Ustawienia) -> Result<(), String> {
+    for (etykieta, sciezka) in [
+        ("źródłowy (UFS Explorer)", &u.ufs_path),
+        ("źródłowy (Skrypt Autorski)", &u.script_path),
+    ] {
+        let path = Path::new(sciezka);
+        if !path.exists() {
+            return Err(format!(
+                "Folder {etykieta} nie istnieje: \"{sciezka}\". Sprawdź ścieżkę w Ustawieniach (dysk odłączony?)."
+            ));
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "Folder {etykieta} nie jest katalogiem: \"{sciezka}\"."
+            ));
+        }
+        // Test odczytu (minimum RO) — samo `exists()` nie wykrywa braku
+        // uprawnień (np. katalog widoczny, ale niedostępny dla tego
+        // użytkownika).
+        if let Err(e) = std::fs::read_dir(path) {
+            return Err(format!(
+                "Brak dostępu do odczytu folderu {etykieta}: \"{sciezka}\" ({e}). Sprawdź uprawnienia."
+            ));
+        }
+    }
+
+    let target = Path::new(&u.target_path);
+    if !target.exists() {
+        // Brak folderu docelowego nie jest sam w sobie niebezpieczny (w
+        // odróżnieniu od źródłowych) — próbujemy go po prostu utworzyć,
+        // zanim zgłosimy twardy błąd.
+        if let Err(e) = std::fs::create_dir_all(target) {
+            return Err(format!(
+                "Nie można utworzyć folderu docelowego \"{}\": {e}.",
+                u.target_path
+            ));
+        }
+    }
+    if !target.is_dir() {
+        return Err(format!(
+            "Folder docelowy nie jest katalogiem: \"{}\".",
+            u.target_path
+        ));
+    }
+    // Test zapisu (minimum RW): tworzymy i natychmiast kasujemy próbny plik
+    // — sam bit uprawnień w metadanych nie jest wiarygodny na wszystkich
+    // systemach plików (sieciowe montowania, ACL, read-only bind mount).
+    match tempfile::Builder::new()
+        .prefix(".zapis_probny_faza_")
+        .tempfile_in(target)
+    {
+        Ok(_) => {} // Plik usuwa się sam przy Drop.
+        Err(e) => {
+            return Err(format!(
+                "Brak dostępu do zapisu w folderze docelowym \"{}\" ({e}). Sprawdź uprawnienia (write-blocker na docelowym?).",
+                u.target_path
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,7 +601,10 @@ fn run_phase_z_opcjami(
     czekaj_na_potwierdzenie: bool,
 ) -> rusqlite::Result<Duration> {
     let mut ui_state = PhaseUIState::new(icon, title, category, desc);
-    info!("Rozpoczęto wywołanie Fazy Roboczej: {} ({})", title, category);
+    info!(
+        "Rozpoczęto wywołanie Fazy Roboczej: {} ({})",
+        title, category
+    );
 
     // Fokus i stan zaznaczenia/przewinięcia tabel — utworzone RAZ, tutaj
     // (nie wewnątrz pętli renderującej), żeby przeżyły przejście z live-pętli
@@ -338,8 +641,21 @@ fn run_phase_z_opcjami(
     std::thread::scope(|s| {
         // [WĄTEK ROBOCZY] - Ciężkie operacje I/O, Rayon i baza SQLite
         s.spawn(move || {
-            if let Err(e) = phase_fn(conn, &ustawienia_clone, tx.clone()) {
-                let _ = tx.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY BAZY DANYCH: {}", e)));
+            match sprawdz_dostepnosc_folderow(&ustawienia_clone) {
+                Ok(()) => {
+                    if let Err(e) = phase_fn(conn, &ustawienia_clone, tx.clone()) {
+                        let _ = tx.send(PhaseEvent::Log(format!(
+                            "BŁĄD KRYTYCZNY BAZY DANYCH: {}",
+                            e
+                        )));
+                    }
+                }
+                Err(komunikat) => {
+                    let _ = tx.send(PhaseEvent::Log(format!(
+                        "🛑 PRZERWANO PRZED SKANOWANIEM (foldery niedostępne): {}",
+                        komunikat
+                    )));
+                }
             }
             let _ = tx.send(PhaseEvent::Done);
         });
@@ -356,11 +672,13 @@ fn run_phase_z_opcjami(
             // 1. Odbiór wiadomości od wątku roboczego (Paski, Logi, Ścieżki)
             match rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(event) => {
-                    if matches!(event, PhaseEvent::Done) { break; }
+                    if matches!(event, PhaseEvent::Done) {
+                        break;
+                    }
                     ui_state.process_event(event);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {} 
-                Err(mpsc::RecvTimeoutError::Disconnected) => break, 
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
             // 2. Odświeżanie statystyk sprzętowych w tle
@@ -374,93 +692,162 @@ fn run_phase_z_opcjami(
             // dokumentacja `PhaseUIState::scroll_logs_up`).
             if event::poll(Duration::from_millis(0)).unwrap_or(false)
                 && let Ok(event::Event::Key(key)) = event::read()
-                    && key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            crate::utils::CANCEL_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
-                            if cancel_requested_at.is_none() {
-                                cancel_requested_at = Some(Instant::now());
-                                ui_state.process_event(PhaseEvent::Log("⚠️ WYKRYTO PRZERWANIE UŻYTKOWNIKA (Ctrl+C). Oczekiwanie na bezpieczne zamknięcie szyny I/O...".to_string()));
+                && key.kind == KeyEventKind::Press
+            {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    crate::utils::CANCEL_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if cancel_requested_at.is_none() {
+                        cancel_requested_at = Some(Instant::now());
+                        ui_state.process_event(PhaseEvent::Log("⚠️ WYKRYTO PRZERWANIE UŻYTKOWNIKA (Ctrl+C). Oczekiwanie na bezpieczne zamknięcie szyny I/O...".to_string()));
+                    }
+                } else if opis_otwarty.is_some() {
+                    // Nakładka wyjaśnienia PRZEJMUJE Enter/Esc całkowicie —
+                    // wzorzec 1:1 z `EditMode::None` w `settings_actions.rs`.
+                    // Inne klawisze (Tab, strzałki...) są tu celowo ignorowane:
+                    // podczas gdy nakładka zasłania ekran, nawigacja pod spodem
+                    // myliłaby operatora niewidocznym skutkiem.
+                    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                        opis_otwarty = None;
+                    }
+                } else {
+                    let pokaz_skaner_live = !ui_state.side_texts.is_empty();
+                    match key.code {
+                        KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
+                        KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
+                        KeyCode::Up => match fokus {
+                            PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
+                            PanelWFokusie::Dyski => {
+                                table_select_prev(&mut dyski_ts, app.disk_list.len())
                             }
-                        } else if opis_otwarty.is_some() {
-                            // Nakładka wyjaśnienia PRZEJMUJE Enter/Esc całkowicie —
-                            // wzorzec 1:1 z `EditMode::None` w `settings_actions.rs`.
-                            // Inne klawisze (Tab, strzałki...) są tu celowo ignorowane:
-                            // podczas gdy nakładka zasłania ekran, nawigacja pod spodem
-                            // myliłaby operatora niewidocznym skutkiem.
-                            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                                opis_otwarty = None;
+                            PanelWFokusie::Konfiguracja => {
+                                table_select_prev(&mut konfiguracja_ts, usize::MAX)
                             }
-                        } else {
-                            let pokaz_skaner_live = !ui_state.side_texts.is_empty();
-                            match key.code {
-                                KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
-                                KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
-                                KeyCode::Up => match fokus {
-                                    PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
-                                    PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
-                                    PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
-                                    // SkanerLive: liczba wierszy nieznana tutaj (zależy od
-                                    // parsowania `side_texts`, patrz `draw_side_stats_panel`) —
-                                    // funkcja tylko dekrementuje, więc górny limit jest
-                                    // nieistotny dla ruchu w górę.
-                                    PanelWFokusie::SkanerLive => table_select_prev(&mut skaner_live_ts, usize::MAX),
-                                    PanelWFokusie::SciezkiIO => table_select_prev(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                                },
-                                KeyCode::Down => match fokus {
-                                    PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
-                                    PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
-                                    PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
-                                    // Patrz komentarz przy Up: `draw_side_stats_panel` samo
-                                    // zatrzaskuje `selected()` do rzeczywistej liczby wierszy
-                                    // na KAŻDEJ klatce, więc `usize::MAX` tutaj jest bezpieczne
-                                    // — ruch w dół nigdy realnie nie "ucieka" poza panel.
-                                    PanelWFokusie::SkanerLive => table_select_next(&mut skaner_live_ts, usize::MAX),
-                                    PanelWFokusie::SciezkiIO => table_select_next(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                                },
-                                KeyCode::PageUp => match fokus {
-                                    PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
-                                    PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                                    PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                                    PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                                    PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                                },
-                                KeyCode::PageDown => match fokus {
-                                    PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
-                                    PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                                    PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                                    PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                                    PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                                },
-                                KeyCode::Home => match fokus {
-                                    PanelWFokusie::Logi => {}
-                                    PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
-                                    PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
-                                    PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
-                                    PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                                },
-                                KeyCode::End => match fokus {
-                                    PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
-                                    PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
-                                    PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
-                                    PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
-                                    PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                                },
-                                // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
-                                // `opis_otwarty` wyżej i `crate::opisy_anomalii`).
-                                // Bez efektu na wierszach bez znanego opisu
-                                // (nagłówki sekcji, luźne linie, nieopisane
-                                // jeszcze etykiety) — `etykieta_wiersza`/`znajdz_opis`
-                                // zwracają wtedy `None`, nic się nie dzieje.
-                                KeyCode::Enter if fokus == PanelWFokusie::SkanerLive => {
-                                    if let Some(etykieta) = crate::tui::scanner_panel::etykieta_wiersza(&ui_state, skaner_live_ts.selected().unwrap_or(0))
-                                        && let Some(wyjasnienie) = crate::opisy_anomalii::znajdz_opis(&etykieta) {
-                                            opis_otwarty = Some((etykieta, wyjasnienie));
-                                        }
-                                }
-                                _ => {}
+                            // SkanerLive: liczba wierszy nieznana tutaj (zależy od
+                            // parsowania `side_texts`, patrz `draw_side_stats_panel`) —
+                            // funkcja tylko dekrementuje, więc górny limit jest
+                            // nieistotny dla ruchu w górę.
+                            PanelWFokusie::SkanerLive => {
+                                table_select_prev(&mut skaner_live_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SciezkiIO => table_select_prev(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            ),
+                        },
+                        KeyCode::Down => match fokus {
+                            PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
+                            PanelWFokusie::Dyski => {
+                                table_select_next(&mut dyski_ts, app.disk_list.len())
+                            }
+                            PanelWFokusie::Konfiguracja => {
+                                table_select_next(&mut konfiguracja_ts, usize::MAX)
+                            }
+                            // Patrz komentarz przy Up: `draw_side_stats_panel` samo
+                            // zatrzaskuje `selected()` do rzeczywistej liczby wierszy
+                            // na KAŻDEJ klatce, więc `usize::MAX` tutaj jest bezpieczne
+                            // — ruch w dół nigdy realnie nie "ucieka" poza panel.
+                            PanelWFokusie::SkanerLive => {
+                                table_select_next(&mut skaner_live_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SciezkiIO => table_select_next(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            ),
+                        },
+                        KeyCode::PageUp => match fokus {
+                            PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
+                            PanelWFokusie::Dyski => table_select_page_up(
+                                &mut dyski_ts,
+                                app.disk_list.len(),
+                                STRONA_LOGOW,
+                            ),
+                            PanelWFokusie::Konfiguracja => {
+                                table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW)
+                            }
+                            PanelWFokusie::SkanerLive => {
+                                table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW)
+                            }
+                            PanelWFokusie::SciezkiIO => table_select_page_up(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                                STRONA_LOGOW,
+                            ),
+                        },
+                        KeyCode::PageDown => match fokus {
+                            PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
+                            PanelWFokusie::Dyski => table_select_page_down(
+                                &mut dyski_ts,
+                                app.disk_list.len(),
+                                STRONA_LOGOW,
+                            ),
+                            PanelWFokusie::Konfiguracja => table_select_page_down(
+                                &mut konfiguracja_ts,
+                                usize::MAX,
+                                STRONA_LOGOW,
+                            ),
+                            PanelWFokusie::SkanerLive => table_select_page_down(
+                                &mut skaner_live_ts,
+                                usize::MAX,
+                                STRONA_LOGOW,
+                            ),
+                            PanelWFokusie::SciezkiIO => table_select_page_down(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                                STRONA_LOGOW,
+                            ),
+                        },
+                        KeyCode::Home => match fokus {
+                            PanelWFokusie::Logi => {}
+                            PanelWFokusie::Dyski => {
+                                table_select_home(&mut dyski_ts, app.disk_list.len())
+                            }
+                            PanelWFokusie::Konfiguracja => {
+                                table_select_home(&mut konfiguracja_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SkanerLive => {
+                                table_select_home(&mut skaner_live_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SciezkiIO => table_select_home(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            ),
+                        },
+                        KeyCode::End => match fokus {
+                            PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
+                            PanelWFokusie::Dyski => {
+                                table_select_end(&mut dyski_ts, app.disk_list.len())
+                            }
+                            PanelWFokusie::Konfiguracja => {
+                                table_select_end(&mut konfiguracja_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SkanerLive => {
+                                table_select_end(&mut skaner_live_ts, usize::MAX)
+                            }
+                            PanelWFokusie::SciezkiIO => table_select_end(
+                                &mut sciezki_io_ts,
+                                crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            ),
+                        },
+                        // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
+                        // `opis_otwarty` wyżej i `crate::opisy_anomalii`).
+                        // Bez efektu na wierszach bez znanego opisu
+                        // (nagłówki sekcji, luźne linie, nieopisane
+                        // jeszcze etykiety) — `etykieta_wiersza`/`znajdz_opis`
+                        // zwracają wtedy `None`, nic się nie dzieje.
+                        KeyCode::Enter if fokus == PanelWFokusie::SkanerLive => {
+                            if let Some(etykieta) = crate::tui::scanner_panel::etykieta_wiersza(
+                                &ui_state,
+                                skaner_live_ts.selected().unwrap_or(0),
+                            ) && let Some(wyjasnienie) =
+                                crate::opisy_anomalii::znajdz_opis(&etykieta)
+                            {
+                                opis_otwarty = Some((etykieta, wyjasnienie));
                             }
                         }
+                        _ => {}
                     }
+                }
+            }
 
             // 3b. Żywy licznik sekund oczekiwania na dogaszenie wątków roboczych.
             // Bez tego ekran milczy między komunikatem o przerwaniu a faktycznym
@@ -483,13 +870,19 @@ fn run_phase_z_opcjami(
                 // Krok A: Tniemy ekran w poziomie (Góra: 100%, Dół: 5 linijek na ścieżki)
                 let main_vertical = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Vertical)
-                    .constraints([ratatui::layout::Constraint::Min(10), ratatui::layout::Constraint::Length(9)])
+                    .constraints([
+                        ratatui::layout::Constraint::Min(10),
+                        ratatui::layout::Constraint::Length(9),
+                    ])
                     .split(full_screen);
 
                 // Krok B: Tniemy górę w pionie na lewą i prawą stronę
                 let top_horizontal = ratatui::layout::Layout::default()
                     .direction(ratatui::layout::Direction::Horizontal)
-                    .constraints([ratatui::layout::Constraint::Percentage(50), ratatui::layout::Constraint::Percentage(50)])
+                    .constraints([
+                        ratatui::layout::Constraint::Percentage(50),
+                        ratatui::layout::Constraint::Percentage(50),
+                    ])
                     .split(main_vertical[0]);
 
                 // Krok C: Dynamiczny podział LEWEJ strony
@@ -502,16 +895,20 @@ fn run_phase_z_opcjami(
                 // "na żywo". Wspólna stała eliminuje TĘ KLASĘ błędu na przyszłość.
                 let left_constraints = if !ui_state.side_texts.is_empty() {
                     vec![
-                        ratatui::layout::Constraint::Length(3),  // HW
-                        ratatui::layout::Constraint::Length(8),  // Disks
-                        ratatui::layout::Constraint::Length(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX), // Config
-                        ratatui::layout::Constraint::Min(5),     // Aktywny Skaner (Live) pod spodem
+                        ratatui::layout::Constraint::Length(3), // HW
+                        ratatui::layout::Constraint::Length(8), // Disks
+                        ratatui::layout::Constraint::Length(
+                            crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX,
+                        ), // Config
+                        ratatui::layout::Constraint::Min(5),    // Aktywny Skaner (Live) pod spodem
                     ]
                 } else {
                     vec![
-                        ratatui::layout::Constraint::Length(3),  // HW
-                        ratatui::layout::Constraint::Length(8),  // Disks
-                        ratatui::layout::Constraint::Min(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX), // Config do końca
+                        ratatui::layout::Constraint::Length(3), // HW
+                        ratatui::layout::Constraint::Length(8), // Disks
+                        ratatui::layout::Constraint::Min(
+                            crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX,
+                        ), // Config do końca
                     ]
                 };
 
@@ -522,34 +919,66 @@ fn run_phase_z_opcjami(
 
                 // Rysujemy Lewą Stronę
                 crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
-                crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
-                crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
+                crate::tui::hardware_panel::draw_disks_panel(
+                    f,
+                    app,
+                    left_chunks[1],
+                    &mut dyski_ts,
+                    fokus == PanelWFokusie::Dyski,
+                );
+                crate::tui::hardware_panel::draw_paths_panel(
+                    f,
+                    app,
+                    left_chunks[2],
+                    &mut konfiguracja_ts,
+                    fokus == PanelWFokusie::Konfiguracja,
+                );
 
                 if !ui_state.side_texts.is_empty() {
-                    crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
+                    crate::tui::scanner_panel::draw_side_stats_panel(
+                        f,
+                        &ui_state,
+                        left_chunks[3],
+                        &mut skaner_live_ts,
+                        fokus == PanelWFokusie::SkanerLive,
+                    );
                 }
 
                 // Rysujemy Prawą Stronę (Logi operacyjne i Paski)
-                crate::tui::phase_screen::draw_phase_screen(f, &ui_state, top_horizontal[1], fokus == PanelWFokusie::Logi);
+                crate::tui::phase_screen::draw_phase_screen(
+                    f,
+                    &ui_state,
+                    top_horizontal[1],
+                    fokus == PanelWFokusie::Logi,
+                );
 
                 // Rysujemy Dół Ekranu (Szeroki panel na ekstremalnie długie ścieżki I/O)
-                crate::tui::scanner_panel::draw_bottom_paths_panel(f, &ui_state, main_vertical[1], &mut sciezki_io_ts, fokus == PanelWFokusie::SciezkiIO);
+                crate::tui::scanner_panel::draw_bottom_paths_panel(
+                    f,
+                    &ui_state,
+                    main_vertical[1],
+                    &mut sciezki_io_ts,
+                    fokus == PanelWFokusie::SciezkiIO,
+                );
 
                 // Nakładka wyjaśnienia RYSOWANA NA KOŃCU, na wierzchu wszystkiego.
                 if let Some((etykieta, wyjasnienie)) = &opis_otwarty {
-                    crate::tui::scanner_panel::draw_opis_popup(f, full_screen, etykieta, wyjasnienie);
+                    crate::tui::scanner_panel::draw_opis_popup(
+                        f,
+                        full_screen,
+                        etykieta,
+                        wyjasnienie,
+                    );
                 }
             });
         }
     });
 
-    ui_state.process_event(PhaseEvent::Log(
-        if czekaj_na_potwierdzenie {
-            "\n✅ FAZA ZAKOŃCZONA! Naciśnij [ENTER], aby wrócić do Menu Głównego...".to_string()
-        } else {
-            "\n✅ FAZA ZAKOŃCZONA — autopilot przechodzi do następnej.".to_string()
-        }
-    ));
+    ui_state.process_event(PhaseEvent::Log(if czekaj_na_potwierdzenie {
+        "\n✅ FAZA ZAKOŃCZONA! Naciśnij [ENTER], aby wrócić do Menu Głównego...".to_string()
+    } else {
+        "\n✅ FAZA ZAKOŃCZONA — autopilot przechodzi do następnej.".to_string()
+    }));
 
     // ========================================================================
     // EKRAN KOŃCOWY FAZY
@@ -563,12 +992,18 @@ fn run_phase_z_opcjami(
 
             let main_vertical = ratatui::layout::Layout::default()
                 .direction(ratatui::layout::Direction::Vertical)
-                .constraints([ratatui::layout::Constraint::Min(10), ratatui::layout::Constraint::Length(9)])
+                .constraints([
+                    ratatui::layout::Constraint::Min(10),
+                    ratatui::layout::Constraint::Length(9),
+                ])
                 .split(full_screen);
 
             let top_horizontal = ratatui::layout::Layout::default()
                 .direction(ratatui::layout::Direction::Horizontal)
-                .constraints([ratatui::layout::Constraint::Percentage(50), ratatui::layout::Constraint::Percentage(50)])
+                .constraints([
+                    ratatui::layout::Constraint::Percentage(50),
+                    ratatui::layout::Constraint::Percentage(50),
+                ])
                 .split(main_vertical[0]);
 
             // REGRESJA (measure twice — druga weryfikacja Gemini, todo.menu.md):
@@ -582,14 +1017,18 @@ fn run_phase_z_opcjami(
                 vec![
                     ratatui::layout::Constraint::Length(3),
                     ratatui::layout::Constraint::Length(8),
-                    ratatui::layout::Constraint::Length(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX),
+                    ratatui::layout::Constraint::Length(
+                        crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX,
+                    ),
                     ratatui::layout::Constraint::Min(5),
                 ]
             } else {
                 vec![
                     ratatui::layout::Constraint::Length(3),
                     ratatui::layout::Constraint::Length(8),
-                    ratatui::layout::Constraint::Min(crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX),
+                    ratatui::layout::Constraint::Min(
+                        crate::tui::hardware_panel::WYSOKOSC_PANELU_SCIEZEK_MAX,
+                    ),
                 ]
             };
 
@@ -599,15 +1038,44 @@ fn run_phase_z_opcjami(
                 .split(top_horizontal[0]);
 
             crate::tui::hardware_panel::draw_hw_panel(f, app, left_chunks[0]);
-            crate::tui::hardware_panel::draw_disks_panel(f, app, left_chunks[1], &mut dyski_ts, fokus == PanelWFokusie::Dyski);
-            crate::tui::hardware_panel::draw_paths_panel(f, app, left_chunks[2], &mut konfiguracja_ts, fokus == PanelWFokusie::Konfiguracja);
+            crate::tui::hardware_panel::draw_disks_panel(
+                f,
+                app,
+                left_chunks[1],
+                &mut dyski_ts,
+                fokus == PanelWFokusie::Dyski,
+            );
+            crate::tui::hardware_panel::draw_paths_panel(
+                f,
+                app,
+                left_chunks[2],
+                &mut konfiguracja_ts,
+                fokus == PanelWFokusie::Konfiguracja,
+            );
 
             if !ui_state.side_texts.is_empty() {
-                crate::tui::scanner_panel::draw_side_stats_panel(f, &ui_state, left_chunks[3], &mut skaner_live_ts, fokus == PanelWFokusie::SkanerLive);
+                crate::tui::scanner_panel::draw_side_stats_panel(
+                    f,
+                    &ui_state,
+                    left_chunks[3],
+                    &mut skaner_live_ts,
+                    fokus == PanelWFokusie::SkanerLive,
+                );
             }
 
-            crate::tui::phase_screen::draw_phase_screen(f, &ui_state, top_horizontal[1], fokus == PanelWFokusie::Logi);
-            crate::tui::scanner_panel::draw_bottom_paths_panel(f, &ui_state, main_vertical[1], &mut sciezki_io_ts, fokus == PanelWFokusie::SciezkiIO);
+            crate::tui::phase_screen::draw_phase_screen(
+                f,
+                &ui_state,
+                top_horizontal[1],
+                fokus == PanelWFokusie::Logi,
+            );
+            crate::tui::scanner_panel::draw_bottom_paths_panel(
+                f,
+                &ui_state,
+                main_vertical[1],
+                &mut sciezki_io_ts,
+                fokus == PanelWFokusie::SciezkiIO,
+            );
 
             // Nakładka wyjaśnienia RYSOWANA NA KOŃCU, na wierzchu wszystkiego.
             if let Some((etykieta, wyjasnienie)) = &opis_otwarty {
@@ -621,86 +1089,150 @@ fn run_phase_z_opcjami(
 
         if event::poll(Duration::from_millis(50)).unwrap_or(false)
             && let Ok(event::Event::Key(key)) = event::read()
-                && key.kind == KeyEventKind::Press {
-                    if opis_otwarty.is_some() {
-                        // Patrz identyczna gałąź w live-pętli wyżej: nakładka
-                        // przejmuje Enter/Esc całkowicie, PIERWSZE Enter/Esc ją
-                        // zamyka zamiast wyjść z ekranu fazy — wyjście wymaga
-                        // osobnego, kolejnego naciśnięcia.
-                        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                            opis_otwarty = None;
-                        }
-                    } else {
-                        // Przewijanie/nawigacja NA EKRANIE KOŃCOWYM — operator
-                        // dostaje szansę przejrzeć cały przebieg fazy (logi,
-                        // dyski, statystyki, ścieżki) przed powrotem do menu, nie
-                        // tylko ich ogon. `fokus`/stany tabel PRZEŻYŁY przejście
-                        // z live-pętli (utworzone raz, przed `std::thread::scope`).
-                        let pokaz_skaner_live = !ui_state.side_texts.is_empty();
-
-                        // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
-                        // `opis_otwarty` i `crate::opisy_anomalii`) - policzone PRZED
-                        // `match`, żeby Enter mógł albo otworzyć nakładkę (gdy coś
-                        // faktycznie da się wyjaśnić), albo zachować dotychczasowe
-                        // znaczenie "wyjdź z ekranu" (gdy nie ma czego wyjaśnić).
-                        let opis_do_otwarcia = if fokus == PanelWFokusie::SkanerLive {
-                            crate::tui::scanner_panel::etykieta_wiersza(&ui_state, skaner_live_ts.selected().unwrap_or(0))
-                                .and_then(|etykieta| crate::opisy_anomalii::znajdz_opis(&etykieta).map(|w| (etykieta, w)))
-                        } else {
-                            None
-                        };
-
-                        match key.code {
-                            KeyCode::Enter if opis_do_otwarcia.is_some() => { opis_otwarty = opis_do_otwarcia; }
-                            KeyCode::Enter | KeyCode::Esc => break,
-                            KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
-                            KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
-                            KeyCode::Up => match fokus {
-                                PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
-                                PanelWFokusie::Dyski => table_select_prev(&mut dyski_ts, app.disk_list.len()),
-                                PanelWFokusie::Konfiguracja => table_select_prev(&mut konfiguracja_ts, usize::MAX),
-                                PanelWFokusie::SkanerLive => table_select_prev(&mut skaner_live_ts, usize::MAX),
-                                PanelWFokusie::SciezkiIO => table_select_prev(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                            },
-                            KeyCode::Down => match fokus {
-                                PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
-                                PanelWFokusie::Dyski => table_select_next(&mut dyski_ts, app.disk_list.len()),
-                                PanelWFokusie::Konfiguracja => table_select_next(&mut konfiguracja_ts, usize::MAX),
-                                PanelWFokusie::SkanerLive => table_select_next(&mut skaner_live_ts, usize::MAX),
-                                PanelWFokusie::SciezkiIO => table_select_next(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                            },
-                            KeyCode::PageUp => match fokus {
-                                PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
-                                PanelWFokusie::Dyski => table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                                PanelWFokusie::Konfiguracja => table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                                PanelWFokusie::SkanerLive => table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                                PanelWFokusie::SciezkiIO => table_select_page_up(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                            },
-                            KeyCode::PageDown => match fokus {
-                                PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
-                                PanelWFokusie::Dyski => table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW),
-                                PanelWFokusie::Konfiguracja => table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW),
-                                PanelWFokusie::SkanerLive => table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW),
-                                PanelWFokusie::SciezkiIO => table_select_page_down(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state), STRONA_LOGOW),
-                            },
-                            KeyCode::Home => match fokus {
-                                PanelWFokusie::Logi => {}
-                                PanelWFokusie::Dyski => table_select_home(&mut dyski_ts, app.disk_list.len()),
-                                PanelWFokusie::Konfiguracja => table_select_home(&mut konfiguracja_ts, usize::MAX),
-                                PanelWFokusie::SkanerLive => table_select_home(&mut skaner_live_ts, usize::MAX),
-                                PanelWFokusie::SciezkiIO => table_select_home(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                            },
-                            KeyCode::End => match fokus {
-                                PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
-                                PanelWFokusie::Dyski => table_select_end(&mut dyski_ts, app.disk_list.len()),
-                                PanelWFokusie::Konfiguracja => table_select_end(&mut konfiguracja_ts, usize::MAX),
-                                PanelWFokusie::SkanerLive => table_select_end(&mut skaner_live_ts, usize::MAX),
-                                PanelWFokusie::SciezkiIO => table_select_end(&mut sciezki_io_ts, crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state)),
-                            },
-                            _ => {}
-                        }
-                    }
+            && key.kind == KeyEventKind::Press
+        {
+            if opis_otwarty.is_some() {
+                // Patrz identyczna gałąź w live-pętli wyżej: nakładka
+                // przejmuje Enter/Esc całkowicie, PIERWSZE Enter/Esc ją
+                // zamyka zamiast wyjść z ekranu fazy — wyjście wymaga
+                // osobnego, kolejnego naciśnięcia.
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    opis_otwarty = None;
                 }
+            } else {
+                // Przewijanie/nawigacja NA EKRANIE KOŃCOWYM — operator
+                // dostaje szansę przejrzeć cały przebieg fazy (logi,
+                // dyski, statystyki, ścieżki) przed powrotem do menu, nie
+                // tylko ich ogon. `fokus`/stany tabel PRZEŻYŁY przejście
+                // z live-pętli (utworzone raz, przed `std::thread::scope`).
+                let pokaz_skaner_live = !ui_state.side_texts.is_empty();
+
+                // Wyjaśnienie etykiety zaznaczonego wiersza (patrz
+                // `opis_otwarty` i `crate::opisy_anomalii`) - policzone PRZED
+                // `match`, żeby Enter mógł albo otworzyć nakładkę (gdy coś
+                // faktycznie da się wyjaśnić), albo zachować dotychczasowe
+                // znaczenie "wyjdź z ekranu" (gdy nie ma czego wyjaśnić).
+                let opis_do_otwarcia = if fokus == PanelWFokusie::SkanerLive {
+                    crate::tui::scanner_panel::etykieta_wiersza(
+                        &ui_state,
+                        skaner_live_ts.selected().unwrap_or(0),
+                    )
+                    .and_then(|etykieta| {
+                        crate::opisy_anomalii::znajdz_opis(&etykieta).map(|w| (etykieta, w))
+                    })
+                } else {
+                    None
+                };
+
+                match key.code {
+                    KeyCode::Enter if opis_do_otwarcia.is_some() => {
+                        opis_otwarty = opis_do_otwarcia;
+                    }
+                    KeyCode::Enter | KeyCode::Esc => break,
+                    KeyCode::Tab => fokus = fokus.nastepny(pokaz_skaner_live),
+                    KeyCode::BackTab => fokus = fokus.poprzedni(pokaz_skaner_live),
+                    KeyCode::Up => match fokus {
+                        PanelWFokusie::Logi => ui_state.scroll_logs_up(1),
+                        PanelWFokusie::Dyski => {
+                            table_select_prev(&mut dyski_ts, app.disk_list.len())
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_prev(&mut konfiguracja_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_prev(&mut skaner_live_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_prev(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                        ),
+                    },
+                    KeyCode::Down => match fokus {
+                        PanelWFokusie::Logi => ui_state.scroll_logs_down(1),
+                        PanelWFokusie::Dyski => {
+                            table_select_next(&mut dyski_ts, app.disk_list.len())
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_next(&mut konfiguracja_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_next(&mut skaner_live_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_next(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                        ),
+                    },
+                    KeyCode::PageUp => match fokus {
+                        PanelWFokusie::Logi => ui_state.scroll_logs_up(STRONA_LOGOW),
+                        PanelWFokusie::Dyski => {
+                            table_select_page_up(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW)
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_page_up(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_page_up(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_page_up(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            STRONA_LOGOW,
+                        ),
+                    },
+                    KeyCode::PageDown => match fokus {
+                        PanelWFokusie::Logi => ui_state.scroll_logs_down(STRONA_LOGOW),
+                        PanelWFokusie::Dyski => {
+                            table_select_page_down(&mut dyski_ts, app.disk_list.len(), STRONA_LOGOW)
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_page_down(&mut konfiguracja_ts, usize::MAX, STRONA_LOGOW)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_page_down(&mut skaner_live_ts, usize::MAX, STRONA_LOGOW)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_page_down(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                            STRONA_LOGOW,
+                        ),
+                    },
+                    KeyCode::Home => match fokus {
+                        PanelWFokusie::Logi => {}
+                        PanelWFokusie::Dyski => {
+                            table_select_home(&mut dyski_ts, app.disk_list.len())
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_home(&mut konfiguracja_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_home(&mut skaner_live_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_home(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                        ),
+                    },
+                    KeyCode::End => match fokus {
+                        PanelWFokusie::Logi => ui_state.jump_to_latest_log(),
+                        PanelWFokusie::Dyski => {
+                            table_select_end(&mut dyski_ts, app.disk_list.len())
+                        }
+                        PanelWFokusie::Konfiguracja => {
+                            table_select_end(&mut konfiguracja_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SkanerLive => {
+                            table_select_end(&mut skaner_live_ts, usize::MAX)
+                        }
+                        PanelWFokusie::SciezkiIO => table_select_end(
+                            &mut sciezki_io_ts,
+                            crate::tui::scanner_panel::liczba_wierszy_sciezek(&ui_state),
+                        ),
+                    },
+                    _ => {}
+                }
+            }
+        }
     }
 
     Ok(start_time.elapsed())
@@ -727,21 +1259,56 @@ fn run_phase_z_opcjami(
 /// z kolumn wypełnianych przez fazy wcześniejsze, a Faza 09 konsumuje ścieżki
 /// wytworzone przez Fazy 17 i 18.
 const ZALEZNOSCI_FAZ: &[(u32, u32, &str)] = &[
-    (6,  17, "moduł przycinania śmieci kwalifikuje pliki po `eof_ok` z Fazy 06"),
-    (10, 17, "moduł sanityzacji tekstu kwalifikuje po `utf8_ok`/`is_oneliner` z Fazy 10"),
-    (12, 17, "moduły nagłówków i korekty rozszerzeń kwalifikują po `media_reason` z Fazy 12"),
-    (14, 17, "moduł zszywania kwalifikuje po `match_type` z korelacji Fazy 14"),
-    (19, 17, "moduły naprawy MP4 kwalifikują po `video_ok` z Fazy 19"),
-    (14, 18, "Smart Splice kwalifikuje pliki po `match_type` z korelacji Fazy 14"),
-    (17, 9,  "Faza 09 konsumuje `repaired_path_*` wytworzone przez Fazę 17"),
-    (18, 9,  "Faza 09 konsumuje `smart_splice_path` wytworzone przez Fazę 18"),
+    (
+        6,
+        17,
+        "moduł przycinania śmieci kwalifikuje pliki po `eof_ok` z Fazy 06",
+    ),
+    (
+        10,
+        17,
+        "moduł sanityzacji tekstu kwalifikuje po `utf8_ok`/`is_oneliner` z Fazy 10",
+    ),
+    (
+        12,
+        17,
+        "moduły nagłówków i korekty rozszerzeń kwalifikują po `media_reason` z Fazy 12",
+    ),
+    (
+        14,
+        17,
+        "moduł zszywania kwalifikuje po `match_type` z korelacji Fazy 14",
+    ),
+    (
+        19,
+        17,
+        "moduły naprawy MP4 kwalifikują po `video_ok` z Fazy 19",
+    ),
+    (
+        14,
+        18,
+        "Smart Splice kwalifikuje pliki po `match_type` z korelacji Fazy 14",
+    ),
+    (
+        17,
+        9,
+        "Faza 09 konsumuje `repaired_path_*` wytworzone przez Fazę 17",
+    ),
+    (
+        18,
+        9,
+        "Faza 09 konsumuje `smart_splice_path` wytworzone przez Fazę 18",
+    ),
 ];
 
 /// Fazy, które autopilot może POMINĄĆ warunkowo — ich brak na liście nie jest
 /// błędem.
 const FAZY_WARUNKOWE: &[(u32, &str)] = &[
     (16, "pomijana, gdy w `yara_rules/` nie ma żadnej reguły"),
-    (17, "pomijana, gdy nie wybrano ani jednego modułu naprawczego"),
+    (
+        17,
+        "pomijana, gdy nie wybrano ani jednego modułu naprawczego",
+    ),
 ];
 
 /// Wyciąga numer fazy z jej tytułu (`"Faza 07: Analiza Entropii"` → `7`).
@@ -769,26 +1336,34 @@ fn sprawdz_kolejnosc_autopilota(tytuly: &[&str]) -> Vec<String> {
         if let Some((_, powod)) = FAZY_WARUNKOWE.iter().find(|(f, _)| *f == faza) {
             continue_warunkowa(&mut naruszenia, faza, powod);
         } else {
-            naruszenia.push(format!("Faza {:02} NIE JEST uruchamiana przez autopilota", faza));
+            naruszenia.push(format!(
+                "Faza {:02} NIE JEST uruchamiana przez autopilota",
+                faza
+            ));
         }
     }
 
     // 2. Kolejność zależności.
     for &(wczesniejsza, pozniejsza, powod) in ZALEZNOSCI_FAZ {
         if let (Some(a), Some(b)) = (pozycja(wczesniejsza), pozycja(pozniejsza))
-            && a > b {
-                naruszenia.push(format!(
-                    "Faza {:02} musi poprzedzać Fazę {:02}: {}",
-                    wczesniejsza, pozniejsza, powod
-                ));
-            }
+            && a > b
+        {
+            naruszenia.push(format!(
+                "Faza {:02} musi poprzedzać Fazę {:02}: {}",
+                wczesniejsza, pozniejsza, powod
+            ));
+        }
     }
 
     // 3. Złota Kopia zamyka przebieg.
     if let Some(p) = pozycja(9)
-        && p != kolejnosc.len().saturating_sub(1) {
-            naruszenia.push("Faza 09 (Złota Kopia) musi być OSTATNIA - konsumuje wyniki wszystkich pozostałych".to_string());
-        }
+        && p != kolejnosc.len().saturating_sub(1)
+    {
+        naruszenia.push(
+            "Faza 09 (Złota Kopia) musi być OSTATNIA - konsumuje wyniki wszystkich pozostałych"
+                .to_string(),
+        );
+    }
 
     naruszenia
 }
@@ -796,7 +1371,10 @@ fn sprawdz_kolejnosc_autopilota(tytuly: &[&str]) -> Vec<String> {
 /// Brak fazy warunkowej to nie naruszenie — funkcja istnieje, żeby ten wyjątek
 /// był jawny w kodzie, a nie ukryty w pustej gałęzi `if`.
 fn continue_warunkowa(_naruszenia: &mut Vec<String>, faza: u32, powod: &str) {
-    debug!("Autopilot: Faza {:02} nieobecna, ale to dozwolone - {}", faza, powod);
+    debug!(
+        "Autopilot: Faza {:02} nieobecna, ale to dozwolone - {}",
+        faza, powod
+    );
 }
 
 // ============================================================================
@@ -823,25 +1401,112 @@ fn run_autopilot(
     let phase17_module_ids = phases::phase17_repair::all_module_ids();
 
     let mut phases_to_run: Vec<(&str, &str, &str, &str, PhaseFn)> = vec![
-        ("[  🗺️  ]", "Faza 01: Mapowanie struktury", "Akwizycja Systemu Plików", "Wczytuje ścieżki i buduje drzewo bazy danych.", Box::new(phases::phase1::run)),
-        ("[ 📏  ]", "Faza 02: Akwizycja Metadanych", "Rozmiary", "Oblicza rozmiary i wagi plików, eliminuje puste wydmuszki.", Box::new(phases::phase2::run)),
-        ("[ 🧬  ]", "Faza 03: Hashe BLAKE3 (Zgodne pliki)", "Kryptografia", "Generuje skróty plików wspólnych z prędkością NVMe.", Box::new(phases::phase3::run)),
-        ("[ 🧬  ]", "Faza 04: Hashe BLAKE3 (Brakujące)", "Kryptografia", "Skanuje pliki resztkowe i odrzuty.", Box::new(phases::phase4::run)),
-        ("[ 📅  ]", "Faza 05: Czas modyfikacji i prawa", "i-node", "Ekstrakcja uprawnień Unix i Timestampów modyfikacji.", Box::new(phases::phase5::run)),
-        ("[ 👻  ]", "Faza 06: Detekcja Pustych Plików", "Zawartość", "Szuka uciętych ogonów (Brak EOF) oraz wydmuszek po TRIM.", Box::new(phases::phase6::run)),
-        ("[ 🎲  ]", "Faza 07: Analiza Entropii", "Matematyka", "Szum informacyjny i zaszyfrowanie Ransomware.", Box::new(phases::phase7::run)),
-        ("[ 📜  ]", "Faza 10: Walidacja Tekstu (MIME)", "Semantyka", "Weryfikuje czystość znaków ASCII/UTF-8.", Box::new(phases::phase10::run)),
-        ("[ 📦  ]", "Faza 11: Walidacja Archiwów", "Kontenery", "Sprawdza drzewa Central Directory i Zip Bomby.", Box::new(phases::phase11::run)),
-        ("[ 📸  ]", "Faza 12: Struktury Obrazów (EXIF)", "Multimedia", "Odzyskuje GPS, oryginalne daty wykonania i sprzęt.", Box::new(phases::phase12::run)),
-        ("[ 🖼️   ]", "Faza 13: Dekodowanie Mediów", "Multimedia", "Renderuje obrazy w poszukiwaniu Gray Banding.", Box::new(phases::phase13::run)),
-        ("[  🎬  ]", "Faza 19: Diagnostyka Kontenerów Wideo", "Multimedia", "MP4/MOV/M4V, MKV/WebM, FLV oraz strumienie transportowe TS.", Box::new(phases::phase19_video::run)),
-        ("[ 👯‍♂️ ]", "Faza 14: Rozmyte Hashowanie", "Korelacja", "Szuka zaginionych bliźniaków (ssdeep).", Box::new(phases::phase14::run)),
-        ("[  🏷️  ]", "Faza 15: Rozszerzone Atrybuty", "Metadane", "Analizuje ukryte strumienie systemowe XATTR.", Box::new(phases::phase15::run)),
+        (
+            "[  🗺️  ]",
+            "Faza 01: Mapowanie struktury",
+            "Akwizycja Systemu Plików",
+            "Wczytuje ścieżki i buduje drzewo bazy danych.",
+            Box::new(phases::phase1::run),
+        ),
+        (
+            "[ 📏  ]",
+            "Faza 02: Akwizycja Metadanych",
+            "Rozmiary",
+            "Oblicza rozmiary i wagi plików, eliminuje puste wydmuszki.",
+            Box::new(phases::phase2::run),
+        ),
+        (
+            "[ 🧬  ]",
+            "Faza 03: Hashe BLAKE3 (Zgodne pliki)",
+            "Kryptografia",
+            "Generuje skróty plików wspólnych z prędkością NVMe.",
+            Box::new(phases::phase3::run),
+        ),
+        (
+            "[ 🧬  ]",
+            "Faza 04: Hashe BLAKE3 (Brakujące)",
+            "Kryptografia",
+            "Skanuje pliki resztkowe i odrzuty.",
+            Box::new(phases::phase4::run),
+        ),
+        (
+            "[ 📅  ]",
+            "Faza 05: Czas modyfikacji i prawa",
+            "i-node",
+            "Ekstrakcja uprawnień Unix i Timestampów modyfikacji.",
+            Box::new(phases::phase5::run),
+        ),
+        (
+            "[ 👻  ]",
+            "Faza 06: Detekcja Pustych Plików",
+            "Zawartość",
+            "Szuka uciętych ogonów (Brak EOF) oraz wydmuszek po TRIM.",
+            Box::new(phases::phase6::run),
+        ),
+        (
+            "[ 🎲  ]",
+            "Faza 07: Analiza Entropii",
+            "Matematyka",
+            "Szum informacyjny i zaszyfrowanie Ransomware.",
+            Box::new(phases::phase7::run),
+        ),
+        (
+            "[ 📜  ]",
+            "Faza 10: Walidacja Tekstu (MIME)",
+            "Semantyka",
+            "Weryfikuje czystość znaków ASCII/UTF-8.",
+            Box::new(phases::phase10::run),
+        ),
+        (
+            "[ 📦  ]",
+            "Faza 11: Walidacja Archiwów",
+            "Kontenery",
+            "Sprawdza drzewa Central Directory i Zip Bomby.",
+            Box::new(phases::phase11::run),
+        ),
+        (
+            "[ 📸  ]",
+            "Faza 12: Struktury Obrazów (EXIF)",
+            "Multimedia",
+            "Odzyskuje GPS, oryginalne daty wykonania i sprzęt.",
+            Box::new(phases::phase12::run),
+        ),
+        (
+            "[ 🖼️   ]",
+            "Faza 13: Dekodowanie Mediów",
+            "Multimedia",
+            "Renderuje obrazy w poszukiwaniu Gray Banding.",
+            Box::new(phases::phase13::run),
+        ),
+        (
+            "[  🎬  ]",
+            "Faza 19: Diagnostyka Kontenerów Wideo",
+            "Multimedia",
+            "MP4/MOV/M4V, MKV/WebM, FLV oraz strumienie transportowe TS.",
+            Box::new(phases::phase19_video::run),
+        ),
+        (
+            "[ 👯‍♂️ ]",
+            "Faza 14: Rozmyte Hashowanie",
+            "Korelacja",
+            "Szuka zaginionych bliźniaków (ssdeep).",
+            Box::new(phases::phase14::run),
+        ),
+        (
+            "[  🏷️  ]",
+            "Faza 15: Rozszerzone Atrybuty",
+            "Metadane",
+            "Analizuje ukryte strumienie systemowe XATTR.",
+            Box::new(phases::phase15::run),
+        ),
     ];
 
     match phase16_rules {
         Some(rules) => phases_to_run.push((
-            "[  ☢  ]", "Faza 16: Skanowanie YARA", "Malware", "Rozpoznaje zagrożenia wirusowe, notatki hakerskie.",
+            "[  ☢  ]",
+            "Faza 16: Skanowanie YARA",
+            "Malware",
+            "Rozpoznaje zagrożenia wirusowe, notatki hakerskie.",
             Box::new(move |conn, u, tx| phases::phase16::run(conn, u, tx, rules)),
         )),
         None => info!("Autopilot: Faza 16 pominięta (brak reguł YARA w 'yara_rules/')."),
@@ -849,8 +1514,13 @@ fn run_autopilot(
 
     if !phase17_module_ids.is_empty() {
         phases_to_run.push((
-            "[  🛠️  ]", "Faza 17: Aktywne Moduły Naprawcze", "Rekonstrukcja", "Fizycznie łata błędy w kodzie binarnym plików.",
-            Box::new(move |conn, u, tx| phases::phase17_repair::run(conn, u, tx, phase17_module_ids)),
+            "[  🛠️  ]",
+            "Faza 17: Aktywne Moduły Naprawcze",
+            "Rekonstrukcja",
+            "Fizycznie łata błędy w kodzie binarnym plików.",
+            Box::new(move |conn, u, tx| {
+                phases::phase17_repair::run(conn, u, tx, phase17_module_ids)
+            }),
         ));
     }
 
@@ -873,8 +1543,20 @@ fn run_autopilot(
         Box::new(phases::phase18_smart_splice::run),
     ));
 
-    phases_to_run.push(("[ 📝  ]", "Faza 08: Raport Końcowy (CSV)", "Eksport", "Wypuszcza ostateczny arkusz decyzyjny Euro-CSV.", Box::new(phases::phase8::run)));
-    phases_to_run.push(("[ 👑  ]", "Faza 09: Smart Merge (Złota Kopia)", "Fuzja", "Zlewa naprawione i zdrowe dane w wyczyszczoną kopię finalną.", Box::new(phases::phase9::run)));
+    phases_to_run.push((
+        "[ 📝  ]",
+        "Faza 08: Raport Końcowy (CSV)",
+        "Eksport",
+        "Wypuszcza ostateczny arkusz decyzyjny Euro-CSV.",
+        Box::new(phases::phase8::run),
+    ));
+    phases_to_run.push((
+        "[ 👑  ]",
+        "Faza 09: Smart Merge (Złota Kopia)",
+        "Fuzja",
+        "Zlewa naprawione i zdrowe dane w wyczyszczoną kopię finalną.",
+        Box::new(phases::phase9::run),
+    ));
 
     // SAMOKONTROLA: sprawdza kompletność listy i kolejność wymaganą przez
     // zależności danych między fazami. Naruszenie nie przerywa przebiegu —
@@ -888,17 +1570,25 @@ fn run_autopilot(
             // screen Ratatui, więc `println!`/`eprintln!` w tym miejscu
             // rozjechałoby ekran — ten sam powód, dla którego reszta projektu
             // raportuje przez `PhaseEvent`, a moduły naprawcze przez `tracing`.
-            warn!("Autopilot - naruszenie niezmiennika kolejności faz: {}", naruszenie);
+            warn!(
+                "Autopilot - naruszenie niezmiennika kolejności faz: {}",
+                naruszenie
+            );
         }
     }
 
     for (icon, title, category, desc, phase_fn) in phases_to_run {
-        let dur_res = run_phase_bez_czekania(terminal, conn, app, icon, title, category, desc, phase_fn);
+        let dur_res =
+            run_phase_bez_czekania(terminal, conn, app, icon, title, category, desc, phase_fn);
 
         let duration = dur_res.unwrap_or(Duration::from_secs(0));
 
         if crate::utils::CANCEL_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
-            completed_phases.push((title.to_string(), duration, "PRZERWANA (CTRL-C)".to_string()));
+            completed_phases.push((
+                title.to_string(),
+                duration,
+                "PRZERWANA (CTRL-C)".to_string(),
+            ));
             aborted = true;
             break; // Awaryjne zatrzymanie całego autopilota
         } else {
@@ -912,7 +1602,11 @@ fn run_autopilot(
     // Zrzut danych dla celów audytu do bazy
     let _ = conn.execute(
         "INSERT INTO autopilot_runs (duration_sec, status, phases_run) VALUES (?1, ?2, ?3)",
-        rusqlite::params![total_dur.as_secs_f64(), status_final, completed_phases.len() as i32]
+        rusqlite::params![
+            total_dur.as_secs_f64(),
+            status_final,
+            completed_phases.len() as i32
+        ],
     );
 
     show_autopilot_summary(terminal, &completed_phases, total_dur, aborted)
@@ -923,41 +1617,66 @@ fn show_autopilot_summary(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     results: &[(String, Duration, String)],
     total_time: Duration,
-    aborted: bool
+    aborted: bool,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| {
             let size = f.area();
-            let block = Block::default().borders(Borders::ALL)
-                .title(if aborted { " [ 🛑 ] Podsumowanie Auto-Pilota (PRZERWANO) " } else { " [ 🚀 ] Podsumowanie Auto-Pilota (SUKCES) " })
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(if aborted {
+                    " [ 🛑 ] Podsumowanie Auto-Pilota (PRZERWANO) "
+                } else {
+                    " [ 🚀 ] Podsumowanie Auto-Pilota (SUKCES) "
+                })
                 .border_style(Style::default().fg(if aborted { Color::Red } else { Color::Green }));
 
             let mut lines = vec![
-                ListItem::new(Span::styled(format!("Całkowity czas analizy: {:.2?}", total_time), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                ListItem::new(Span::styled(
+                    format!("Całkowity czas analizy: {:.2?}", total_time),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 ListItem::new(Span::raw("")),
             ];
 
             for (i, (name, dur, stat)) in results.iter().enumerate() {
-                let stat_color = if stat.contains("ZAKOŃCZONA") { Color::Green } else { Color::Red };
+                let stat_color = if stat.contains("ZAKOŃCZONA") {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
                 lines.push(ListItem::new(Line::from(vec![
-                    Span::styled(format!("[{:02}] ", i + 1), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("[{:02}] ", i + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::styled(format!("{:<40}", name), Style::default().fg(Color::White)),
                     Span::raw(" -> "),
                     Span::styled(format!("{:<15}", stat), Style::default().fg(stat_color)),
-                    Span::styled(format!("({:.2?})", dur), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("({:.2?})", dur),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ])));
             }
             lines.push(ListItem::new(Span::raw("")));
-            lines.push(ListItem::new(Span::styled("Naciśnij [ENTER], aby wrócić do Menu Głównego...", Style::default().fg(Color::Cyan))));
+            lines.push(ListItem::new(Span::styled(
+                "Naciśnij [ENTER], aby wrócić do Menu Głównego...",
+                Style::default().fg(Color::Cyan),
+            )));
 
             f.render_widget(List::new(lines).block(block), size);
         })?;
 
         if event::poll(Duration::from_millis(100))?
             && let Ok(event::Event::Key(key)) = event::read()
-                && key.kind == KeyEventKind::Press && (key.code == KeyCode::Enter || key.code == KeyCode::Esc) {
-                    break;
-                }
+            && key.kind == KeyEventKind::Press
+            && (key.code == KeyCode::Enter || key.code == KeyCode::Esc)
+        {
+            break;
+        }
     }
     Ok(())
 }
@@ -968,24 +1687,32 @@ fn show_autopilot_summary(
 
 /// Tymczasowo usypia Ratatui, oddaje kontrole do zwykłej, klasycznej konsoli (CLI), wykonuje stary kod,
 /// a następnie budzi się, powraca do trybu RAW i odbudowuje ekran Ratatui w nienaruszonym stanie.
-fn execute_with_cli_suspension<F>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut f: F) 
-where F: FnMut() 
+fn execute_with_cli_suspension<F>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut f: F)
+where
+    F: FnMut(),
 {
     info!("Zawieszanie środowiska graficznego (TUI) i przekazanie kontroli do tradycyjnego CLI...");
-    disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
-    terminal.show_cursor().unwrap();
+    disable_raw_mode().expect("Wyłączenie trybu surowego terminala nie powiodło się");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .expect("Opuszczenie alternatywnego ekranu terminala nie powiodło się");
+    terminal
+        .show_cursor()
+        .expect("Pokazanie kursora terminala nie powiodło się");
 
     f(); // Odpalenie wstrzykniętego kodu (Moduł CLI: np. reset, ustawienia)
 
     crate::utils::CANCEL_SIGNAL.store(false, std::sync::atomic::Ordering::SeqCst);
-    println!("\n{}", "Naciśnij [ENTER], aby wrócić do centrum dowodzenia...".bright_black());
+    println!(
+        "\n{}",
+        "Naciśnij [ENTER], aby wrócić do centrum dowodzenia...".bright_black()
+    );
     let mut dummy = String::new();
     let _ = io::stdin().read_line(&mut dummy);
 
     info!("Przywracanie sesji środowiska graficznego (TUI)...");
-    enable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), EnterAlternateScreen).unwrap();
+    enable_raw_mode().expect("Włączenie trybu surowego terminala nie powiodło się");
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .expect("Przejście do alternatywnego ekranu terminala nie powiodło się");
     // NIE `unwrap()`: od ratatui 0.30 `clear()` zapisuje i przywraca pozycję
     // kursora, czyli wysyła zapytanie DSR (`ESC[6n`) i czeka na odpowiedź
     // terminala. Tam, gdzie nikt nie odpowiada (wyjście przekierowane, potok,
@@ -1006,19 +1733,26 @@ where F: FnMut()
 /// o terminal (obserwowany bug: prompt nigdy się nie pojawiał, faza cicho
 /// ruszała dalej bez rzeczywistego wyboru użytkownika).
 fn suspend_tui_for_cli<F, R>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, f: F) -> R
-where F: FnOnce() -> R
+where
+    F: FnOnce() -> R,
 {
     info!("Zawieszanie środowiska graficznego (TUI) na czas interaktywnego wyboru...");
-    disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
-    terminal.show_cursor().unwrap();
+    disable_raw_mode().expect("Wyłączenie trybu surowego terminala nie powiodło się");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .expect("Opuszczenie alternatywnego ekranu terminala nie powiodło się");
+    terminal
+        .show_cursor()
+        .expect("Pokazanie kursora terminala nie powiodło się");
 
     let result = f();
 
     info!("Przywracanie sesji środowiska graficznego (TUI) po wyborze...");
-    enable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), EnterAlternateScreen).unwrap();
-    terminal.clear().unwrap();
+    enable_raw_mode().expect("Włączenie trybu surowego terminala nie powiodło się");
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .expect("Przejście do alternatywnego ekranu terminala nie powiodło się");
+    terminal
+        .clear()
+        .expect("Czyszczenie ekranu terminala nie powiodło się");
 
     result
 }
@@ -1060,17 +1794,38 @@ fn run_repair_submenu(
             Some(0) => {
                 // Wybór modułów MUSI nastąpić PRZED trybem Raw (ten sam
                 // powód co Faza 16 - konflikt dialoguer z aktywnym Ratatui).
-                let module_ids = suspend_tui_for_cli(terminal, phases::phase17_repair::select_active_module_ids);
+                let module_ids =
+                    suspend_tui_for_cli(terminal, phases::phase17_repair::select_active_module_ids);
                 match module_ids {
                     Some(module_ids) => {
-                        let phase_fn: PhaseFn = Box::new(move |conn, u, tx| phases::phase17_repair::run(conn, u, tx, module_ids));
-                        let _ = run_phase_with_ui(terminal, conn, app, "[  🛠️  ]", "Faza 17: Aktywne Moduły Naprawcze", "Rekonstrukcja", "Fizycznie łata błędy w kodzie binarnym zniszczonych plików.", phase_fn);
+                        let phase_fn: PhaseFn = Box::new(move |conn, u, tx| {
+                            phases::phase17_repair::run(conn, u, tx, module_ids)
+                        });
+                        let _ = run_phase_with_ui(
+                            terminal,
+                            conn,
+                            app,
+                            "[  🛠️  ]",
+                            "Faza 17: Aktywne Moduły Naprawcze",
+                            "Rekonstrukcja",
+                            "Fizycznie łata błędy w kodzie binarnym zniszczonych plików.",
+                            phase_fn,
+                        );
                     }
                     None => info!("Faza 17 pominięta - nie wybrano żadnych modułów naprawczych."),
                 }
             }
             Some(1) => {
-                let _ = run_phase_with_ui(terminal, conn, app, "[  🧩  ]", "Faza 18: Inteligentna Rekonstrukcja (Smart Splice)", "Rekonstrukcja", "Składa sprawny plik z dwóch uszkodzonych kopii (JPG/PNG, archiwa ZIP-podobne, TAR) z obowiązkową weryfikacją wyniku.", Box::new(phases::phase18_smart_splice::run));
+                let _ = run_phase_with_ui(
+                    terminal,
+                    conn,
+                    app,
+                    "[  🧩  ]",
+                    "Faza 18: Inteligentna Rekonstrukcja (Smart Splice)",
+                    "Rekonstrukcja",
+                    "Składa sprawny plik z dwóch uszkodzonych kopii (JPG/PNG, archiwa ZIP-podobne, TAR) z obowiązkową weryfikacją wyniku.",
+                    Box::new(phases::phase18_smart_splice::run),
+                );
             }
             Some(2) => {
                 let _ = run_dng_repair_with_ui(terminal, app, conn);
@@ -1148,7 +1903,15 @@ fn run_mp4_doctor_with_ui(
             let _ = terminal.show_cursor();
 
             let _ = std::process::Command::new("ffplay")
-                .args(["-autoexit", "-t", "3", "-v", "warning", "-window_title", "MP4 Doctor - podglad"])
+                .args([
+                    "-autoexit",
+                    "-t",
+                    "3",
+                    "-v",
+                    "warning",
+                    "-window_title",
+                    "MP4 Doctor - podglad",
+                ])
                 .arg(&sciezka)
                 .status();
 
@@ -1163,15 +1926,18 @@ fn run_mp4_doctor_with_ui(
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if event::poll(tick)?
-            && let event::Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
-                // Ctrl+C wychodzi z podekranu do menu Weryfikatora, nie zabija
-                // programu - ten sam kontrakt co w narzędziu DNG.
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    break;
-                }
-                app.handle_key(key);
+            && let event::Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
+            // Ctrl+C wychodzi z podekranu do menu Weryfikatora, nie zabija
+            // programu - ten sam kontrakt co w narzędziu DNG.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                break;
+            }
+            app.handle_key(key);
+        }
     }
 
     // Wyjście z podekranu nie może zostawić podniesionego znacznika —
@@ -1208,14 +1974,19 @@ fn run_dng_repair_with_ui(
         terminal.draw(|f| crate::tui::dng_repair_screen::draw_dng_repair_screen(f, &state))?;
 
         if event::poll(Duration::from_millis(50))?
-            && let event::Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    break;
-                }
-                dng_repair::handle_key(key, &mut state, conn, &paths, &mut log_file);
-                if state.should_exit { break; }
+            && let event::Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                break;
+            }
+            dng_repair::handle_key(key, &mut state, conn, &paths, &mut log_file);
+            if state.should_exit {
+                break;
+            }
+        }
 
         // Tryb automatyczny przetwarza jeden plik PER KLATKA (nie czeka na
         // klawisz) - żeby ekran mógł się odświeżać w trakcie długiego
@@ -1244,21 +2015,28 @@ fn run_settings_with_ui(
     let mut state = SettingsUiState::new();
 
     loop {
-        terminal.draw(|f| crate::tui::settings_screen::draw_settings_screen(f, &state, app.ustawienia))?;
+        terminal.draw(|f| {
+            crate::tui::settings_screen::draw_settings_screen(f, &state, app.ustawienia)
+        })?;
 
         if event::poll(Duration::from_millis(100))?
-            && let event::Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
-
-                // Awaryjne twarde wyjście (Ctrl+C) - spójne z resztą aplikacji
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    info!("Przechwycono Ctrl+C na ekranie ustawień. Powrót do menu głównego.");
-                    break;
-                }
-
-                settings_actions::handle_key(key, &mut state, app.ustawienia);
-                if state.should_exit { break; }
+            && let event::Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
+
+            // Awaryjne twarde wyjście (Ctrl+C) - spójne z resztą aplikacji
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                info!("Przechwycono Ctrl+C na ekranie ustawień. Powrót do menu głównego.");
+                break;
+            }
+
+            settings_actions::handle_key(key, &mut state, app.ustawienia);
+            if state.should_exit {
+                break;
+            }
+        }
     }
 
     info!("Zamknięto ekran ustawień.");
@@ -1286,7 +2064,12 @@ mod tests {
     fn test_kolejnosc_bez_skanera_live_pomija_ten_panel() {
         assert_eq!(
             PanelWFokusie::kolejnosc(false),
-            vec![PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::Logi, PanelWFokusie::SciezkiIO]
+            vec![
+                PanelWFokusie::Dyski,
+                PanelWFokusie::Konfiguracja,
+                PanelWFokusie::Logi,
+                PanelWFokusie::SciezkiIO
+            ]
         );
     }
 
@@ -1294,14 +2077,26 @@ mod tests {
     fn test_kolejnosc_ze_skanerem_live_zawiera_wszystkie_piec() {
         assert_eq!(
             PanelWFokusie::kolejnosc(true),
-            vec![PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::SkanerLive, PanelWFokusie::Logi, PanelWFokusie::SciezkiIO]
+            vec![
+                PanelWFokusie::Dyski,
+                PanelWFokusie::Konfiguracja,
+                PanelWFokusie::SkanerLive,
+                PanelWFokusie::Logi,
+                PanelWFokusie::SciezkiIO
+            ]
         );
     }
 
     #[test]
     fn test_nastepny_cyklicznie_okraza_cala_liste() {
         let mut p = PanelWFokusie::Logi;
-        for oczekiwany in [PanelWFokusie::SciezkiIO, PanelWFokusie::Dyski, PanelWFokusie::Konfiguracja, PanelWFokusie::SkanerLive, PanelWFokusie::Logi] {
+        for oczekiwany in [
+            PanelWFokusie::SciezkiIO,
+            PanelWFokusie::Dyski,
+            PanelWFokusie::Konfiguracja,
+            PanelWFokusie::SkanerLive,
+            PanelWFokusie::Logi,
+        ] {
             p = p.nastepny(true);
             assert_eq!(p, oczekiwany);
         }
@@ -1310,7 +2105,13 @@ mod tests {
     #[test]
     fn test_poprzedni_cyklicznie_okraza_cala_liste_w_odwrotna_strone() {
         let mut p = PanelWFokusie::Logi;
-        for oczekiwany in [PanelWFokusie::SkanerLive, PanelWFokusie::Konfiguracja, PanelWFokusie::Dyski, PanelWFokusie::SciezkiIO, PanelWFokusie::Logi] {
+        for oczekiwany in [
+            PanelWFokusie::SkanerLive,
+            PanelWFokusie::Konfiguracja,
+            PanelWFokusie::Dyski,
+            PanelWFokusie::SciezkiIO,
+            PanelWFokusie::Logi,
+        ] {
             p = p.poprzedni(true);
             assert_eq!(p, oczekiwany);
         }
@@ -1319,7 +2120,10 @@ mod tests {
     #[test]
     fn test_nastepny_pomija_skaner_live_gdy_nieobecny() {
         // Konfiguracja -> (pominięty SkanerLive) -> Logi
-        assert_eq!(PanelWFokusie::Konfiguracja.nastepny(false), PanelWFokusie::Logi);
+        assert_eq!(
+            PanelWFokusie::Konfiguracja.nastepny(false),
+            PanelWFokusie::Logi
+        );
     }
 
     #[test]
@@ -1327,6 +2131,153 @@ mod tests {
         for p in PanelWFokusie::kolejnosc(true) {
             assert_eq!(p.nastepny(true).poprzedni(true), p);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // sprawdz_dostepnosc_folderow — zabezpieczenie przed "przypadkowym
+    // skanowaniem" (zgłoszenie użytkownika): brakujący/odłączony wolumin
+    // musi przerwać fazę PRZED startem, z jasnym komunikatem — a nie
+    // zaliczać każdy plik jako osobny błąd I/O.
+    // ------------------------------------------------------------------
+
+    fn ustawienia_z_folderami(ufs: &Path, script: &Path, target: &Path) -> Ustawienia {
+        Ustawienia {
+            ufs_path: ufs.to_string_lossy().to_string(),
+            script_path: script.to_string_lossy().to_string(),
+            target_path: target.to_string_lossy().to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_wszystkie_foldery_dostepne_przechodzi() {
+        let ufs = tempfile::tempdir().expect("tempdir");
+        let script = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let u = ustawienia_z_folderami(ufs.path(), script.path(), target.path());
+
+        assert!(sprawdz_dostepnosc_folderow(&u).is_ok());
+    }
+
+    #[test]
+    fn test_brakujacy_folder_ufs_jest_bledem() {
+        let script = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let u = ustawienia_z_folderami(
+            Path::new("/nieistniejaca/sciezka/ufs"),
+            script.path(),
+            target.path(),
+        );
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+        assert!(wynik.is_err());
+        assert!(
+            wynik.unwrap_err().contains("UFS Explorer"),
+            "komunikat musi wskazywać, który folder źródłowy zawiódł"
+        );
+    }
+
+    #[test]
+    fn test_brakujacy_folder_skryptu_jest_bledem() {
+        let ufs = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let u = ustawienia_z_folderami(
+            ufs.path(),
+            Path::new("/nieistniejaca/sciezka/skrypt"),
+            target.path(),
+        );
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+        assert!(wynik.is_err());
+        assert!(wynik.unwrap_err().contains("Skrypt Autorski"));
+    }
+
+    #[test]
+    fn test_zrodlo_bedace_plikiem_nie_katalogiem_jest_bledem() {
+        let ufs_dir = tempfile::tempdir().expect("tempdir");
+        let plik_udajacy_folder = ufs_dir.path().join("to_jest_plik.txt");
+        std::fs::write(&plik_udajacy_folder, b"nie jestem katalogiem").expect("write");
+        let script = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let u = ustawienia_z_folderami(&plik_udajacy_folder, script.path(), target.path());
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+        assert!(wynik.is_err());
+        assert!(wynik.unwrap_err().contains("nie jest katalogiem"));
+    }
+
+    #[test]
+    fn test_brakujacy_folder_docelowy_zostaje_utworzony_automatycznie() {
+        let ufs = tempfile::tempdir().expect("tempdir");
+        let script = tempfile::tempdir().expect("tempdir");
+        let target_root = tempfile::tempdir().expect("tempdir");
+        let target_nieistniejacy = target_root.path().join("nowy_podkatalog_docelowy");
+        assert!(!target_nieistniejacy.exists());
+        let u = ustawienia_z_folderami(ufs.path(), script.path(), &target_nieistniejacy);
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+        assert!(
+            wynik.is_ok(),
+            "brak folderu docelowego nie powinien być twardym błędem — trzeba go utworzyć: {:?}",
+            wynik
+        );
+        assert!(
+            target_nieistniejacy.is_dir(),
+            "folder docelowy powinien zostać faktycznie utworzony na dysku"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_zrodlo_bez_prawa_odczytu_jest_bledem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Test wymaga uruchomienia jako zwykły użytkownik (root ignoruje
+        // bity uprawnień) — pomijamy w kontenerach/CI działających jako root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let ufs = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(ufs.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("nie można ustawić uprawnień testu");
+        let script = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let u = ustawienia_z_folderami(ufs.path(), script.path(), target.path());
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+
+        // Sprzątanie PRZED assercją — inaczej TempDir nie usunie katalogu 0o000 przy Drop.
+        let _ = std::fs::set_permissions(ufs.path(), std::fs::Permissions::from_mode(0o755));
+
+        assert!(wynik.is_err(), "folder bez prawa odczytu musi być odrzucony");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_folder_docelowy_bez_prawa_zapisu_jest_bledem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let ufs = tempfile::tempdir().expect("tempdir");
+        let script = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("nie można ustawić uprawnień testu");
+        let u = ustawienia_z_folderami(ufs.path(), script.path(), target.path());
+
+        let wynik = sprawdz_dostepnosc_folderow(&u);
+
+        let _ = std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o755));
+
+        assert!(
+            wynik.is_err(),
+            "folder docelowy bez prawa zapisu musi być odrzucony"
+        );
+        assert!(wynik.unwrap_err().contains("zapisu"));
     }
 
     // --- table_select_* ---
@@ -1343,7 +2294,11 @@ mod tests {
         let mut ts = TableState::default();
         ts.select(Some(4));
         table_select_next(&mut ts, 5);
-        assert_eq!(ts.selected(), Some(4), "5 wierszy = indeksy 0..=4, Next na ostatnim nie może wyjść poza zakres");
+        assert_eq!(
+            ts.selected(),
+            Some(4),
+            "5 wierszy = indeksy 0..=4, Next na ostatnim nie może wyjść poza zakres"
+        );
     }
 
     #[test]
@@ -1374,7 +2329,11 @@ mod tests {
         let mut ts = TableState::default();
         ts.select(Some(2));
         table_select_page_down(&mut ts, 5, 10);
-        assert_eq!(ts.selected(), Some(4), "skok większy niż tabela musi zatrzasnąć na ostatnim wierszu");
+        assert_eq!(
+            ts.selected(),
+            Some(4),
+            "skok większy niż tabela musi zatrzasnąć na ostatnim wierszu"
+        );
     }
 
     #[test]
@@ -1382,7 +2341,11 @@ mod tests {
         let mut ts = TableState::default();
         ts.select(Some(7));
         table_select_page_up(&mut ts, 100, 10);
-        assert_eq!(ts.selected(), Some(0), "saturating_sub nie może zejść poniżej zera");
+        assert_eq!(
+            ts.selected(),
+            Some(0),
+            "saturating_sub nie może zejść poniżej zera"
+        );
     }
 
     #[test]
@@ -1465,15 +2428,24 @@ mod tests {
 
         let tytul = |i: usize| app.selections.get(i).map(|(t, _)| *t).unwrap_or("");
 
-        assert!(tytul(25).contains("MP4 DOCTOR"), "indeks 25 musi być MP4 Doctor, jest: {:?}", tytul(25));
-        assert!(tytul(26).contains("USTAWIENIA"), "indeks 26 musi być ustawieniami, jest: {:?}", tytul(26));
+        assert!(
+            tytul(25).contains("MP4 DOCTOR"),
+            "indeks 25 musi być MP4 Doctor, jest: {:?}",
+            tytul(25)
+        );
+        assert!(
+            tytul(26).contains("USTAWIENIA"),
+            "indeks 26 musi być ustawieniami, jest: {:?}",
+            tytul(26)
+        );
 
         // Wyjście rozpoznawane jest dynamicznie jako OSTATNIA pozycja
         // (patrz `menu::run`), więc musi nią pozostać.
         let ostatni = app.selections.len() - 1;
         assert!(
             tytul(ostatni).contains("WYJŚCIE"),
-            "ostatnia pozycja musi być wyjściem, jest: {:?}", tytul(ostatni)
+            "ostatnia pozycja musi być wyjściem, jest: {:?}",
+            tytul(ostatni)
         );
     }
 
@@ -1483,20 +2455,32 @@ mod tests {
     #[test]
     fn test_separatory_zajmuja_ustalone_pozycje() {
         let mut u = crate::settings::Ustawienia::default();
-        let app = crate::menu::state::AppState::new(&mut u).unwrap();
+        let app = crate::menu::state::AppState::new(&mut u)
+            .expect("Inicjalizacja stanu aplikacji nie powiodła się");
 
-        let separatory: Vec<usize> = app.selections.iter().enumerate()
+        let separatory: Vec<usize> = app
+            .selections
+            .iter()
+            .enumerate()
             .filter(|(_, (t, _))| t.starts_with('─'))
             .map(|(i, _)| i)
             .collect();
 
-        assert_eq!(separatory, vec![1, 21], "separatory na innych pozycjach przesuwają akcje: {:?}", separatory);
+        assert_eq!(
+            separatory,
+            vec![1, 21],
+            "separatory na innych pozycjach przesuwają akcje: {:?}",
+            separatory
+        );
     }
 
     #[test]
     fn test_numer_fazy_czyta_z_tytulu() {
         assert_eq!(numer_fazy("Faza 01: Mapowanie struktury"), Some(1));
-        assert_eq!(numer_fazy("Faza 19: Diagnostyka Kontenerów Wideo"), Some(19));
+        assert_eq!(
+            numer_fazy("Faza 19: Diagnostyka Kontenerów Wideo"),
+            Some(19)
+        );
         assert_eq!(numer_fazy("Faza 8: bez zera wiodącego"), Some(8));
     }
 
@@ -1529,9 +2513,16 @@ mod tests {
     fn test_autopilot_obejmuje_wszystkie_19_faz() {
         assert_eq!(KOLEJNOSC_AUTOPILOTA.len(), 19);
 
-        let numery: Vec<u32> = KOLEJNOSC_AUTOPILOTA.iter().filter_map(|t| numer_fazy(t)).collect();
+        let numery: Vec<u32> = KOLEJNOSC_AUTOPILOTA
+            .iter()
+            .filter_map(|t| numer_fazy(t))
+            .collect();
         for faza in 1..=19u32 {
-            assert!(numery.contains(&faza), "Faza {:02} nie jest uruchamiana przez autopilota", faza);
+            assert!(
+                numery.contains(&faza),
+                "Faza {:02} nie jest uruchamiana przez autopilota",
+                faza
+            );
         }
     }
 
@@ -1545,14 +2536,16 @@ mod tests {
     #[test]
     fn test_kontrola_wylapuje_brak_fazy_18() {
         let bez_18: Vec<&str> = KOLEJNOSC_AUTOPILOTA
-            .iter().copied()
+            .iter()
+            .copied()
             .filter(|t| numer_fazy(t) != Some(18))
             .collect();
 
         let naruszenia = sprawdz_kolejnosc_autopilota(&bez_18);
         assert!(
             naruszenia.iter().any(|n| n.contains("Faza 18")),
-            "brak Fazy 18 MUSI zostać wychwycony, dostałem: {:?}", naruszenia
+            "brak Fazy 18 MUSI zostać wychwycony, dostałem: {:?}",
+            naruszenia
         );
     }
 
@@ -1560,12 +2553,19 @@ mod tests {
     fn test_kontrola_wylapuje_faze_18_po_fazie_09() {
         // Smart Splice po scalaniu nie ma sensu — Faza 09 już zdążyła wybrać
         // zwycięzców, nie widząc żadnego złożenia.
-        let zla = ["Faza 14: x", "Faza 09: Smart Merge", "Faza 18: Smart Splice"];
+        let zla = [
+            "Faza 14: x",
+            "Faza 09: Smart Merge",
+            "Faza 18: Smart Splice",
+        ];
         let naruszenia = sprawdz_kolejnosc_autopilota(&zla);
 
         assert!(
-            naruszenia.iter().any(|n| n.contains("Faza 18") && n.contains("Faza 09")),
-            "odwrócona kolejność 18/09 musi zostać wychwycona: {:?}", naruszenia
+            naruszenia
+                .iter()
+                .any(|n| n.contains("Faza 18") && n.contains("Faza 09")),
+            "odwrócona kolejność 18/09 musi zostać wychwycona: {:?}",
+            naruszenia
         );
     }
 
@@ -1577,8 +2577,11 @@ mod tests {
         let naruszenia = sprawdz_kolejnosc_autopilota(&zla);
 
         assert!(
-            naruszenia.iter().any(|n| n.contains("Faza 19") && n.contains("video_ok")),
-            "odwrócona kolejność 19/17 musi zostać wychwycona wraz z powodem: {:?}", naruszenia
+            naruszenia
+                .iter()
+                .any(|n| n.contains("Faza 19") && n.contains("video_ok")),
+            "odwrócona kolejność 19/17 musi zostać wychwycona wraz z powodem: {:?}",
+            naruszenia
         );
     }
 
@@ -1589,7 +2592,8 @@ mod tests {
 
         assert!(
             naruszenia.iter().any(|n| n.contains("OSTATNIA")),
-            "Faza 09 nie na końcu musi zostać wychwycona: {:?}", naruszenia
+            "Faza 09 nie na końcu musi zostać wychwycona: {:?}",
+            naruszenia
         );
     }
 
@@ -1604,14 +2608,19 @@ mod tests {
     fn test_brak_faz_warunkowych_nie_jest_naruszeniem() {
         for pomijana in [16u32, 17u32] {
             let lista: Vec<&str> = KOLEJNOSC_AUTOPILOTA
-                .iter().copied()
+                .iter()
+                .copied()
                 .filter(|t| numer_fazy(t) != Some(pomijana))
                 .collect();
 
             let naruszenia = sprawdz_kolejnosc_autopilota(&lista);
             assert!(
-                !naruszenia.iter().any(|n| n.contains(&format!("Faza {:02} NIE JEST", pomijana))),
-                "Faza {:02} jest warunkowa - jej brak nie może być błędem: {:?}", pomijana, naruszenia
+                !naruszenia
+                    .iter()
+                    .any(|n| n.contains(&format!("Faza {:02} NIE JEST", pomijana))),
+                "Faza {:02} jest warunkowa - jej brak nie może być błędem: {:?}",
+                pomijana,
+                naruszenia
             );
         }
     }
@@ -1625,7 +2634,10 @@ mod tests {
         assert_eq!(numery, vec![16, 17]);
 
         for (_, powod) in FAZY_WARUNKOWE {
-            assert!(!powod.is_empty(), "każda faza warunkowa musi mieć zapisany powód");
+            assert!(
+                !powod.is_empty(),
+                "każda faza warunkowa musi mieć zapisany powód"
+            );
         }
     }
 
@@ -1638,11 +2650,18 @@ mod tests {
         assert!(!ZALEZNOSCI_FAZ.is_empty());
 
         for &(a, b, powod) in ZALEZNOSCI_FAZ {
-            assert!((1..=19).contains(&a) && (1..=19).contains(&b), "numery faz poza zakresem: {} -> {}", a, b);
+            assert!(
+                (1..=19).contains(&a) && (1..=19).contains(&b),
+                "numery faz poza zakresem: {} -> {}",
+                a,
+                b
+            );
             assert_ne!(a, b, "faza nie może zależeć od siebie samej");
             assert!(
                 powod.len() > 20,
-                "zależność {} -> {} potrzebuje powodu wyjaśniającego JAKĄ daną przekazuje", a, b
+                "zależność {} -> {} potrzebuje powodu wyjaśniającego JAKĄ daną przekazuje",
+                a,
+                b
             );
         }
     }
@@ -1654,7 +2673,9 @@ mod tests {
         for &(a, b, _) in ZALEZNOSCI_FAZ {
             assert!(
                 !ZALEZNOSCI_FAZ.iter().any(|&(c, d, _)| c == b && d == a),
-                "sprzeczne zależności między Fazą {:02} i {:02}", a, b
+                "sprzeczne zależności między Fazą {:02} i {:02}",
+                a,
+                b
             );
         }
     }
@@ -1663,7 +2684,13 @@ mod tests {
     fn test_pusta_lista_nie_panikuje() {
         // Nie zgłasza kolejności, ale zgłosi brak faz nieopcjonalnych.
         let naruszenia = sprawdz_kolejnosc_autopilota(&[]);
-        assert!(!naruszenia.is_empty(), "pusta lista to brak wszystkich faz obowiązkowych");
-        assert!(!naruszenia.iter().any(|n| n.contains("Faza 16 NIE JEST")), "16 jest warunkowa");
+        assert!(
+            !naruszenia.is_empty(),
+            "pusta lista to brak wszystkich faz obowiązkowych"
+        );
+        assert!(
+            !naruszenia.iter().any(|n| n.contains("Faza 16 NIE JEST")),
+            "16 jest warunkowa"
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 //! # Faza 4: Uniwersalna Akwizycja Sum Kontrolnych (BLAKE3) i Magicznych Bajtów
 //!
-//! Zintegrowany, jednoprzebiegowy silnik skanujący dla plików resztkowych 
+//! Zintegrowany, jednoprzebiegowy silnik skanujący dla plików resztkowych
 //! (unikalnych oraz tych o różnym rozmiarze). Posiada twardy limit RAM (sync_channel),
 //! zintegrowaną w locie weryfikację Magic Bytes oraz obsługę systemu Dual-Logging,
 //! a komunikacja wizualna opiera się na Ratatui PhaseEvent.
@@ -38,16 +38,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, hash_file, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path, hash_file};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{info, instrument, warn};
 
@@ -97,11 +97,11 @@ pub(crate) struct LiveStats {
     /// Błędy I/O przy otwieraniu LUB przy właściwym hashowaniu ([`hash_file`]).
     hash_errors: AtomicUsize,
     magic_errors: AtomicUsize,
-    valid_signatures: AtomicUsize, 
-    
+    valid_signatures: AtomicUsize,
+
     /// Suma wag (bajtów) per rozszerzenie — do "Top format" w panelu bocznym.
-    ext_weights: Mutex<HashMap<String, u64>>, 
-    
+    ext_weights: Mutex<HashMap<String, u64>>,
+
     offset_anomalies: AtomicUsize,
     null_padding: AtomicUsize,
     ascii_trash: AtomicUsize,
@@ -152,7 +152,11 @@ impl LiveStats {
 /// śledzenie wątków w SEQUENTIAL, gdzie w rzeczywistości działa CAŁA
 /// globalna pula, nie dedykowana połówka).
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje zbiorczy blok `[Kryptografia i sygnatury (Resztki)]` sumując
@@ -160,28 +164,60 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 /// stron — mirror `phase3::build_crypto_block` (Wariant B), patrz
 /// dokumentacja modułu.
 fn build_crypto_block(own: &LiveStats, other: &LiveStats, start_time: Instant) -> String {
-    let combined_bytes = own.processed_bytes.load(Ordering::Relaxed) + other.processed_bytes.load(Ordering::Relaxed);
+    let combined_bytes =
+        own.processed_bytes.load(Ordering::Relaxed) + other.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed_mb = (combined_bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_exts_str = {
         let mut merged: HashMap<String, u64> = HashMap::new();
-        for (k, v) in own.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
-        for (k, v) in other.ext_weights.lock().unwrap().iter() { *merged.entry(k.clone()).or_insert(0) += v; }
+        for (k, v) in own
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            *merged.entry(k.clone()).or_insert(0) += v;
+        }
+        for (k, v) in other
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            *merged.entry(k.clone()).or_insert(0) += v;
+        }
         let mut sorted: Vec<_> = merged.into_iter().collect();
         sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_top = if top_exts_str.is_empty() { "Analiza danych...".to_string() } else { top_exts_str };
+    let display_top = if top_exts_str.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_exts_str
+    };
 
-    let combined_valid = own.valid_signatures.load(Ordering::Relaxed) + other.valid_signatures.load(Ordering::Relaxed);
-    let combined_io_err = own.hash_errors.load(Ordering::Relaxed) + other.hash_errors.load(Ordering::Relaxed);
-    let combined_magic_err = own.magic_errors.load(Ordering::Relaxed) + other.magic_errors.load(Ordering::Relaxed);
+    let combined_valid = own.valid_signatures.load(Ordering::Relaxed)
+        + other.valid_signatures.load(Ordering::Relaxed);
+    let combined_io_err =
+        own.hash_errors.load(Ordering::Relaxed) + other.hash_errors.load(Ordering::Relaxed);
+    let combined_magic_err =
+        own.magic_errors.load(Ordering::Relaxed) + other.magic_errors.load(Ordering::Relaxed);
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&own.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&own.thread_activity.snapshot());
 
     format!(
         "[Kryptografia i sygnatury (Resztki)]\nPrędkość: {:.2} MB/s\nTop format: {}\nPoprawne sygnatury: {}\nBłędy I/O: {}\nSpoofing (magic): {}\nWątki BLAKE3 (Wariant A): {}",
@@ -195,7 +231,8 @@ fn build_crypto_block(own: &LiveStats, other: &LiveStats, start_time: Instant) -
 /// zbiorcza liczba "Anomalie nagłówka (suma)") rozpisuje każdą kategorię
 /// osobno, dokładnie tak jak Faza 3.
 fn build_anomaly_block(own: &LiveStats, other: &LiveStats) -> String {
-    let sum = |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
+    let sum =
+        |a: &AtomicUsize, b: &AtomicUsize| a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
 
     format!(
         "[Anomalie nagłówka (Resztki)]\nPrzesunięty nagłówek: {}\nNull-padding: {}\nŚmieci ASCII: {}\nMikro-plik <32B: {}\nZła pod-sygnatura: {}\nSkażony slack space: {}\nIniekcja pasożytnicza: {}\nKonflikt endian: {}\nUrwana granica sektora: {}\nWysoka wolatywność: {}",
@@ -240,50 +277,78 @@ struct HeaderAnomalies {
 /// niezależne i samodzielnie kompletne, zgodnie z resztą architektury projektu).
 fn analyze_header_cluster(buf: &[u8], file_size: u64, ext: &str) -> HeaderAnomalies {
     let mut anom = HeaderAnomalies {
-        is_micro: false, has_null: false, has_offset: false, has_trash: false,
-        sub_magic_err: false, slack_contam: false, parasitic: false,
-        endian_conflict: false, boundary_drop: false, high_volatility: false,
+        is_micro: false,
+        has_null: false,
+        has_offset: false,
+        has_trash: false,
+        sub_magic_err: false,
+        slack_contam: false,
+        parasitic: false,
+        endian_conflict: false,
+        boundary_drop: false,
+        high_volatility: false,
     };
 
     if file_size < 32 || buf.len() < 32 {
         anom.is_micro = true;
-        return anom; 
+        return anom;
     }
 
     anom.has_null = buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0x00;
-    
-    anom.has_offset = buf.windows(4).position(|w| {
-        w == b"\xFF\xD8\xFF\xE0" || w == b"\xFF\xD8\xFF\xE1" ||
-        w == b"\x50\x4B\x03\x04" ||
-        w == b"%PDF" ||
-        w == b"\x89PNG"
-    }).is_some_and(|pos| pos > 0 && pos < buf.len().saturating_sub(4));
+
+    anom.has_offset = buf
+        .windows(4)
+        .position(|w| {
+            w == b"\xFF\xD8\xFF\xE0"
+                || w == b"\xFF\xD8\xFF\xE1"
+                || w == b"\x50\x4B\x03\x04"
+                || w == b"%PDF"
+                || w == b"\x89PNG"
+        })
+        .is_some_and(|pos| pos > 0 && pos < buf.len().saturating_sub(4));
 
     let is_pdf = &buf[0..4] == b"%PDF";
-    anom.has_trash = !is_pdf && buf[0..4].iter().all(|b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation()) 
-        && !anom.has_offset 
+    anom.has_trash = !is_pdf
+        && buf[0..4]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b.is_ascii_punctuation())
+        && !anom.has_offset
         && matches!(ext, "jpg" | "zip" | "mp4" | "png");
 
-    if buf.len() >= 12 && &buf[0..4] == b"RIFF" && &buf[8..12] != b"AVI " && &buf[8..12] != b"WEBP" && &buf[8..12] != b"WAVE" {
+    if buf.len() >= 12
+        && &buf[0..4] == b"RIFF"
+        && &buf[8..12] != b"AVI "
+        && &buf[8..12] != b"WEBP"
+        && &buf[8..12] != b"WAVE"
+    {
         anom.sub_magic_err = true;
     }
-    
-    if buf.len() >= 10 && &buf[0..2] == b"BM" && (buf[6] != 0 || buf[7] != 0 || buf[8] != 0 || buf[9] != 0) {
+
+    if buf.len() >= 10
+        && &buf[0..2] == b"BM"
+        && (buf[6] != 0 || buf[7] != 0 || buf[8] != 0 || buf[9] != 0)
+    {
         anom.slack_contam = true;
     }
-    
-    anom.parasitic = buf[32..].windows(4).any(|w| w == b"\x50\x4B\x03\x04" || w == b"\x50\x45\x00\x00");
 
-    if buf.len() >= 4 && &buf[0..2] == b"II" && buf[2] == 0x00 && buf[3] == 0x2A { 
+    anom.parasitic = buf[32..]
+        .windows(4)
+        .any(|w| w == b"\x50\x4B\x03\x04" || w == b"\x50\x45\x00\x00");
+
+    if buf.len() >= 4 && &buf[0..2] == b"II" && buf[2] == 0x00 && buf[3] == 0x2A {
         anom.endian_conflict = true;
     }
 
     if buf.len() >= 512 {
-        anom.boundary_drop = (buf[508] == 0x00 && buf[509] == 0x00 && buf[510] == 0x00 && buf[511] == 0x00) 
-                          || (buf[508] == 0xFF && buf[509] == 0xFF && buf[510] == 0xFF && buf[511] == 0xFF);
+        anom.boundary_drop =
+            (buf[508] == 0x00 && buf[509] == 0x00 && buf[510] == 0x00 && buf[511] == 0x00)
+                || (buf[508] == 0xFF && buf[509] == 0xFF && buf[510] == 0xFF && buf[511] == 0xFF);
     }
 
-    let volatility: i32 = buf.windows(2).map(|w| (w[0] as i32 - w[1] as i32).abs()).sum();
+    let volatility: i32 = buf
+        .windows(2)
+        .map(|w| (w[0] as i32 - w[1] as i32).abs())
+        .sum();
     anom.high_volatility = volatility > 60000;
 
     anom
@@ -320,34 +385,72 @@ pub struct StreamCtx<'a> {
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
     pub start_time: Instant,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
-
 #[allow(clippy::match_like_matches_macro)]
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, other_stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log, start_time } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        other_stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        start_time,
+        debug_log,
+    } = ctx;
+    let metoda = "hash_file (BLAKE3, magic bytes)";
 
     tasks.par_chunks(CHUNK_SIZE).for_each_init(
         || (tx_db.clone(), Instant::now(), Vec::new()),
         |(tx, last_ui_update, log_buf), chunk| {
-            if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
+            if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                return;
+            }
 
             let mut results = Vec::with_capacity(chunk.len());
             let mut local_ext_weights: HashMap<String, u64> = HashMap::new();
 
             for task in chunk {
-                if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 let full_path: PathBuf = base_path.join(&task.rel_path);
                 let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+
+                // Log info: linia "Start" PRZED jakimkolwiek I/O — niezależnie
+                // od tego, na której ścieżce wyjścia plik się skończy (patrz
+                // "Koniec" w każdej z nich niżej).
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                ));
 
                 let mut file = match File::open(&full_path) {
                     Ok(f) => f,
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
-                        log_buf.push(format!("[{}] Błąd I/O (Brak dostępu): \"{}\"", side_label, task.rel_path));
-                        results.push(ScanResult { id: task.id, hash: None, magic_ok: None, io_error: Some(true) });
+                        log_buf.push(format!(
+                            "[{}] Błąd I/O (Brak dostępu): \"{}\"",
+                            side_label, task.rel_path
+                        ));
+                        log_buf.push(format!(
+                            "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: BŁĄD I/O (otwarcie)] Źródło: \"{}\"",
+                            crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                        ));
+                        results.push(ScanResult {
+                            id: task.id,
+                            hash: None,
+                            magic_ok: None,
+                            io_error: Some(true),
+                        });
                         continue;
                     }
                 };
@@ -358,63 +461,136 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 drop(file);
 
                 if first_read == 0 {
-                    let empty_hash = stats.thread_activity.track_current(|| hash_file(&full_path)).ok();
+                    let call_start = debug_log.is_active().then(Instant::now);
+                    let wynik_hash = stats
+                        .thread_activity
+                        .track_current(|| hash_file(&full_path));
+                    let wynik = if wynik_hash.is_ok() { "OK" } else { "BŁĄD I/O" };
+                    if let Some(t) = call_start {
+                        debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+                    }
+                    log_buf.push(format!(
+                        "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                        crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                    ));
+                    let empty_hash = wynik_hash.ok();
                     results.push(ScanResult {
                         id: task.id,
                         hash: empty_hash,
-                        magic_ok: Some(true), io_error: Some(false)
+                        magic_ok: Some(true),
+                        io_error: Some(false),
                     });
                     continue;
                 }
 
                 let first_chunk = &buffer[..first_read];
-                
-                let file_name = Path::new(&task.rel_path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-                let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
-                
+
+                let file_name = Path::new(&task.rel_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let ext = Path::new(&task.rel_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("brak")
+                    .to_lowercase();
+
                 *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size as u64;
 
                 let a = analyze_header_cluster(first_chunk, file_size, &ext);
-                
+
                 let mut detected_anomalies = Vec::new();
 
-                if a.is_micro { stats.micro_files.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Mikro-plik (<32B)"); }
-                if a.has_null { stats.null_padding.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Puste bloki (Null-Padding)"); }
-                if a.has_offset { stats.offset_anomalies.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Przesunięty Nagłówek"); }
-                if a.has_trash { stats.ascii_trash.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Śmieci ASCII"); }
-                if a.sub_magic_err { stats.sub_magic_errors.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Błąd Pod-Sygnatury"); }
-                if a.slack_contam { stats.slack_space_contam.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Skażenie Slack Space"); }
-                if a.parasitic { stats.parasitic_injections.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Iniekcja Pasożytnicza"); }
-                if a.endian_conflict { stats.endian_conflicts.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Konflikt Endianness"); }
-                if a.boundary_drop { stats.boundary_drops.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Urwana Granica Sektora"); }
-                if a.high_volatility { stats.high_volatility.fetch_add(1, Ordering::Relaxed); detected_anomalies.push("Wysoka Wolatywność (HFV)"); }
+                if a.is_micro {
+                    stats.micro_files.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Mikro-plik (<32B)");
+                }
+                if a.has_null {
+                    stats.null_padding.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Puste bloki (Null-Padding)");
+                }
+                if a.has_offset {
+                    stats.offset_anomalies.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Przesunięty Nagłówek");
+                }
+                if a.has_trash {
+                    stats.ascii_trash.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Śmieci ASCII");
+                }
+                if a.sub_magic_err {
+                    stats.sub_magic_errors.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Błąd Pod-Sygnatury");
+                }
+                if a.slack_contam {
+                    stats.slack_space_contam.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Skażenie Slack Space");
+                }
+                if a.parasitic {
+                    stats.parasitic_injections.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Iniekcja Pasożytnicza");
+                }
+                if a.endian_conflict {
+                    stats.endian_conflicts.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Konflikt Endianness");
+                }
+                if a.boundary_drop {
+                    stats.boundary_drops.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Urwana Granica Sektora");
+                }
+                if a.high_volatility {
+                    stats.high_volatility.fetch_add(1, Ordering::Relaxed);
+                    detected_anomalies.push("Wysoka Wolatywność (HFV)");
+                }
 
                 let mut magic_ok = Some(true);
                 if file_name.contains('.') {
                     let parts: Vec<&str> = file_name.split('.').filter(|s| !s.is_empty()).collect();
-                    let ext_parts = if parts.len() > 1 { &parts[1..] } else { &parts[0..] };
+                    let ext_parts = if parts.len() > 1 {
+                        &parts[1..]
+                    } else {
+                        &parts[0..]
+                    };
 
                     if let Some(kind) = infer::get(first_chunk) {
                         let kind_ext = kind.extension();
                         let matches = ext_parts.iter().any(|&e| {
-                            kind_ext == e || match (kind_ext, e) {
-                                ("jpg", "jpeg") | ("jpeg", "jpg") => true,
-                                ("tif", "tiff") | ("tiff", "tif") | ("tif", "dng") | ("tiff", "dng") | ("tif", "cr2") | ("tif", "nef") | ("tif", "arw") => true, 
-                                ("heic", "heif") | ("heif", "heic") | ("heic", "hef") | ("heif", "hef") => true,
-                                ("mp4", "m4v") | ("mov", "mp4") | ("mp4", "mov") => true, 
-                                ("mkv", "webm") | ("webm", "mkv") => true, 
-                                ("mpeg", "mpg") | ("mpg", "mpeg") | ("mpeg", "ts") | ("mpg", "ts") => true, 
-                                ("ogg", "ogv") | ("ogg", "oga") | ("ogg", "ogx") => true,
-                                ("flv", "f4v") => true,
-                                ("zip", "docx") | ("zip", "xlsx") | ("zip", "pptx") => true,
-                                ("zip", "odt") | ("zip", "ods") | ("zip", "odp") => true,
-                                ("zip", "epub") | ("zip", "apk") | ("zip", "jar") => true,
-                                ("gz", "tar") | ("bz2", "tar") | ("7z", "tar") | ("rar", "tar") => true,
-                                ("sqlite", "db") | ("sqlite", "sqlite3") | ("sqlite3", "db") => true,
-                                ("htm", "html") | ("html", "htm") => true,
-                                ("mid", "midi") | ("midi", "mid") => true,
-                                _ => false,
-                            }
+                            kind_ext == e
+                                || match (kind_ext, e) {
+                                    ("jpg", "jpeg") | ("jpeg", "jpg") => true,
+                                    ("tif", "tiff")
+                                    | ("tiff", "tif")
+                                    | ("tif", "dng")
+                                    | ("tiff", "dng")
+                                    | ("tif", "cr2")
+                                    | ("tif", "nef")
+                                    | ("tif", "arw") => true,
+                                    ("heic", "heif")
+                                    | ("heif", "heic")
+                                    | ("heic", "hef")
+                                    | ("heif", "hef") => true,
+                                    ("mp4", "m4v") | ("mov", "mp4") | ("mp4", "mov") => true,
+                                    ("mkv", "webm") | ("webm", "mkv") => true,
+                                    ("mpeg", "mpg")
+                                    | ("mpg", "mpeg")
+                                    | ("mpeg", "ts")
+                                    | ("mpg", "ts") => true,
+                                    ("ogg", "ogv") | ("ogg", "oga") | ("ogg", "ogx") => true,
+                                    ("flv", "f4v") => true,
+                                    ("zip", "docx") | ("zip", "xlsx") | ("zip", "pptx") => true,
+                                    ("zip", "odt") | ("zip", "ods") | ("zip", "odp") => true,
+                                    ("zip", "epub") | ("zip", "apk") | ("zip", "jar") => true,
+                                    ("gz", "tar")
+                                    | ("bz2", "tar")
+                                    | ("7z", "tar")
+                                    | ("rar", "tar") => true,
+                                    ("sqlite", "db")
+                                    | ("sqlite", "sqlite3")
+                                    | ("sqlite3", "db") => true,
+                                    ("htm", "html") | ("html", "htm") => true,
+                                    ("mid", "midi") | ("midi", "mid") => true,
+                                    _ => false,
+                                }
                         });
 
                         if matches {
@@ -435,34 +611,62 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 if !detected_anomalies.is_empty() {
                     let anomalies_str = detected_anomalies.join(", ");
-                    log_buf.push(format!("[{:<15}] [{}] Format: .{:<5} | Ścieżka: \"{}\"", side_label, anomalies_str, ext, full_path.display()));
+                    log_buf.push(format!(
+                        "[{:<15}] [{}] Format: .{:<5} | Ścieżka: \"{}\"",
+                        side_label,
+                        anomalies_str,
+                        ext,
+                        full_path.display()
+                    ));
                 }
 
-                let file_hash = match stats.thread_activity.track_current(|| hash_file(&full_path)) {
+                let call_start = debug_log.is_active().then(Instant::now);
+                let wynik_hash = stats
+                    .thread_activity
+                    .track_current(|| hash_file(&full_path));
+                let wynik = match &wynik_hash {
+                    Ok(_) => "OK",
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => "PRZERWANO",
+                    Err(_) => "BŁĄD I/O",
+                };
+                if let Some(t) = call_start {
+                    debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+                }
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                ));
+                let file_hash = match wynik_hash {
                     Ok(h) => Some(h),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                        None
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => None,
                     Err(_) => {
                         stats.hash_errors.fetch_add(1, Ordering::Relaxed);
-                        log_buf.push(format!("[{}] Błąd I/O podczas właściwego hashowania: \"{}\"", side_label, task.rel_path));
+                        log_buf.push(format!(
+                            "[{}] Błąd I/O podczas właściwego hashowania: \"{}\"",
+                            side_label, task.rel_path
+                        ));
                         None
                     }
                 };
 
-                if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
+                if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 stats.processed_files.fetch_add(1, Ordering::Relaxed);
-                stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
+                stats
+                    .processed_bytes
+                    .fetch_add(file_size, Ordering::Relaxed);
 
                 let current = stats.processed_files.load(Ordering::Relaxed);
                 let now = Instant::now();
-                
+
                 if now.duration_since(*last_ui_update).as_millis() > 60 {
-                    *last_ui_update = now; 
+                    *last_ui_update = now;
 
                     if !local_ext_weights.is_empty() {
-                        let mut global_map = stats.ext_weights.lock().unwrap();
+                        let mut global_map =
+                            stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                         for (k, v) in local_ext_weights.drain() {
                             *global_map.entry(k).or_insert(0) += v;
                         }
@@ -488,27 +692,28 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     });
                 }
 
-                results.push(ScanResult { 
-                    id: task.id, 
-                    hash: file_hash, 
-                    magic_ok, 
-                    io_error: Some(false) 
+                results.push(ScanResult {
+                    id: task.id,
+                    hash: file_hash,
+                    magic_ok,
+                    io_error: Some(false),
                 });
             }
 
             if !local_ext_weights.is_empty() {
-                let mut global_map = stats.ext_weights.lock().unwrap();
+                let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in local_ext_weights.drain() {
                     *global_map.entry(k).or_insert(0) += v;
                 }
             }
 
             if !log_buf.is_empty()
-                && let Ok(mut f) = opr_log.lock() {
-                    for line in log_buf.drain(..) {
-                        let _ = writeln!(f, "{}", line);
-                    }
+                && let Ok(mut f) = opr_log.lock()
+            {
+                for line in log_buf.drain(..) {
+                    let _ = writeln!(f, "{}", line);
                 }
+            }
 
             if !results.is_empty() {
                 if is_ufs {
@@ -517,7 +722,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     let _ = tx.send(ScanMsg::ScriptChunk(results));
                 }
             }
-        }
+        },
     );
 
     let _ = tx_ui.send(PhaseEvent::UpdateBar {
@@ -559,7 +764,8 @@ const SQL_FINALIZACJA_HASHY: &str = "UPDATE files SET
 /// [`SQL_FINALIZACJA_HASHY`] powyżej, z tego samego powodu: raport ma liczyć
 /// wyłącznie pliki ze swojej domeny (resztki/unikaty), inaczej wliczyłby też
 /// pliki zgodne rozmiarowo, którymi zajmuje się i raportuje już Faza 3.
-const SQL_RAPORT_HASHY: &str = "SELECT relative_path, hash_match, magic_ok_ufs, magic_ok_script, found_in_ufs, found_in_script
+const SQL_RAPORT_HASHY: &str =
+    "SELECT relative_path, hash_match, magic_ok_ufs, magic_ok_script, found_in_ufs, found_in_script
          FROM files
          WHERE phase4_done = 1 AND (size_match IS NULL OR size_match = 0)";
 
@@ -582,19 +788,38 @@ const SQL_RAPORT_HASHY: &str = "SELECT relative_path, hash_match, magic_ok_ufs, 
 /// Wątek zapisu SQLite używa transakcji hybrydowych: commit przy 5000
 /// rekordach ALBO co 500ms (co pierwsze), zamiast jednej transakcji per
 /// paczka — różnica względem prostszego modelu z Fazy 3.
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     crate::utils::CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
-    let raport_cfg = config.raporty_faz.get("Faza 4").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza4.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza4.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 4")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza4.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza4.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza4.txt", &stamp),
+        &config.log_level,
+    );
+
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -602,22 +827,45 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 4 (FAŁSZYWE ROZSZERZENIA - RESZTKOWE) ===");
-        let _ = writeln!(f, "Pliki unikalne zawierające błędy strukturalne (np. ucięte nagłówki, śmieci ASCII, puste bloki, fałszywe rozszerzenia):\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 4 (FAŁSZYWE ROZSZERZENIA - RESZTKOWE) ==="
+        );
+        let _ = writeln!(
+            f,
+            "Pliki unikalne zawierające błędy strukturalne (np. ucięte nagłówki, śmieci ASCII, puste bloki, fałszywe rozszerzenia):\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 4. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 4. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -625,38 +873,52 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare(
         "SELECT id, relative_path, found_in_ufs, found_in_script, hash_ufs, hash_script, io_error_ufs, io_error_script 
          FROM files 
-         WHERE phase4_done = 0 OR phase4_done IS NULL"
+         WHERE (phase4_done = 0 OR phase4_done IS NULL)
+           AND (size_match IS NULL OR size_match = 0)" // 🟢 ZABEZPIECZENIE: Faza 4 omija pliki Fazy 3
     )?;
-    
+
+    //    let mut stmt = conn.prepare(
+    //        "SELECT id, relative_path, found_in_ufs, found_in_script, hash_ufs, hash_script, io_error_ufs, io_error_script
+    //         FROM files
+    //         WHERE phase4_done = 0 OR phase4_done IS NULL"
+    //    )?;
+
     let mut ufs_tasks: Vec<Task> = Vec::new();
     let mut script_tasks: Vec<Task> = Vec::new();
-    
+
     let mut skipped_ufs = 0;
     let mut skipped_script = 0;
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, 
-            row.get::<_, bool>(2)?, row.get::<_, bool>(3)?, 
-            row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, 
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, h_ufs, h_scr, err_ufs, err_scr) = r;
-        
+
         if in_ufs {
-            if h_ufs.is_none() && err_ufs != Some(true) { 
-                ufs_tasks.push(Task { id, rel_path: rel.clone() }); 
+            if h_ufs.is_none() && err_ufs != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                });
             } else {
                 skipped_ufs += 1;
             }
         }
-        
+
         if in_script {
-            if h_scr.is_none() && err_scr != Some(true) { 
-                script_tasks.push(Task { id, rel_path: rel }); 
+            if h_scr.is_none() && err_scr != Some(true) {
+                script_tasks.push(Task { id, rel_path: rel });
             } else {
                 skipped_script += 1;
             }
@@ -665,18 +927,46 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto pliki z wyliczonym już hashem. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto pliki z wyliczonym już hashem. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_files = ufs_tasks.len() + script_tasks.len();
     if total_files == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików resztkowych do weryfikacji kryptograficznej. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Hashowanie resztkowe jest już kompletne. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Pozwala to skryptowi wejść
+        // gładko w Etap 4 i wykonać `conn.execute(SQL_FINALIZACJA_HASHY)`,
+        // które odznaczy osierocone hashe w bazie z radaru!
     }
 
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Resztki)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Resztki)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_files as u64, color: Color::Green });
+    //    let total_files = ufs_tasks.len() + script_tasks.len();
+    //    if total_files == 0 {
+    //        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików resztkowych do weryfikacji kryptograficznej. Baza aktualna.".to_string()));
+    //        return Ok(());
+    //    }
+
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Resztki)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Resztki)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_files as u64,
+        color: Color::Green,
+    });
 
     // Wyliczone TERAZ (nie tylko w gałęzi CONCURRENT niżej) - LiveStats
     // potrzebuje tej wartości do rozmiaru trackera zajętości niezależnie
@@ -778,6 +1068,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let tx2 = tx_db.clone();
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -786,37 +1078,104 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build().unwrap();
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                        .expect("Inicjalizacja puli wątków nie powiodła się");
                     pool.install(|| {
-                        process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, other_stats: stat_s, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_path,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            other_stats: stat_s,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: log_u,
+                            start_time,
+                            debug_log: dbg_u,
+                        });
                     });
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku UFS zakończone.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Hashowanie resztkowe dysku UFS zakończone.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
                 if !script_tasks.is_empty() {
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build().unwrap();
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                        .expect("Inicjalizacja puli wątków nie powiodła się");
                     pool.install(|| {
-                        process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, other_stats: stat_u, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_path,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            other_stats: stat_u,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: log_s,
+                            start_time,
+                            debug_log: dbg_s,
+                        });
                     });
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
-
         } else {
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
-            
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, other_stats: &script_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku UFS zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_path,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    other_stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: log_u,
+                    start_time,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Hashowanie resztkowe dysku UFS zakończone.".to_string(),
+                ));
             }
-            
+
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, other_stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_path,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    other_stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: log_s,
+                    start_time,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Hashowanie resztkowe dysku Skryptu zakończone.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -838,12 +1197,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     wynik_zapisu?;
 
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa korelacja resztek i budowa macierzy w SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa korelacja resztek i budowa macierzy w SQLite...".to_string(),
+    ));
+
     conn.execute(SQL_FINALIZACJA_HASHY, [])?;
 
     // --- ETAP 5: GENEROWANIE RAPORTU KRYMINALISTYCZNEGO ---
@@ -855,143 +1218,361 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare(SQL_RAPORT_HASHY)?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, 
-            row.get::<_, Option<bool>>(1)?, 
-            row.get::<_, Option<bool>>(2)?, 
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<bool>>(1)?,
+            row.get::<_, Option<bool>>(2)?,
             row.get::<_, Option<bool>>(3)?,
             row.get::<_, bool>(4)?,
-            row.get::<_, bool>(5)?
+            row.get::<_, bool>(5)?,
         ))
     })?;
 
     for (rel_path, hash_match, magic_ufs, magic_script, in_ufs, in_script) in rows.flatten() {
-        if hash_match == Some(true) { match_count += 1; } 
-        else if hash_match == Some(false) { mismatch_count += 1; }
-        
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
-        if in_ufs && magic_ufs == Some(false) { spoofing_matrix_ufs.entry(ext.clone()).or_default().push(rel_path.clone()); }
-        if in_script && magic_script == Some(false) { spoofing_matrix_script.entry(ext).or_default().push(rel_path); }
+        if hash_match == Some(true) {
+            match_count += 1;
+        } else if hash_match == Some(false) {
+            mismatch_count += 1;
+        }
+
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
+        if in_ufs && magic_ufs == Some(false) {
+            spoofing_matrix_ufs
+                .entry(ext.clone())
+                .or_default()
+                .push(rel_path.clone());
+        }
+        if in_script && magic_script == Some(false) {
+            spoofing_matrix_script
+                .entry(ext)
+                .or_default()
+                .push(rel_path);
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    
-    let ufs_anom = ufs_stats.offset_anomalies.load(Ordering::SeqCst) + ufs_stats.null_padding.load(Ordering::SeqCst) + ufs_stats.ascii_trash.load(Ordering::SeqCst) + ufs_stats.sub_magic_errors.load(Ordering::SeqCst) + ufs_stats.slack_space_contam.load(Ordering::SeqCst) + ufs_stats.parasitic_injections.load(Ordering::SeqCst) + ufs_stats.endian_conflicts.load(Ordering::SeqCst) + ufs_stats.boundary_drops.load(Ordering::SeqCst) + ufs_stats.high_volatility.load(Ordering::SeqCst);
-    let scr_anom = script_stats.offset_anomalies.load(Ordering::SeqCst) + script_stats.null_padding.load(Ordering::SeqCst) + script_stats.ascii_trash.load(Ordering::SeqCst) + script_stats.sub_magic_errors.load(Ordering::SeqCst) + script_stats.slack_space_contam.load(Ordering::SeqCst) + script_stats.parasitic_injections.load(Ordering::SeqCst) + script_stats.endian_conflicts.load(Ordering::SeqCst) + script_stats.boundary_drops.load(Ordering::SeqCst) + script_stats.high_volatility.load(Ordering::SeqCst);
-    
+
+    let ufs_anom = ufs_stats.offset_anomalies.load(Ordering::SeqCst)
+        + ufs_stats.null_padding.load(Ordering::SeqCst)
+        + ufs_stats.ascii_trash.load(Ordering::SeqCst)
+        + ufs_stats.sub_magic_errors.load(Ordering::SeqCst)
+        + ufs_stats.slack_space_contam.load(Ordering::SeqCst)
+        + ufs_stats.parasitic_injections.load(Ordering::SeqCst)
+        + ufs_stats.endian_conflicts.load(Ordering::SeqCst)
+        + ufs_stats.boundary_drops.load(Ordering::SeqCst)
+        + ufs_stats.high_volatility.load(Ordering::SeqCst);
+    let scr_anom = script_stats.offset_anomalies.load(Ordering::SeqCst)
+        + script_stats.null_padding.load(Ordering::SeqCst)
+        + script_stats.ascii_trash.load(Ordering::SeqCst)
+        + script_stats.sub_magic_errors.load(Ordering::SeqCst)
+        + script_stats.slack_space_contam.load(Ordering::SeqCst)
+        + script_stats.parasitic_injections.load(Ordering::SeqCst)
+        + script_stats.endian_conflicts.load(Ordering::SeqCst)
+        + script_stats.boundary_drops.load(Ordering::SeqCst)
+        + script_stats.high_volatility.load(Ordering::SeqCst);
+
     let all_anomalies = ufs_anom + scr_anom;
-    let confidence_score = if total_files > 0 { 
-        let clean = total_files.saturating_sub(all_anomalies + spoofing_matrix_ufs.values().map(|v| v.len()).sum::<usize>() + spoofing_matrix_script.values().map(|v| v.len()).sum::<usize>());
-        (clean as f64 / total_files as f64) * 100.0 
-    } else { 0.0 };
+    let confidence_score = if total_files > 0 {
+        let clean = total_files.saturating_sub(
+            all_anomalies
+                + spoofing_matrix_ufs.values().map(|v| v.len()).sum::<usize>()
+                + spoofing_matrix_script
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
+        );
+        (clean as f64 / total_files as f64) * 100.0
+    } else {
+        0.0
+    };
 
     // -- GENEROWANIE DZIENNIKA KOŃCOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 4 (KRYPTOGRAFIA PLIKÓW RESZTKOWYCH I UNIKALNYCH)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 4 (KRYPTOGRAFIA PLIKÓW RESZTKOWYCH I UNIKALNYCH)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let _ = writeln!(&mut log_out, "[ 1 ] WYNIKI HASHOWANIA DLA PLIKÓW RESZTKOWYCH:");
-    let _ = writeln!(&mut log_out, "   -> Zgodne hashe (BLAKE3): {} plików", match_count);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Pliki, które początkowo miały różny rozmiar lub leżały w sierotach ($Tresh), ale w środku posiadają 100% spójne binarnie dane.");
-    let _ = writeln!(&mut log_out, "   -> Różne hashe (Unikalne / Korupcja): {} plików", mismatch_count);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Większość plików w tej fazie znajduje się tylko na JEDNYM dysku (są unikalne), więc siłą rzeczy nie mają zgodnego hasha z drugim dyskiem.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] WYNIKI HASHOWANIA DLA PLIKÓW RESZTKOWYCH:"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zgodne hashe (BLAKE3): {} plików",
+        match_count
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Pliki, które początkowo miały różny rozmiar lub leżały w sierotach ($Tresh), ale w środku posiadają 100% spójne binarnie dane."
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Różne hashe (Unikalne / Korupcja): {} plików",
+        mismatch_count
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Większość plików w tej fazie znajduje się tylko na JEDNYM dysku (są unikalne), więc siłą rzeczy nie mają zgodnego hasha z drugim dyskiem.\n"
+    );
 
-    let _ = writeln!(&mut log_out, "[ 2 ] WERYFIKACJA MAGIC BYTES (Głębokie Sygnatury):");
-    let _ = writeln!(&mut log_out, "   -> Potwierdzone sygnatury w UFS:    {}", ufs_stats.valid_signatures.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Potwierdzone sygnatury w Skrypt: {}", script_stats.valid_signatures.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Format zadeklarowany w nazwie zgadza się z prawdziwym nagłówkiem binarnym pliku.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 2 ] WERYFIKACJA MAGIC BYTES (Głębokie Sygnatury):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Potwierdzone sygnatury w UFS:    {}",
+        ufs_stats.valid_signatures.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Potwierdzone sygnatury w Skrypt: {}",
+        script_stats.valid_signatures.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Format zadeklarowany w nazwie zgadza się z prawdziwym nagłówkiem binarnym pliku.\n"
+    );
 
     if all_anomalies > 0 {
         let _ = writeln!(&mut log_out, "[ 3 ] ROZKŁAD ANOMALII PIERWSZEGO KLASTRA:");
-        let _ = writeln!(&mut log_out, "   Wykryto łącznie: {} anomalii", all_anomalies);
-        let _ = writeln!(&mut log_out, "   [ ZNACZENIE ]: Błędy pierwszych 512 bajtów pliku wskazujące na korupcję danych lub złe wyliczenie offsetu przez program odzyskujący.\n");
-        
-        let add_spoof_to_log = |out_str: &mut String, map: &HashMap<String, Vec<String>>, label: &str| {
-            if !map.is_empty() {
-                let _ = writeln!(out_str, "   -> MACIERZ FAŁSZERSTW ({})", label);
-                let mut sorted: Vec<_> = map.iter().collect();
-                sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len())); 
-                for (ext, paths) in sorted {
-                    let _ = writeln!(out_str, "      Rozszerzenie .{:<5} | Liczba: {} | Przykład: {}", ext, paths.len(), paths.first().unwrap_or(&"".to_string()));
+        let _ = writeln!(
+            &mut log_out,
+            "   Wykryto łącznie: {} anomalii",
+            all_anomalies
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "   [ ZNACZENIE ]: Błędy pierwszych 512 bajtów pliku wskazujące na korupcję danych lub złe wyliczenie offsetu przez program odzyskujący.\n"
+        );
+
+        let add_spoof_to_log =
+            |out_str: &mut String, map: &HashMap<String, Vec<String>>, label: &str| {
+                if !map.is_empty() {
+                    let _ = writeln!(out_str, "   -> MACIERZ FAŁSZERSTW ({})", label);
+                    let mut sorted: Vec<_> = map.iter().collect();
+                    sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
+                    for (ext, paths) in sorted {
+                        let _ = writeln!(
+                            out_str,
+                            "      Rozszerzenie .{:<5} | Liczba: {} | Przykład: {}",
+                            ext,
+                            paths.len(),
+                            paths.first().unwrap_or(&"".to_string())
+                        );
+                    }
                 }
-            }
-        };
+            };
         add_spoof_to_log(&mut log_out, &spoofing_matrix_ufs, "UFS Explorer");
         add_spoof_to_log(&mut log_out, &spoofing_matrix_script, "Skrypt Autorski");
         let _ = writeln!(&mut log_out);
     }
 
-    let _ = writeln!(&mut log_out, "[ 4 ] ZAUFANIE DO ALGORYTMÓW (Carver Confidence Score):");
+    let _ = writeln!(
+        &mut log_out,
+        "[ 4 ] ZAUFANIE DO ALGORYTMÓW (Carver Confidence Score):"
+    );
     let _ = writeln!(&mut log_out, "   -> Zaufanie: {:.2}%", confidence_score);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Procent unikalnych plików resztkowych, które mimo trudnej historii odzysku posiadają poprawny pierwszy klaster.\n");
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Procent unikalnych plików resztkowych, które mimo trudnej historii odzysku posiadają poprawny pierwszy klaster.\n"
+    );
 
     let _ = writeln!(&mut log_out, "[ 5 ] ZESTAWIENIE WAGOWE FORMATÓW:");
     let print_all_exts = |out_str: &mut String, map: &HashMap<String, u64>, label: &str| {
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
     let _ = writeln!(&mut log_out);
 
-    let tot_micro = ufs_stats.micro_files.load(Ordering::SeqCst) + script_stats.micro_files.load(Ordering::SeqCst);
-    if all_anomalies > 0 || tot_micro > 0 || !spoofing_matrix_ufs.is_empty() || !spoofing_matrix_script.is_empty() {
-        let _ = writeln!(&mut log_out, "[ 6 ] SZCZEGÓŁOWY ROZKŁAD ANOMALII PIERWSZEGO KLASTRA (512B):");
-        
-        let print_anom = |out_str: &mut String, name: &str, ufs_val: usize, scr_val: usize, icon: &str| {
-            if ufs_val > 0 || scr_val > 0 {
-                let _ = writeln!(out_str, "     [ {} ] {} [UFS: {} | Skrypt: {}]", icon, name, ufs_val, scr_val);
-            }
-        };
+    let tot_micro = ufs_stats.micro_files.load(Ordering::SeqCst)
+        + script_stats.micro_files.load(Ordering::SeqCst);
+    if all_anomalies > 0
+        || tot_micro > 0
+        || !spoofing_matrix_ufs.is_empty()
+        || !spoofing_matrix_script.is_empty()
+    {
+        let _ = writeln!(
+            &mut log_out,
+            "[ 6 ] SZCZEGÓŁOWY ROZKŁAD ANOMALII PIERWSZEGO KLASTRA (512B):"
+        );
 
-        print_anom(&mut log_out, "Przesunięte nagłówki (Offset)", ufs_stats.offset_anomalies.load(Ordering::SeqCst), script_stats.offset_anomalies.load(Ordering::SeqCst), "✂️ ");
-        print_anom(&mut log_out, "Puste bloki na starcie (Null)", ufs_stats.null_padding.load(Ordering::SeqCst), script_stats.null_padding.load(Ordering::SeqCst), "📦");
-        print_anom(&mut log_out, "Śmieci ASCII (Trash)", ufs_stats.ascii_trash.load(Ordering::SeqCst), script_stats.ascii_trash.load(Ordering::SeqCst), "🗑️ ");
-        print_anom(&mut log_out, "Mikro-pliki (< 32B)", ufs_stats.micro_files.load(Ordering::SeqCst), script_stats.micro_files.load(Ordering::SeqCst), "🔬");
-        print_anom(&mut log_out, "Zgubione Pod-Sygnatury", ufs_stats.sub_magic_errors.load(Ordering::SeqCst), script_stats.sub_magic_errors.load(Ordering::SeqCst), "🦠");
-        print_anom(&mut log_out, "Skażenie Zarezerwowanych Bajtów", ufs_stats.slack_space_contam.load(Ordering::SeqCst), script_stats.slack_space_contam.load(Ordering::SeqCst), "🦠");
-        print_anom(&mut log_out, "Iniekcje Pasożytnicze", ufs_stats.parasitic_injections.load(Ordering::SeqCst), script_stats.parasitic_injections.load(Ordering::SeqCst), "🦠");
-        print_anom(&mut log_out, "Konflikty Architektury (Endian)", ufs_stats.endian_conflicts.load(Ordering::SeqCst), script_stats.endian_conflicts.load(Ordering::SeqCst), "🦠");
-        print_anom(&mut log_out, "Urwane Granice Sektora", ufs_stats.boundary_drops.load(Ordering::SeqCst), script_stats.boundary_drops.load(Ordering::SeqCst), "🦠");
-        print_anom(&mut log_out, "Skrajna Wolatywność (HFV)", ufs_stats.high_volatility.load(Ordering::SeqCst), script_stats.high_volatility.load(Ordering::SeqCst), "🦠");
+        let print_anom =
+            |out_str: &mut String, name: &str, ufs_val: usize, scr_val: usize, icon: &str| {
+                if ufs_val > 0 || scr_val > 0 {
+                    let _ = writeln!(
+                        out_str,
+                        "     [ {} ] {} [UFS: {} | Skrypt: {}]",
+                        icon, name, ufs_val, scr_val
+                    );
+                }
+            };
+
+        print_anom(
+            &mut log_out,
+            "Przesunięte nagłówki (Offset)",
+            ufs_stats.offset_anomalies.load(Ordering::SeqCst),
+            script_stats.offset_anomalies.load(Ordering::SeqCst),
+            "✂️ ",
+        );
+        print_anom(
+            &mut log_out,
+            "Puste bloki na starcie (Null)",
+            ufs_stats.null_padding.load(Ordering::SeqCst),
+            script_stats.null_padding.load(Ordering::SeqCst),
+            "📦",
+        );
+        print_anom(
+            &mut log_out,
+            "Śmieci ASCII (Trash)",
+            ufs_stats.ascii_trash.load(Ordering::SeqCst),
+            script_stats.ascii_trash.load(Ordering::SeqCst),
+            "🗑️ ",
+        );
+        print_anom(
+            &mut log_out,
+            "Mikro-pliki (< 32B)",
+            ufs_stats.micro_files.load(Ordering::SeqCst),
+            script_stats.micro_files.load(Ordering::SeqCst),
+            "🔬",
+        );
+        print_anom(
+            &mut log_out,
+            "Zgubione Pod-Sygnatury",
+            ufs_stats.sub_magic_errors.load(Ordering::SeqCst),
+            script_stats.sub_magic_errors.load(Ordering::SeqCst),
+            "🦠",
+        );
+        print_anom(
+            &mut log_out,
+            "Skażenie Zarezerwowanych Bajtów",
+            ufs_stats.slack_space_contam.load(Ordering::SeqCst),
+            script_stats.slack_space_contam.load(Ordering::SeqCst),
+            "🦠",
+        );
+        print_anom(
+            &mut log_out,
+            "Iniekcje Pasożytnicze",
+            ufs_stats.parasitic_injections.load(Ordering::SeqCst),
+            script_stats.parasitic_injections.load(Ordering::SeqCst),
+            "🦠",
+        );
+        print_anom(
+            &mut log_out,
+            "Konflikty Architektury (Endian)",
+            ufs_stats.endian_conflicts.load(Ordering::SeqCst),
+            script_stats.endian_conflicts.load(Ordering::SeqCst),
+            "🦠",
+        );
+        print_anom(
+            &mut log_out,
+            "Urwane Granice Sektora",
+            ufs_stats.boundary_drops.load(Ordering::SeqCst),
+            script_stats.boundary_drops.load(Ordering::SeqCst),
+            "🦠",
+        );
+        print_anom(
+            &mut log_out,
+            "Skrajna Wolatywność (HFV)",
+            ufs_stats.high_volatility.load(Ordering::SeqCst),
+            script_stats.high_volatility.load(Ordering::SeqCst),
+            "🦠",
+        );
         let _ = writeln!(&mut log_out);
     }
 
-
-    let total_io_errors = ufs_stats.hash_errors.load(Ordering::SeqCst) + script_stats.hash_errors.load(Ordering::SeqCst);
-    let total_magic_errors = ufs_stats.magic_errors.load(Ordering::SeqCst) + script_stats.magic_errors.load(Ordering::SeqCst);
+    let total_io_errors = ufs_stats.hash_errors.load(Ordering::SeqCst)
+        + script_stats.hash_errors.load(Ordering::SeqCst);
+    let total_magic_errors = ufs_stats.magic_errors.load(Ordering::SeqCst)
+        + script_stats.magic_errors.load(Ordering::SeqCst);
 
     if total_io_errors > 0 || total_magic_errors > 0 {
         let _ = writeln!(&mut log_out);
     }
     if total_io_errors > 0 {
-        let _ = writeln!(&mut log_out, "   [ 🚨 ] Błędy I/O (Brak dostępu): {} [UFS: {} | Skrypt: {}]", 
-            total_io_errors, ufs_stats.hash_errors.load(Ordering::SeqCst), script_stats.hash_errors.load(Ordering::SeqCst));
+        let _ = writeln!(
+            &mut log_out,
+            "   [ 🚨 ] Błędy I/O (Brak dostępu): {} [UFS: {} | Skrypt: {}]",
+            total_io_errors,
+            ufs_stats.hash_errors.load(Ordering::SeqCst),
+            script_stats.hash_errors.load(Ordering::SeqCst)
+        );
     }
     if total_magic_errors > 0 {
-        let _ = writeln!(&mut log_out, "   [ 🚨 ] Złe Magic Bytes (Spoofing): {} [UFS: {} | Skrypt: {}]", 
-            total_magic_errors, ufs_stats.magic_errors.load(Ordering::SeqCst), script_stats.magic_errors.load(Ordering::SeqCst));
+        let _ = writeln!(
+            &mut log_out,
+            "   [ 🚨 ] Złe Magic Bytes (Spoofing): {} [UFS: {} | Skrypt: {}]",
+            total_magic_errors,
+            ufs_stats.magic_errors.load(Ordering::SeqCst),
+            script_stats.magic_errors.load(Ordering::SeqCst)
+        );
     }
-    
-    let _ = writeln!(&mut log_out); 
+
+    let _ = writeln!(&mut log_out);
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     for line in log_out.lines() {
@@ -1059,7 +1640,10 @@ mod tests {
     #[test]
     fn test_analyze_header_offset_jpeg_detected() {
         let mut buf = vec![0x41; 64];
-        buf[8] = 0xFF; buf[9] = 0xD8; buf[10] = 0xFF; buf[11] = 0xE0;
+        buf[8] = 0xFF;
+        buf[9] = 0xD8;
+        buf[10] = 0xFF;
+        buf[11] = 0xE0;
         let a = analyze_header_cluster(&buf, 64, "jpg");
         assert!(a.has_offset);
     }
@@ -1067,7 +1651,10 @@ mod tests {
     #[test]
     fn test_analyze_header_offset_not_flagged_when_at_position_zero() {
         let mut buf = vec![0x00; 64];
-        buf[0] = 0xFF; buf[1] = 0xD8; buf[2] = 0xFF; buf[3] = 0xE0;
+        buf[0] = 0xFF;
+        buf[1] = 0xD8;
+        buf[2] = 0xFF;
+        buf[3] = 0xE0;
         let a = analyze_header_cluster(&buf, 64, "jpg");
         assert!(!a.has_offset);
     }
@@ -1092,7 +1679,8 @@ mod tests {
     #[test]
     fn test_analyze_header_bmp_slack_contamination() {
         let mut buf = vec![0x00; 64];
-        buf[0] = b'B'; buf[1] = b'M';
+        buf[0] = b'B';
+        buf[1] = b'M';
         buf[6] = 0xFF;
         let a = analyze_header_cluster(&buf, 64, "bmp");
         assert!(a.slack_contam);
@@ -1101,7 +1689,10 @@ mod tests {
     #[test]
     fn test_analyze_header_parasitic_zip_injection() {
         let mut buf = vec![0x41; 64];
-        buf[40] = 0x50; buf[41] = 0x4B; buf[42] = 0x03; buf[43] = 0x04;
+        buf[40] = 0x50;
+        buf[41] = 0x4B;
+        buf[42] = 0x03;
+        buf[43] = 0x04;
         let a = analyze_header_cluster(&buf, 64, "jpg");
         assert!(a.parasitic);
     }
@@ -1109,7 +1700,10 @@ mod tests {
     #[test]
     fn test_analyze_header_tiff_little_endian_conflict() {
         let mut buf = vec![0x00; 64];
-        buf[0] = b'I'; buf[1] = b'I'; buf[2] = 0x00; buf[3] = 0x2A;
+        buf[0] = b'I';
+        buf[1] = b'I';
+        buf[2] = 0x00;
+        buf[3] = 0x2A;
         let a = analyze_header_cluster(&buf, 64, "tif");
         assert!(a.endian_conflict);
     }
@@ -1117,7 +1711,10 @@ mod tests {
     #[test]
     fn test_analyze_header_boundary_drop_zeros() {
         let mut buf = vec![0x41; 512];
-        buf[508] = 0x00; buf[509] = 0x00; buf[510] = 0x00; buf[511] = 0x00;
+        buf[508] = 0x00;
+        buf[509] = 0x00;
+        buf[510] = 0x00;
+        buf[511] = 0x00;
         let a = analyze_header_cluster(&buf, 512, "dat");
         assert!(a.boundary_drop);
     }
@@ -1128,7 +1725,9 @@ mod tests {
         // bajtów: (n-1) * 255. Próg w analyze_header_cluster to > 60000, więc
         // potrzeba n-1 > ~235, czyli co najmniej 237 bajtów (64B dawało tylko
         // 63*255=16065 - stąd wcześniejsza fałszywa porażka tego testu).
-        let buf: Vec<u8> = (0..300).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect();
+        let buf: Vec<u8> = (0..300)
+            .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
+            .collect();
         let a = analyze_header_cluster(&buf, 300, "dat");
         assert!(a.high_volatility);
     }
@@ -1136,7 +1735,10 @@ mod tests {
     #[test]
     fn test_analyze_header_clean_file_no_anomalies() {
         let mut buf = vec![0u8; 600];
-        buf[0] = 0xFF; buf[1] = 0xD8; buf[2] = 0xFF; buf[3] = 0xE0;
+        buf[0] = 0xFF;
+        buf[1] = 0xD8;
+        buf[2] = 0xFF;
+        buf[3] = 0xE0;
         buf[4..].fill(0x80);
         let a = analyze_header_cluster(&buf, 600, "jpg");
 
@@ -1174,9 +1776,21 @@ mod tests {
         let block = build_crypto_block(&own, &other, start_time);
 
         assert!(block.starts_with("[Kryptografia i sygnatury (Resztki)]"));
-        assert!(block.contains("Poprawne sygnatury: 7"), "5 (own) + 2 (other): {}", block);
-        assert!(block.contains("Błędy I/O: 5"), "1 (own) + 4 (other): {}", block);
-        assert!(block.contains("Spoofing (magic): 4"), "1 (own) + 3 (other): {}", block);
+        assert!(
+            block.contains("Poprawne sygnatury: 7"),
+            "5 (own) + 2 (other): {}",
+            block
+        );
+        assert!(
+            block.contains("Błędy I/O: 5"),
+            "1 (own) + 4 (other): {}",
+            block
+        );
+        assert!(
+            block.contains("Spoofing (magic): 4"),
+            "1 (own) + 3 (other): {}",
+            block
+        );
     }
 
     #[test]
@@ -1200,8 +1814,15 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_crypto_block(&own, &other, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki BLAKE3")).expect("powinna istnieć linia Wariantu A");
-        assert_eq!(line, "Wątki BLAKE3 (Wariant A): {G:1} {R:2} {R:3}", "aktywność musi pochodzić z `own`, nie z `other`: {}", block);
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki BLAKE3"))
+            .expect("powinna istnieć linia Wariantu A");
+        assert_eq!(
+            line, "Wątki BLAKE3 (Wariant A): {G:1} {R:2} {R:3}",
+            "aktywność musi pochodzić z `own`, nie z `other`: {}",
+            block
+        );
     }
 
     #[test]
@@ -1217,10 +1838,18 @@ mod tests {
         let block = build_anomaly_block(&own, &other);
 
         assert!(block.starts_with("[Anomalie nagłówka (Resztki)]"));
-        assert!(block.contains("Przesunięty nagłówek: 5"), "2 (own) + 3 (other): {}", block);
+        assert!(
+            block.contains("Przesunięty nagłówek: 5"),
+            "2 (own) + 3 (other): {}",
+            block
+        );
         assert!(block.contains("Null-padding: 1"));
         assert!(block.contains("Wysoka wolatywność: 1"));
-        assert!(block.contains("Śmieci ASCII: 0"), "kategorie bez aktywności muszą dalej się pojawiać, jako 0: {}", block);
+        assert!(
+            block.contains("Śmieci ASCII: 0"),
+            "kategorie bez aktywności muszą dalej się pojawiać, jako 0: {}",
+            block
+        );
     }
 
     #[test]
@@ -1228,7 +1857,11 @@ mod tests {
         let own = LiveStats::new(4);
         let other = LiveStats::new(4);
         let block = build_anomaly_block(&own, &other);
-        assert!(!block.contains("suma"), "nowy panel rozpisuje kategorie, nie pokazuje już jednej sumy: {}", block);
+        assert!(
+            !block.contains("suma"),
+            "nowy panel rozpisuje kategorie, nie pokazuje już jednej sumy: {}",
+            block
+        );
     }
 
     /// REGRESJA: `[Anomalie nagłówka (Resztki)]` Fazy 4 używa TYCH SAMYCH
@@ -1252,12 +1885,16 @@ mod tests {
             if let Some((etykieta, _)) = line.split_once(": ") {
                 assert!(
                     crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                    "etykieta '{}' z panelu Fazy 4 nie ma zarejestrowanego wyjaśnienia - popup po Enter pokazałby pustkę", etykieta
+                    "etykieta '{}' z panelu Fazy 4 nie ma zarejestrowanego wyjaśnienia - popup po Enter pokazałby pustkę",
+                    etykieta
                 );
                 sprawdzonych += 1;
             }
         }
-        assert_eq!(sprawdzonych, 10, "panel powinien mieć dokładnie 10 wierszy kategorii anomalii");
+        assert_eq!(
+            sprawdzonych, 10,
+            "panel powinien mieć dokładnie 10 wierszy kategorii anomalii"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1278,7 +1915,7 @@ mod tests {
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_ufs, hash_script, io_error_ufs, io_error_script, phase4_done)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0, 0, 0)",
             params![id, rel, found_in_script, size_match, hash_ufs, hash_script],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
     }
 
     /// Plik ZGODNY rozmiarowo (`size_match = 1`) to domena Fazy 3, nie Fazy 4
@@ -1289,21 +1926,41 @@ mod tests {
     /// samego pliku w statystykach obu faz naraz.
     #[test]
     fn test_finalizacja_pomija_pliki_z_domeny_fazy_trzeciej() {
-        let conn = crate::db::init_db(":memory:").unwrap();
-        wstaw_plik(&conn, 1, "zgodny.jpg", Some(1), Some("abc"), Some("abc"), true);
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
+        wstaw_plik(
+            &conn,
+            1,
+            "zgodny.jpg",
+            Some(1),
+            Some("abc"),
+            Some("abc"),
+            true,
+        );
         wstaw_plik(&conn, 2, "unikat.jpg", None, Some("def"), None, false);
 
-        conn.execute(SQL_FINALIZACJA_HASHY, []).unwrap();
+        conn.execute(SQL_FINALIZACJA_HASHY, [])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let phase4_zgodny: bool = conn.query_row(
-            "SELECT phase4_done FROM files WHERE id = 1", [], |r| r.get(0)
-        ).unwrap();
-        assert!(!phase4_zgodny, "plik z size_match=1 należy do Fazy 3 - Faza 4 nie może go domknąć");
+        let phase4_zgodny: bool = conn
+            .query_row("SELECT phase4_done FROM files WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("Inicjalizacja bazy danych nie powiodła się");
+        assert!(
+            !phase4_zgodny,
+            "plik z size_match=1 należy do Fazy 3 - Faza 4 nie może go domknąć"
+        );
 
-        let phase4_unikat: bool = conn.query_row(
-            "SELECT phase4_done FROM files WHERE id = 2", [], |r| r.get(0)
-        ).unwrap();
-        assert!(phase4_unikat, "plik unikalny (poza domeną Fazy 3) to właściwa domena Fazy 4 - musi zostać domknięty");
+        let phase4_unikat: bool = conn
+            .query_row("SELECT phase4_done FROM files WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .expect("Inicjalizacja bazy danych nie powiodła się");
+        assert!(
+            phase4_unikat,
+            "plik unikalny (poza domeną Fazy 3) to właściwa domena Fazy 4 - musi zostać domknięty"
+        );
     }
 
     /// Raport końcowy Fazy 4 musi liczyć wyłącznie swoją domenę: gdyby
@@ -1314,26 +1971,31 @@ mod tests {
     /// odfiltrowuje taki wiersz po `size_match`.
     #[test]
     fn test_raport_pomija_pliki_z_domeny_fazy_trzeciej() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_match, phase4_done)
              VALUES (1, 'zgodny.jpg', 1, 1, 1, 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_match, hash_match, phase4_done)
              VALUES (2, 'unikat.jpg', 1, 0, NULL, NULL, 1)",
             [],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
 
-        let mut stmt = conn.prepare(SQL_RAPORT_HASHY).unwrap();
-        let sciezki: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
+        let mut stmt = conn
+            .prepare(SQL_RAPORT_HASHY)
+            .expect("Odczyt z bazy danych nie powiódł się");
+        let sciezki: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("Inicjalizacja bazy danych nie powiodła się")
             .filter_map(|r| r.ok())
             .collect();
 
         assert_eq!(
-            sciezki, vec!["unikat.jpg".to_string()],
+            sciezki,
+            vec!["unikat.jpg".to_string()],
             "raport Fazy 4 nie może zawierać pliku z domeny Fazy 3, nawet jeśli ma phase4_done=1"
         );
     }

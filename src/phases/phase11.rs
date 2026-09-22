@@ -873,6 +873,7 @@ pub struct StreamCtx<'a> {
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
     pub info_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
@@ -891,6 +892,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         bar_idx,
         opr_log,
         info_log,
+        debug_log,
     } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
@@ -903,12 +905,27 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         for task in chunk {
             if CANCEL_SIGNAL.load(Ordering::Relaxed) { break; }
 
+            let metoda_start = debug_log.is_active().then(Instant::now);
             let full_path = base_path.join(&task.rel_path);
             let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
             let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
-            
+            if let Some(t) = metoda_start {
+                debug_log.log(side_label, "odczyt metadanych (fs::metadata)", &task.rel_path, t.elapsed(), "OK");
+            }
+
             *local_ext_weights.entry(ext.clone()).or_insert(0) += file_size;
 
+            let metoda = if ZIP_DERIVATIVES.contains(&ext.as_str()) { "analyze_zip_entries" } else { "analyze_archive (strumień)" };
+
+            if let Ok(mut f) = info_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (analysis_opt, io_err) = match stats.thread_activity.track_current(|| analyze_archive(&full_path, file_size, deep_scan)) {
                 Ok(ana) => {
                     let kategoria = if task.is_common { "Wspólne" } else { "Osobne" };
@@ -959,6 +976,30 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     (None, Some(true))
                 }
             };
+            let wynik = if io_err == Some(true) {
+                "BŁĄD I/O".to_string()
+            } else {
+                match &analysis_opt {
+                    Some(ana) if ana.is_valid => "OK".to_string(),
+                    Some(ana) => format!("BŁĄD: {}", ana.reason.as_deref().unwrap_or("Nieznany błąd")),
+                    None => "BŁĄD: Nieznany błąd".to_string(),
+                }
+            };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), &wynik);
+            }
+
+            let zapis_start = debug_log.is_active().then(Instant::now);
+            if let Ok(mut f) = info_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
+            if let Some(t) = zapis_start {
+                debug_log.log(side_label, "zapis wyniku (log info)", &task.rel_path, t.elapsed(), "OK");
+            }
 
             stats.processed_files.fetch_add(1, Ordering::Relaxed);
             stats.processed_bytes.fetch_add(file_size, Ordering::Relaxed);
@@ -987,7 +1028,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 });
                 let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                     idx: bar_idx,
-                    path: full_path.to_string_lossy().to_string(),
+                    path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                 });
 
                 // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -1116,11 +1157,24 @@ pub fn run(
         });
 
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy (operacyjny, dziennik końcowy,
+    // info, debug) niosą ten sam znacznik czasu, więc łatwo je ze sobą
+    // powiązać na dysku, a kolejne uruchomienia się nie nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
 
-    let info_path =
-        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza11_zdrowe_archiwa.txt");
+    let info_path = Path::new(&raport_cfg.katalog).join(crate::utils::stamp_filename(
+        "raport_operacyjny_faza11_zdrowe_archiwa.txt",
+        &stamp,
+    ));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza11.txt", &stamp),
+        &config.log_level,
+    );
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -1371,6 +1425,8 @@ pub fn run(
             let anom_s = log_anom.clone();
             let info_u = log_info.clone();
             let info_s = log_info.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -1398,6 +1454,7 @@ pub fn run(
                                 bar_idx: 0,
                                 opr_log: anom_u,
                                 info_log: info_u,
+                                debug_log: dbg_u.clone(),
                             });
                         });
                     } else {
@@ -1414,6 +1471,7 @@ pub fn run(
                             bar_idx: 0,
                             opr_log: anom_u,
                             info_log: info_u,
+                            debug_log: dbg_u.clone(),
                         });
                     }
                     let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -1442,6 +1500,7 @@ pub fn run(
                                 bar_idx: 1,
                                 opr_log: anom_s,
                                 info_log: info_s,
+                                debug_log: dbg_s.clone(),
                             });
                         });
                     } else {
@@ -1458,6 +1517,7 @@ pub fn run(
                             bar_idx: 1,
                             opr_log: anom_s,
                             info_log: info_s,
+                            debug_log: dbg_s.clone(),
                         });
                     }
                     let _ = tx_ui_ref.send(PhaseEvent::Log(
@@ -1471,6 +1531,8 @@ pub fn run(
             let anom_s = log_anom.clone();
             let info_u = log_info.clone();
             let info_s = log_info.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             if !ufs_tasks.is_empty() {
                 process_side_stream(StreamCtx {
@@ -1486,6 +1548,7 @@ pub fn run(
                     bar_idx: 0,
                     opr_log: anom_u,
                     info_log: info_u,
+                    debug_log: dbg_u,
                 });
                 let _ = tx_ui_ref.send(PhaseEvent::Log(
                     "✔ Walidacja struktury (UFS) zakończona.".to_string(),
@@ -1505,6 +1568,7 @@ pub fn run(
                     bar_idx: 1,
                     opr_log: anom_s,
                     info_log: info_s,
+                    debug_log: dbg_s,
                 });
                 let _ = tx_ui_ref.send(PhaseEvent::Log(
                     "✔ Walidacja struktury (Skrypt) zakończona.".to_string(),

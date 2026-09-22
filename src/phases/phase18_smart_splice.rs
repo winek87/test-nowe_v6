@@ -45,15 +45,15 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -144,30 +144,46 @@ use crate::png_repair::splice_png;
 /// u niektórych enkoderów). Zwraca `None`, gdy struktura nagłówka jest
 /// niepoprawna lub SOS nie występuje w ogóle.
 fn find_jpeg_sos_end(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 { return None; }
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
     let mut pos = 2;
     loop {
         while pos + 1 < bytes.len() && bytes[pos] == 0xFF && bytes[pos + 1] == 0xFF {
             pos += 1;
         }
-        if pos + 1 >= bytes.len() || bytes[pos] != 0xFF { return None; }
+        if pos + 1 >= bytes.len() || bytes[pos] != 0xFF {
+            return None;
+        }
         let marker = bytes[pos + 1];
         pos += 2;
         match marker {
             0x01 | 0xD0..=0xD7 => continue,
             0xD8 | 0xD9 => return None,
             0xDA => {
-                if pos + 2 > bytes.len() { return None; }
+                if pos + 2 > bytes.len() {
+                    return None;
+                }
                 let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
                 let header_end = pos.checked_add(seg_len)?;
-                return if header_end <= bytes.len() { Some(header_end) } else { None };
+                return if header_end <= bytes.len() {
+                    Some(header_end)
+                } else {
+                    None
+                };
             }
             _ => {
-                if pos + 2 > bytes.len() { return None; }
+                if pos + 2 > bytes.len() {
+                    return None;
+                }
                 let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-                if seg_len < 2 { return None; }
+                if seg_len < 2 {
+                    return None;
+                }
                 pos = pos.checked_add(seg_len)?;
-                if pos > bytes.len() { return None; }
+                if pos > bytes.len() {
+                    return None;
+                }
             }
         }
     }
@@ -215,9 +231,13 @@ fn build_candidates(ext: &str, bytes_a: &[u8], bytes_b: &[u8]) -> Vec<Vec<u8>> {
         "png" => splice_png(bytes_a, bytes_b).into_iter().collect(),
         "jpg" | "jpeg" => splice_jpeg_candidates(bytes_a, bytes_b),
         _ if crate::zip_splice::is_zip_based_extension(&format!(".{}", ext)) => {
-            crate::zip_splice::splice_zip(bytes_a, bytes_b).into_iter().collect()
+            crate::zip_splice::splice_zip(bytes_a, bytes_b)
+                .into_iter()
+                .collect()
         }
-        "tar" => crate::tar_archive::splice_tar(bytes_a, bytes_b).into_iter().collect(),
+        "tar" => crate::tar_archive::splice_tar(bytes_a, bytes_b)
+            .into_iter()
+            .collect(),
         // GIF/BMP/WEBP: złożenie metadane + dane obrazu. Te formaty nie mają
         // sum kontrolnych per blok, więc rozstrzyga dekoder — patrz
         // `crate::raster_splice`.
@@ -291,8 +311,8 @@ fn verify_candidate(ext: &str, bytes: &[u8]) -> bool {
 /// warunku, teraz tu, w jedynym miejscu, które o tym decyduje.
 fn klasyfikuj_rozszerzenie(ext: &str) -> (bool, bool) {
     let is_image = matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp");
-    let is_archive = crate::zip_splice::is_zip_based_extension(&format!(".{}", ext))
-        || ext == "tar";
+    let is_archive =
+        crate::zip_splice::is_zip_based_extension(&format!(".{}", ext)) || ext == "tar";
     (is_image, is_archive)
 }
 
@@ -341,7 +361,10 @@ fn unikalna_nazwa_wyniku(rel_path: &str, ext: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     rel_path.hash(&mut hasher);
     let hash = hasher.finish();
-    let stem = Path::new(rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("plik");
+    let stem = Path::new(rel_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plik");
     format!("{}_{:016x}_smartsplice.{}", stem, hash, ext)
 }
 
@@ -382,7 +405,7 @@ fn zapisz_atomowo(target_path: &Path, dane: &[u8]) -> std::io::Result<()> {
 // GŁÓWNA PĘTLA PRZETWARZANIA
 // ============================================================================
 
-#[instrument(skip(tasks, stats, tx_db, tx_ui))]
+#[instrument(skip(tasks, stats, tx_db, tx_ui, opr_log, debug_log))]
 #[allow(clippy::too_many_arguments)]
 fn process_stream(
     base_a: &Path,
@@ -394,7 +417,9 @@ fn process_stream(
     tx_ui: &mpsc::Sender<PhaseEvent>,
     start_time: Instant,
     opr_log: Arc<Mutex<File>>,
+    debug_log: crate::debug_log::DebugLog,
 ) {
+    let metoda = "build_candidates + verify_candidate (splice)";
     let last_ui_update = Arc::new(AtomicU64::new(0));
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
@@ -409,6 +434,15 @@ fn process_stream(
             let path_a = base_a.join(&task.rel_path);
             let path_b = base_b.join(&task.rel_path);
 
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), "Splice A+B", metoda, path_a.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (result_path, result_log) = match (fs::read(&path_a), fs::read(&path_b)) {
                 (Ok(a), Ok(b)) => {
                     let candidates = build_candidates(&task.ext, &a, &b);
@@ -451,6 +485,18 @@ fn process_stream(
                 }
             };
 
+            let wynik = if result_path.is_some() { "OK (ZŁOŻONO)" } else { "BRAK ZŁOŻENIA" };
+            if let Some(t) = call_start {
+                debug_log.log("Splice A+B", metoda, &task.rel_path, t.elapsed(), wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), "Splice A+B", metoda, wynik, path_a.display()
+                );
+            }
+
             let _ = tx_db.send(SpliceResult { id: task.id, path: result_path, log: result_log });
 
             let current = stats.processed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -460,7 +506,7 @@ fn process_stream(
 
             if should_update && last_ui_update.compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                 let _ = tx_ui.send(PhaseEvent::UpdateBar { idx: 0, current: current as u64, message: format_display_path(&task.rel_path) });
-                let _ = tx_ui.send(PhaseEvent::UpdateBottomPath { idx: 0, path: path_a.to_string_lossy().to_string() });
+                let _ = tx_ui.send(PhaseEvent::UpdateBottomPath { idx: 0, path: format!("[{}] {}", metoda, path_a.to_string_lossy()) });
                 let _ = tx_ui.send(PhaseEvent::UpdateSideText { idx: 0, text: build_summary_block(stats, start_time) });
             }
         }
@@ -477,9 +523,15 @@ fn process_stream(
 // GŁÓWNA FUNKCJA (ENTRYPOINT)
 // ============================================================================
 
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
-    let _ = tx_ui.send(PhaseEvent::Log("Uruchomiono Fazę 18: Inteligentna Rekonstrukcja (Smart Splice).".to_string()));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Uruchomiono Fazę 18: Inteligentna Rekonstrukcja (Smart Splice).".to_string(),
+    ));
 
     // REGRESJA (measure twice — druga weryfikacja Gemini, N3): ta faza
     // FIZYCZNIE zapisuje złożone pliki pod `config.target_path`
@@ -490,7 +542,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let ufs_path = Path::new(&config.ufs_path);
     let script_path = Path::new(&config.script_path);
     let target_path_walidacja = Path::new(&config.target_path);
-    if let Err(powod) = super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path) {
+    if let Err(powod) =
+        super::phase9::sciezki_bezpieczne(target_path_walidacja, ufs_path, script_path)
+    {
         let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD KRYTYCZNY: {}", powod)));
         return Ok(());
     }
@@ -500,16 +554,34 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let _ = conn.execute("ALTER TABLE files ADD COLUMN smart_splice_path TEXT", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN smart_splice_log TEXT", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN phase18_done BOOLEAN DEFAULT 0", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN phase18_done BOOLEAN DEFAULT 0",
+        [],
+    );
 
-    let raport_cfg = config.raporty_faz.get("Faza 18").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza18.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza18.txt".to_string(),
-    });
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 18")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza18.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza18.txt".to_string(),
+        });
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza18.txt", &stamp),
+        &config.log_level,
+    );
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -517,15 +589,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 18: INTELIGENTNA REKONSTRUKCJA ===");
-        let _ = writeln!(f, "Ewidencja plików wspólnych złożonych z dwóch uszkodzonych kopii (UFS + Skrypt) w jeden sprawny plik.\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 18: INTELIGENTNA REKONSTRUKCJA ==="
+        );
+        let _ = writeln!(
+            f,
+            "Ewidencja plików wspólnych złożonych z dwóch uszkodzonych kopii (UFS + Skrypt) w jeden sprawny plik.\n"
+        );
     }
 
     // Dobór zadań: pliki WSPÓLNE, w formacie obsługiwanym przez to narzędzie,
@@ -552,7 +633,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 structure_ok_ufs, structure_ok_script
          FROM files
          WHERE found_in_ufs = 1 AND found_in_script = 1
-           AND (phase18_done = 0 OR phase18_done IS NULL)"
+           AND (phase18_done = 0 OR phase18_done IS NULL)",
     )?;
 
     let mut tasks = Vec::new();
@@ -569,8 +650,21 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         ))
     })?;
     for r in rows.filter_map(|r| r.ok()) {
-        let (id, rel, media_decoded_ufs, media_decoded_script, pixels_ok_ufs, pixels_ok_script, structure_ok_ufs, structure_ok_script) = r;
-        let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let (
+            id,
+            rel,
+            media_decoded_ufs,
+            media_decoded_script,
+            pixels_ok_ufs,
+            pixels_ok_script,
+            structure_ok_ufs,
+            structure_ok_script,
+        ) = r;
+        let ext = Path::new(&rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         let (is_image, is_archive) = klasyfikuj_rozszerzenie(&ext);
         if !(is_image || is_archive) {
             continue;
@@ -587,16 +681,29 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         ) {
             continue;
         }
-        tasks.push(Task { id, rel_path: rel, ext });
+        tasks.push(Task {
+            id,
+            rel_path: rel,
+            ext,
+        });
     }
     drop(stmt);
 
     if tasks.is_empty() {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików kwalifikujących się do inteligentnej rekonstrukcji.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Brak plików kwalifikujących się do inteligentnej rekonstrukcji. Baza w 100% czysta."
+                .to_string(),
+        ));
+        // 🟢 UWAGA: Świadomie usuwamy `return Ok(());`. Faza przejdzie naturalnie do końca,
+        // bez generowania I/O, odrysuje paski Ratatui i domknie Dziennik Końcowy!
     }
 
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "Inteligentna Rekonstrukcja (Smart Splice)".to_string(), total: tasks.len() as u64, color: Color::Magenta });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "Inteligentna Rekonstrukcja (Smart Splice)".to_string(),
+        total: tasks.len() as u64,
+        color: Color::Magenta,
+    });
 
     let ufs_base = PathBuf::from(&config.ufs_path);
     let script_base = PathBuf::from(&config.script_path);
@@ -612,7 +719,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     // `phase17_repair::run`/`phase1::run` — `db_thread` zwraca `Result<()>`,
     // panika jest przechwytywana przez `.join()` i zamieniana na błąd domenowy.
     let wynik_zapisu: Result<()> = std::thread::scope(|s| {
-        let (tx_db, rx_db): (mpsc::SyncSender<SpliceResult>, mpsc::Receiver<SpliceResult>) = mpsc::sync_channel(100);
+        let (tx_db, rx_db): (mpsc::SyncSender<SpliceResult>, mpsc::Receiver<SpliceResult>) =
+            mpsc::sync_channel(100);
         let conn_ref = &mut *conn;
         let tx_ui_ref = &tx_ui;
 
@@ -631,7 +739,18 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             Ok(())
         });
 
-        process_stream(&ufs_base, &script_base, &target_base, &tasks, &stats, tx_db, &tx_ui, start_time, opr_log.clone());
+        process_stream(
+            &ufs_base,
+            &script_base,
+            &target_base,
+            &tasks,
+            &stats,
+            tx_db,
+            &tx_ui,
+            start_time,
+            opr_log.clone(),
+            debug_log.clone(),
+        );
 
         match db_thread.join() {
             Ok(wynik) => wynik,
@@ -650,26 +769,60 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     wynik_zapisu?;
 
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Inteligentna rekonstrukcja przerwana przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Inteligentna rekonstrukcja przerwana przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
     let elapsed = start_time.elapsed();
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 18 (INTELIGENTNA REKONSTRUKCJA)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 18 (INTELIGENTNA REKONSTRUKCJA)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
-    let _ = writeln!(&mut log_out, "Złożone PNG (CRC32 per-chunk): {} plików", stats.spliced_png.load(Ordering::Relaxed));
-    let _ = writeln!(&mut log_out, "Złożone JPEG (granica SOS): {} plików", stats.spliced_jpg.load(Ordering::Relaxed));
-    let _ = writeln!(&mut log_out, "Złożone archiwa ZIP-podobne (CRC32 per wpis): {} plików", stats.spliced_zip.load(Ordering::Relaxed));
-    let _ = writeln!(&mut log_out, "Odrzucone (żadna kombinacja się nie zdekodowała): {} plików", stats.failed_verification.load(Ordering::Relaxed));
-    let _ = writeln!(&mut log_out, "Błędy I/O: {}", stats.errors.load(Ordering::Relaxed));
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Złożone PNG (CRC32 per-chunk): {} plików",
+        stats.spliced_png.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Złożone JPEG (granica SOS): {} plików",
+        stats.spliced_jpg.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Złożone archiwa ZIP-podobne (CRC32 per wpis): {} plików",
+        stats.spliced_zip.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Odrzucone (żadna kombinacja się nie zdekodowała): {} plików",
+        stats.failed_verification.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "Błędy I/O: {}",
+        stats.errors.load(Ordering::Relaxed)
+    );
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Dziennik Końcowy w: {}", dz_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
     }
     for line in log_out.lines() {
         let _ = tx_ui.send(PhaseEvent::Log(line.to_string()));
@@ -699,7 +852,7 @@ mod tests {
     // przeniesieniu do `png_repair` to one pilnują, że przeprowadzka niczego
     // nie zmieniła w zachowaniu.
     use crate::png_repair::{
-        crc32, parse_png_chunks, write_png_chunk, CANONICAL_IEND, PngChunk, PNG_SIGNATURE,
+        CANONICAL_IEND, PNG_SIGNATURE, PngChunk, crc32, parse_png_chunks, write_png_chunk,
     };
 
     // ------------------------------------------------------------------
@@ -723,7 +876,14 @@ mod tests {
 
     fn build_png_chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        write_png_chunk(&mut out, &PngChunk { ctype: *ctype, data: data.to_vec(), crc_valid: true });
+        write_png_chunk(
+            &mut out,
+            &PngChunk {
+                ctype: *ctype,
+                data: data.to_vec(),
+                crc_valid: true,
+            },
+        );
         out
     }
 
@@ -741,7 +901,11 @@ mod tests {
         let mut out = png.to_vec();
         let mut pos = 8;
         for i in 0..=chunk_index {
-            let len = u32::from_be_bytes(out[pos..pos + 4].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(
+                out[pos..pos + 4]
+                    .try_into()
+                    .expect("Konwersja bajtów na liczbę całkowitą nie powiodła się"),
+            ) as usize;
             let crc_pos = pos + 8 + len;
             if i == chunk_index {
                 out[crc_pos] ^= 0xFF; // psuje CRC, zostawia długość/typ/dane nietknięte
@@ -758,7 +922,8 @@ mod tests {
     #[test]
     fn test_parse_png_chunks_valid_file_all_crc_ok() {
         let png = build_valid_png(b"IHDR_DATA_X", b"IDAT_PAYLOAD");
-        let chunks = parse_png_chunks(&png).unwrap();
+        let chunks =
+            parse_png_chunks(&png).expect("Parsowanie struktury bloków PNG nie powiodło się");
         assert_eq!(chunks.len(), 3);
         assert!(chunks.iter().all(|c| c.crc_valid));
     }
@@ -772,9 +937,13 @@ mod tests {
     fn test_parse_png_chunks_detects_corrupted_crc() {
         let png = build_valid_png(b"IHDR_DATA_X", b"IDAT_PAYLOAD");
         let corrupted = corrupt_chunk_crc(&png, 1); // psuje CRC chunka IDAT
-        let chunks = parse_png_chunks(&corrupted).unwrap();
+        let chunks =
+            parse_png_chunks(&corrupted).expect("Parsowanie struktury bloków PNG nie powiodło się");
         assert!(chunks[0].crc_valid, "IHDR nietknięty - powinien być OK");
-        assert!(!chunks[1].crc_valid, "IDAT uszkodzony - CRC powinno się nie zgadzać");
+        assert!(
+            !chunks[1].crc_valid,
+            "IDAT uszkodzony - CRC powinno się nie zgadzać"
+        );
         assert!(chunks[2].crc_valid, "IEND nietknięty - powinien być OK");
     }
 
@@ -782,8 +951,12 @@ mod tests {
     fn test_parse_png_chunks_truncated_file_stops_gracefully() {
         let png = build_valid_png(b"IHDR_DATA_X", b"IDAT_PAYLOAD");
         let truncated = &png[..png.len() - 10]; // ucinamy środek ostatniego chunka
-        let chunks = parse_png_chunks(truncated).unwrap();
-        assert!(chunks.len() < 3, "Ucięty plik nie powinien sparsować wszystkich 3 chunków");
+        let chunks =
+            parse_png_chunks(truncated).expect("Parsowanie struktury bloków PNG nie powiodło się");
+        assert!(
+            chunks.len() < 3,
+            "Ucięty plik nie powinien sparsować wszystkich 3 chunków"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -798,11 +971,16 @@ mod tests {
         // Strona B: uszkodzone dane obrazu (IDAT, indeks 1)
         let side_b = corrupt_chunk_crc(&base, 1);
 
-        let result = splice_png(&side_a, &side_b).expect("Złożenie powinno się powieść - uszkodzenia w różnych miejscach");
+        let result = splice_png(&side_a, &side_b)
+            .expect("Złożenie powinno się powieść - uszkodzenia w różnych miejscach");
 
         // Wynik powinien mieć WSZYSTKIE chunki z poprawnym CRC
-        let result_chunks = parse_png_chunks(&result).unwrap();
-        assert!(result_chunks.iter().all(|c| c.crc_valid), "Złożony plik powinien mieć wyłącznie poprawne CRC");
+        let result_chunks =
+            parse_png_chunks(&result).expect("Parsowanie struktury bloków PNG nie powiodło się");
+        assert!(
+            result_chunks.iter().all(|c| c.crc_valid),
+            "Złożony plik powinien mieć wyłącznie poprawne CRC"
+        );
         // I odpowiadać oryginałowi (bez uszkodzeń)
         assert_eq!(result, base);
     }
@@ -812,7 +990,10 @@ mod tests {
         let base = build_valid_png(b"IHDR_DATA_X", b"IDAT_PAYLOAD");
         let side_a = corrupt_chunk_crc(&base, 1); // IDAT zepsute po stronie A
         let side_b = corrupt_chunk_crc(&base, 1); // IDAT RÓWNIEŻ zepsute po stronie B
-        assert!(splice_png(&side_a, &side_b).is_none(), "Brak zdrowej kopii tego chunka po żadnej stronie - nie da się złożyć");
+        assert!(
+            splice_png(&side_a, &side_b).is_none(),
+            "Brak zdrowej kopii tego chunka po żadnej stronie - nie da się złożyć"
+        );
     }
 
     #[test]
@@ -824,7 +1005,10 @@ mod tests {
         let side_b = side_a.clone();
 
         let result = splice_png(&side_a, &side_b).expect("Powinno się złożyć mimo braku IEND");
-        assert!(result.ends_with(&CANONICAL_IEND), "Brakujący IEND powinien zostać dopełniony kanonicznym chunkiem");
+        assert!(
+            result.ends_with(&CANONICAL_IEND),
+            "Brakujący IEND powinien zostać dopełniony kanonicznym chunkiem"
+        );
     }
 
     #[test]
@@ -836,7 +1020,10 @@ mod tests {
         side_b.extend(build_png_chunk(b"tEXt", b"jakis komentarz"));
         side_b.extend(build_png_chunk(b"IEND", &[]));
 
-        assert!(splice_png(&base, &side_b).is_none(), "Rozjazd struktury (różne typy chunków) nie powinien być naprawiany");
+        assert!(
+            splice_png(&base, &side_b).is_none(),
+            "Rozjazd struktury (różne typy chunków) nie powinien być naprawiany"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -890,7 +1077,11 @@ mod tests {
         let jpeg_b = build_minimal_jpeg(b"HDRB", b"DANE_B_DLUZSZE");
 
         let candidates = splice_jpeg_candidates(&jpeg_a, &jpeg_b);
-        assert_eq!(candidates.len(), 2, "Powinny powstać dokładnie dwie kombinacje krzyżowe");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "Powinny powstać dokładnie dwie kombinacje krzyżowe"
+        );
 
         // Kandydat 1: nagłówek A + dane B
         assert!(candidates[0].windows(4).any(|w| w == b"HDRA"));
@@ -932,10 +1123,18 @@ mod tests {
         let mut png_bytes: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut png_bytes);
-            image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .expect("Zapis obrazu do bufora nie powiódł się");
         }
-        assert!(verify_candidate("png", &png_bytes), "PNG musi przejść weryfikację obrazu");
-        assert!(!verify_candidate("docx", &png_bytes), "Ten sam PNG NIE może przejść weryfikacji archiwum");
+        assert!(
+            verify_candidate("png", &png_bytes),
+            "PNG musi przejść weryfikację obrazu"
+        );
+        assert!(
+            !verify_candidate("docx", &png_bytes),
+            "Ten sam PNG NIE może przejść weryfikacji archiwum"
+        );
     }
 
     #[test]
@@ -945,7 +1144,11 @@ mod tests {
         // przez brak paniki i pusty, a nie "nieobsługiwany", wynik.
         for ext in ["zip", "docx", "xlsx", "epub"] {
             let candidates = build_candidates(ext, b"nie archiwum", b"tez nie archiwum");
-            assert!(candidates.is_empty(), "Śmieci nie powinny dać kandydatów dla .{}", ext);
+            assert!(
+                candidates.is_empty(),
+                "Śmieci nie powinny dać kandydatów dla .{}",
+                ext
+            );
         }
     }
 
@@ -969,7 +1172,11 @@ mod tests {
     fn test_klasyfikuj_rozszerzenie_rozpoznaje_formaty_rastrowe_raster_splice() {
         for ext in ["gif", "bmp", "webp"] {
             let (is_image, is_archive) = klasyfikuj_rozszerzenie(ext);
-            assert!(is_image, ".{} musi przejść gatekeeper is_image - inaczej raster_splice jest martwym kodem", ext);
+            assert!(
+                is_image,
+                ".{} musi przejść gatekeeper is_image - inaczej raster_splice jest martwym kodem",
+                ext
+            );
             assert!(!is_archive);
         }
     }
@@ -1006,29 +1213,41 @@ mod tests {
 
     #[test]
     fn test_zapisz_atomowo_tworzy_plik_z_dokladna_zawartoscia() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let cel = dir.path().join("wynik.png");
-        zapisz_atomowo(&cel, b"tresc splice").unwrap();
-        assert_eq!(std::fs::read(&cel).unwrap(), b"tresc splice");
+        zapisz_atomowo(&cel, b"tresc splice")
+            .expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        assert_eq!(
+            std::fs::read(&cel).expect("Nie można odczytać pliku"),
+            b"tresc splice"
+        );
     }
 
     #[test]
     fn test_zapisz_atomowo_nie_zostawia_pliku_tymczasowego_po_sukcesie() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let cel = dir.path().join("wynik.png");
-        zapisz_atomowo(&cel, b"dane").unwrap();
+        zapisz_atomowo(&cel, b"dane").expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
-        let pozostale: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let pozostale: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("Nie można odczytać pliku")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(pozostale, vec!["wynik.png".to_string()], "Po sukcesie w katalogu może zostać WYŁĄCZNIE plik finalny, żaden .tmpN");
+        assert_eq!(
+            pozostale,
+            vec!["wynik.png".to_string()],
+            "Po sukcesie w katalogu może zostać WYŁĄCZNIE plik finalny, żaden .tmpN"
+        );
     }
 
     #[test]
     fn test_zapisz_atomowo_gdy_katalog_docelowy_nie_istnieje_zwraca_blad_bez_panic() {
-        let dir = tempdir().unwrap();
-        let cel = dir.path().join("nieistniejacy_podkatalog").join("wynik.png");
+        let dir = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let cel = dir
+            .path()
+            .join("nieistniejacy_podkatalog")
+            .join("wynik.png");
         assert!(zapisz_atomowo(&cel, b"dane").is_err());
     }
 
@@ -1048,7 +1267,9 @@ mod tests {
         let mut bytes: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut bytes);
-            image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .expect("Zapis obrazu do bufora nie powiódł się");
         }
         assert!(verify_image_bytes(&bytes));
     }
@@ -1061,17 +1282,27 @@ mod tests {
         let mut original: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut original);
-            image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .expect("Zapis obrazu do bufora nie powiódł się");
         }
 
-        let chunks = parse_png_chunks(&original).unwrap();
-        assert!(chunks.len() >= 3, "Prawdziwy PNG powinien mieć co najmniej IHDR/IDAT/IEND");
+        let chunks =
+            parse_png_chunks(&original).expect("Parsowanie struktury bloków PNG nie powiodło się");
+        assert!(
+            chunks.len() >= 3,
+            "Prawdziwy PNG powinien mieć co najmniej IHDR/IDAT/IEND"
+        );
 
         let side_a = corrupt_chunk_crc(&original, 0); // IHDR zepsute
         let side_b = corrupt_chunk_crc(&original, 1); // pierwszy IDAT zepsuty
 
-        let spliced = splice_png(&side_a, &side_b).expect("Złożenie prawdziwego PNG powinno się powieść");
-        assert!(verify_image_bytes(&spliced), "Złożony prawdziwy PNG powinien się poprawnie zdekodować");
+        let spliced =
+            splice_png(&side_a, &side_b).expect("Złożenie prawdziwego PNG powinno się powieść");
+        assert!(
+            verify_image_bytes(&spliced),
+            "Złożony prawdziwy PNG powinien się poprawnie zdekodować"
+        );
     }
 
     /// REGRESJA (measure twice — druga weryfikacja Gemini, N3): Faza 18
@@ -1082,11 +1313,13 @@ mod tests {
     /// `sciezki_bezpieczne` samo w sobie zwraca `Err`.
     #[test]
     fn test_run_odmawia_gdy_target_path_jest_wewnatrz_korpusu() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let logi = tempdir().unwrap();
-        std::fs::write(ufs.path().join("wspolny.jpg"), b"cokolwiek").unwrap();
-        std::fs::write(script.path().join("wspolny.jpg"), b"cokolwiek innego").unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let logi = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        std::fs::write(ufs.path().join("wspolny.jpg"), b"cokolwiek")
+            .expect("Nie można zapisać danych do pliku");
+        std::fs::write(script.path().join("wspolny.jpg"), b"cokolwiek innego")
+            .expect("Nie można zapisać danych do pliku");
 
         let mut config = Ustawienia {
             ufs_path: ufs.path().to_string_lossy().to_string(),
@@ -1097,17 +1330,22 @@ mod tests {
         };
         config.raporty_faz.clear();
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, media_decoded_ufs, media_decoded_script)
              VALUES ('wspolny.jpg', 1, 1, 0, 0)",
             [],
-        ).unwrap();
+        ).expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui).expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
+        run(&mut conn, &config, tx_ui)
+            .expect("run() zwraca Ok - błąd konfiguracji jest komunikatem, nie paniką/Err");
 
-        assert!(!ufs.path().join("_smart_splice_repaired").exists(), "katalog roboczy Fazy 18 NIE MOŻE powstać wewnątrz korpusu źródłowego");
+        assert!(
+            !ufs.path().join("_smart_splice_repaired").exists(),
+            "katalog roboczy Fazy 18 NIE MOŻE powstać wewnątrz korpusu źródłowego"
+        );
     }
 
     /// REGRESJA (todo.faza18.md N2): wszystkie testy tej fazy do tej pory
@@ -1127,24 +1365,32 @@ mod tests {
     /// bazą) - musi zostać poprawnie złożony i zapisany.
     #[test]
     fn test_run_end_to_end_skleja_prawdziwy_png_i_zapisuje_w_bazie() {
-        let ufs = tempdir().unwrap();
-        let script = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        let logi = tempdir().unwrap();
+        let ufs = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let target = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let logi = tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 100, 50]));
         let mut original: Vec<u8> = Vec::new();
         {
             let mut cursor = std::io::Cursor::new(&mut original);
-            image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .expect("Zapis obrazu do bufora nie powiódł się");
         }
-        let chunks = parse_png_chunks(&original).unwrap();
-        assert!(chunks.len() >= 3, "Prawdziwy PNG powinien mieć co najmniej IHDR/IDAT/IEND");
+        let chunks =
+            parse_png_chunks(&original).expect("Parsowanie struktury bloków PNG nie powiodło się");
+        assert!(
+            chunks.len() >= 3,
+            "Prawdziwy PNG powinien mieć co najmniej IHDR/IDAT/IEND"
+        );
 
         let side_a = corrupt_chunk_crc(&original, 0); // IHDR zepsute po stronie UFS
         let side_b = corrupt_chunk_crc(&original, 1); // pierwszy IDAT zepsuty po stronie Skryptu
-        std::fs::write(ufs.path().join("wspolny.png"), &side_a).unwrap();
-        std::fs::write(script.path().join("wspolny.png"), &side_b).unwrap();
+        std::fs::write(ufs.path().join("wspolny.png"), &side_a)
+            .expect("Nie można zapisać danych do pliku");
+        std::fs::write(script.path().join("wspolny.png"), &side_b)
+            .expect("Nie można zapisać danych do pliku");
 
         let mut config = Ustawienia {
             ufs_path: ufs.path().to_string_lossy().to_string(),
@@ -1155,41 +1401,74 @@ mod tests {
         };
         config.raporty_faz.clear();
 
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (relative_path, found_in_ufs, found_in_script, media_decoded_ufs, media_decoded_script)
              VALUES ('wspolny.png', 1, 1, 0, 0)",
             [],
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
         let (tx_ui, _rx_ui) = mpsc::channel();
 
-        run(&mut conn, &config, tx_ui).expect("run() musi zakończyć się Ok dla poprawnej konfiguracji");
+        run(&mut conn, &config, tx_ui)
+            .expect("run() musi zakończyć się Ok dla poprawnej konfiguracji");
 
         let (smart_splice_path, smart_splice_log, phase18_done): (Option<String>, Option<String>, bool) = conn.query_row(
             "SELECT smart_splice_path, smart_splice_log, phase18_done FROM files WHERE relative_path = 'wspolny.png'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
+        ).expect("Inicjalizacja bazy danych nie powiodła się");
 
-        assert!(phase18_done, "wiersz musi zostać oznaczony jako obsłużony, inaczej wróci do kolejki w nieskończoność");
-        let sciezka_wyniku = smart_splice_path.expect("udane złożenie musi zapisać ścieżkę wyniku w bazie");
         assert!(
-            smart_splice_log.as_deref().unwrap_or("").contains("Złożono"),
-            "log musi opisywać sukces złożenia: {:?}", smart_splice_log
+            phase18_done,
+            "wiersz musi zostać oznaczony jako obsłużony, inaczej wróci do kolejki w nieskończoność"
+        );
+        let sciezka_wyniku =
+            smart_splice_path.expect("udane złożenie musi zapisać ścieżkę wyniku w bazie");
+        assert!(
+            smart_splice_log
+                .as_deref()
+                .unwrap_or("")
+                .contains("Złożono"),
+            "log musi opisywać sukces złożenia: {:?}",
+            smart_splice_log
         );
 
         let sciezka_wyniku = Path::new(&sciezka_wyniku);
-        assert!(sciezka_wyniku.exists(), "plik wynikowy musi FIZYCZNIE istnieć na dysku pod ścieżką zapisaną w bazie");
+        assert!(
+            sciezka_wyniku.exists(),
+            "plik wynikowy musi FIZYCZNIE istnieć na dysku pod ścieżką zapisaną w bazie"
+        );
         assert!(
             sciezka_wyniku.starts_with(target.path()),
-            "plik wynikowy musi wylądować pod target_path, nie w korpusie źródłowym: {}", sciezka_wyniku.display()
+            "plik wynikowy musi wylądować pod target_path, nie w korpusie źródłowym: {}",
+            sciezka_wyniku.display()
         );
 
-        let bajty_wyniku = std::fs::read(sciezka_wyniku).unwrap();
-        assert!(verify_image_bytes(&bajty_wyniku), "złożony plik zapisany przez run() musi być poprawnie dekodowalnym PNG");
+        let bajty_wyniku = std::fs::read(sciezka_wyniku).expect("Nie można odczytać pliku");
+        assert!(
+            verify_image_bytes(&bajty_wyniku),
+            "złożony plik zapisany przez run() musi być poprawnie dekodowalnym PNG"
+        );
 
-        let dziennik = std::fs::read_to_string(logi.path().join("dziennik_koncowy_faza18.txt")).expect("Dziennik Końcowy musi powstać");
-        assert!(dziennik.contains("Złożone PNG (CRC32 per-chunk): 1 plików"), "Dziennik Końcowy musi policzyć złożenie:\n{}", dziennik);
+        // Nazwa niesie teraz znacznik czasu (patrz `utils::stamp_filename`) —
+        // szukamy po prefiksie zamiast zakładać stałą nazwę.
+        let dziennik_path = std::fs::read_dir(logi.path())
+            .expect("Nie można odczytać katalogu logów")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("dziennik_koncowy_faza18"))
+            })
+            .expect("Dziennik Końcowy (ze znacznikiem czasu) musi powstać");
+        let dziennik = std::fs::read_to_string(dziennik_path).expect("Dziennik Końcowy musi powstać");
+        assert!(
+            dziennik.contains("Złożone PNG (CRC32 per-chunk): 1 plików"),
+            "Dziennik Końcowy musi policzyć złożenie:\n{}",
+            dziennik
+        );
     }
 
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
@@ -1210,7 +1489,6 @@ mod tests {
 
         assert_eq!(line, "Wątki składania (Wariant A): {R:1} {G:2}");
     }
-
 
     // ------------------------------------------------------------------
     // ZAKRES FORMATÓW SKŁADANYCH
@@ -1244,7 +1522,8 @@ mod tests {
         for ext in ["gif", "bmp", "webp"] {
             assert!(
                 !verify_candidate(ext, b"to zupelnie nie jest obraz"),
-                ".{}: śmieci nie mogą przejść weryfikacji", ext
+                ".{}: śmieci nie mogą przejść weryfikacji",
+                ext
             );
         }
     }
@@ -1263,9 +1542,12 @@ mod tests {
         assert!(!qualifies_for_splice(
             true,  // is_image
             false, // is_archive
-            Some(true), Some(true),   // media_decoded_ufs/script - zdrowy
-            Some(true), Some(true),   // pixels_ok_ufs/script - zdrowy
-            None, None,               // structure_ok_ufs/script - zawsze NULL dla obrazu
+            Some(true),
+            Some(true), // media_decoded_ufs/script - zdrowy
+            Some(true),
+            Some(true), // pixels_ok_ufs/script - zdrowy
+            None,
+            None, // structure_ok_ufs/script - zawsze NULL dla obrazu
         ));
     }
 
@@ -1277,9 +1559,12 @@ mod tests {
         assert!(!qualifies_for_splice(
             false, // is_image
             true,  // is_archive
-            None, None,               // media_decoded_ufs/script - zawsze NULL dla archiwum
-            None, None,               // pixels_ok_ufs/script - zawsze NULL dla archiwum
-            Some(true), Some(true),   // structure_ok_ufs/script - zdrowy
+            None,
+            None, // media_decoded_ufs/script - zawsze NULL dla archiwum
+            None,
+            None, // pixels_ok_ufs/script - zawsze NULL dla archiwum
+            Some(true),
+            Some(true), // structure_ok_ufs/script - zdrowy
         ));
     }
 
@@ -1288,20 +1573,28 @@ mod tests {
         // Scenariusz właściwy dla Fazy 18: obraz nie zdekodował się poprawnie
         // po ŻADNEJ stronie.
         assert!(qualifies_for_splice(
-            true, false,
-            Some(false), Some(false),
-            Some(false), Some(false),
-            None, None,
+            true,
+            false,
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            None,
+            None,
         ));
     }
 
     #[test]
     fn test_archive_failing_on_both_sides_qualifies() {
         assert!(qualifies_for_splice(
-            false, true,
-            None, None,
-            None, None,
-            Some(false), Some(false),
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            Some(false),
         ));
     }
 
@@ -1310,10 +1603,14 @@ mod tests {
         // Jedna strona zdrowa -> zwykła ścieżka wyboru całościowego (Faza
         // 8/9) wystarczy, nie potrzeba składania z dwóch uszkodzonych kopii.
         assert!(!qualifies_for_splice(
-            true, false,
-            Some(false), Some(true), // UFS zawiódł, Skrypt zdrowy
-            Some(false), Some(true),
-            None, None,
+            true,
+            false,
+            Some(false),
+            Some(true), // UFS zawiódł, Skrypt zdrowy
+            Some(false),
+            Some(true),
+            None,
+            None,
         ));
     }
 
@@ -1322,10 +1619,14 @@ mod tests {
         // is_image=false i is_archive=false jednocześnie - musi być
         // bezpiecznie odrzucone, niezależnie od zawartości kolumn.
         assert!(!qualifies_for_splice(
-            false, false,
-            Some(false), Some(false),
-            Some(false), Some(false),
-            Some(false), Some(false),
+            false,
+            false,
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
         ));
     }
 
@@ -1339,7 +1640,10 @@ mod tests {
     fn test_unikalna_nazwa_wyniku_rozroznia_pliki_o_tej_samej_nazwie_z_roznych_katalogow() {
         let a = unikalna_nazwa_wyniku("DCIM/100/IMG_0001.JPG", "jpg");
         let b = unikalna_nazwa_wyniku("DCIM/101/IMG_0001.JPG", "jpg");
-        assert_ne!(a, b, "Dwa różne pliki źródłowe o tej samej nazwie muszą dać RÓŻNE ścieżki wynikowe");
+        assert_ne!(
+            a, b,
+            "Dwa różne pliki źródłowe o tej samej nazwie muszą dać RÓŻNE ścieżki wynikowe"
+        );
     }
 
     #[test]

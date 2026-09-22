@@ -14,16 +14,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, instrument, warn};
@@ -42,12 +42,10 @@ const CHUNK_SIZE: usize = 1000;
 /// powiódł, niesie `size = NULL`. Bez `COALESCE` taki zapis **wymazywałby**
 /// rozmiar odczytany wcześniej poprawnie, zamieniając udany pomiar w brak
 /// danych.
-const SQL_ZAPIS_UFS: &str =
-    "UPDATE files SET size_ufs = COALESCE(?1, size_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3";
+const SQL_ZAPIS_UFS: &str = "UPDATE files SET size_ufs = COALESCE(?1, size_ufs), io_error_ufs = COALESCE(?2, io_error_ufs) WHERE id = ?3";
 
 /// Odpowiednik [`SQL_ZAPIS_UFS`] dla strony Skryptu Autorskiego.
-const SQL_ZAPIS_SCRIPT: &str =
-    "UPDATE files SET size_script = COALESCE(?1, size_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3";
+const SQL_ZAPIS_SCRIPT: &str = "UPDATE files SET size_script = COALESCE(?1, size_script), io_error_script = COALESCE(?2, io_error_script) WHERE id = ?3";
 
 /// Domknięcie macierzy rozmiarów — najgęstsza logika tej fazy.
 ///
@@ -112,7 +110,7 @@ pub(crate) enum ScanMsg {
 pub(crate) struct LiveStats {
     processed: AtomicUsize,
     errors: AtomicUsize,
-    empty_files: AtomicUsize, 
+    empty_files: AtomicUsize,
     total_bytes: AtomicU64,
     ext_weights: Mutex<HashMap<String, u64>>,
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon —
@@ -151,7 +149,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — identyczna logika jak w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 // ============================================================================
@@ -170,18 +172,38 @@ fn build_source_block(label: &str, stats: &LiveStats) -> String {
         let map = stats.wagi_rozszerzen();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let top_display = if top_ext_str.is_empty() { "Analiza danych...".to_string() } else { top_ext_str };
+    let top_display = if top_ext_str.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext_str
+    };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\n📦 Przetworzono: {}\n⚖️ Zważono łącznie: {}\n🔝 Top format: {}\n🕳️ Puste pliki: {}\nWątki lstat (Wariant A): {}\n🚨 Błędy I/O: {}",
-        label, processed, format_bytes(bytes), top_display, empty, activity_markup, errors
+        label,
+        processed,
+        format_bytes(bytes),
+        top_display,
+        empty,
+        activity_markup,
+        errors
     )
 }
 
@@ -248,7 +270,9 @@ impl StatWatchdog {
         let (rep_tx, rep_rx) = mpsc::channel::<std::result::Result<FileStats, std::io::Error>>();
         thread::spawn(move || {
             for path in req_rx {
-                if rep_tx.send(get_file_stats(&path)).is_err() { break; }
+                if rep_tx.send(get_file_stats(&path)).is_err() {
+                    break;
+                }
             }
         });
         Self { req_tx, rep_rx }
@@ -259,13 +283,20 @@ impl StatWatchdog {
     /// NATYCHMIAST po najbliższym punkcie kontrolnym po zgłoszeniu
     /// anulowania — nie czeka na faktyczne zakończenie zawieszonego
     /// wywołania (patrz dokumentacja [`StatWatchdog`]).
-    fn stat_z_limitem(&self, path: PathBuf) -> Option<std::result::Result<FileStats, std::io::Error>> {
-        if self.req_tx.send(path).is_err() { return None; }
+    fn stat_z_limitem(
+        &self,
+        path: PathBuf,
+    ) -> Option<std::result::Result<FileStats, std::io::Error>> {
+        if self.req_tx.send(path).is_err() {
+            return None;
+        }
         loop {
             match self.rep_rx.recv_timeout(CANCEL_POLL_INTERVAL) {
                 Ok(wynik) => return Some(wynik),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if CANCEL_SIGNAL.load(Ordering::Relaxed) { return None; }
+                    if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+                        return None;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return None,
             }
@@ -283,12 +314,25 @@ pub struct StreamCtx<'a> {
     pub tx_ui: &'a mpsc::Sender<PhaseEvent>,
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        debug_log,
+    } = ctx;
+    let metoda = "lstat (rozmiar/metadane)";
 
     // for_each_init inicjalizuje lokalny stan dla KAŻDEGO wątku z osobna:
     // (kanał, stoper utrzymywany między paczkami, lokalny bufor na logi
@@ -305,10 +349,32 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 
                 let full_path = base_path.join(&task.rel_path);
 
+                // Log info: linia "Start" PRZED wywołaniem — niezależnie od
+                // wyniku, żeby operator widział ostatni plik dotknięty przez
+                // fazę, gdyby ta akurat zawiesiła się w środku. Buforowana
+                // razem z resztą (patrz `log_buf` niżej) zamiast osobnej
+                // blokady Mutexa per plik.
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                ));
+
+                let call_start = debug_log.is_active().then(Instant::now);
                 let wynik_lstat = match stats.thread_activity.track_current(|| watchdog.stat_z_limitem(full_path.clone())) {
                     Some(w) => w,
                     None => break, // Anulowano podczas oczekiwania na zawieszone I/O — patrz `StatWatchdog`.
                 };
+                let wynik = match &wynik_lstat {
+                    Ok(_) => "OK",
+                    Err(_) => "BŁĄD I/O",
+                };
+                if let Some(t) = call_start {
+                    debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+                }
+                log_buf.push(format!(
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                ));
 
                 let (stats_opt, io_err) = match wynik_lstat {
                     Ok(s) => {
@@ -366,7 +432,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     // `phase4.rs`/`phase5.rs`/`phase6.rs`/`phase7.rs`.
                     let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                         idx: bar_idx,
-                        path: full_path.to_string_lossy().to_string(),
+                        path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                     });
 
                     // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -400,7 +466,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             }
         }
     );
-    
+
     // Zakończenie pracy paska + panelu bocznego (finalny stan)
     let _ = tx_ui.send(PhaseEvent::UpdateBar {
         idx: bar_idx,
@@ -417,22 +483,41 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 // GŁÓWNA FUNKCJA KORDYNUJĄCA FAZĘ
 // ============================================================================
 
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     crate::utils::CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     let _ = conn.execute("ALTER TABLE files ADD COLUMN larger_side TEXT", []);
 
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 2").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza2.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza2.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 2")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza2.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza2.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza2.txt", &stamp),
+        &config.log_level,
+    );
+
     // REGRESJA (todo.faza02.md): `.unwrap()` tu panikował, gdyby katalog
     // logów stał się niezapisywalny między `create_dir_all` a tym miejscem
     // (np. zablokowany przez antywirusa, drugą równoległą instancję, wolumin
@@ -442,22 +527,45 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 2 (AKWIZYCJA ROZMIARÓW) ===");
-        let _ = writeln!(f, "Zawiera pliki uszkodzone I/O oraz wykryte puste wydmuszki 0 B.\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 2 (AKWIZYCJA ROZMIARÓW) ==="
+        );
+        let _ = writeln!(
+            f,
+            "Zawiera pliki uszkodzone I/O oraz wykryte puste wydmuszki 0 B.\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 2. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 2. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -489,19 +597,31 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let (id, rel, in_ufs, in_script, s_ufs, s_scr, err_ufs, err_scr) = r;
 
         if in_ufs {
-            if s_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone() }); } 
-            else { skipped_ufs += 1; }
+            if s_ufs.is_none() && err_ufs != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                });
+            } else {
+                skipped_ufs += 1;
+            }
         }
 
         if in_script {
-            if s_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel }); } 
-            else { skipped_script += 1; }
+            if s_scr.is_none() && err_scr != Some(true) {
+                script_tasks.push(Task { id, rel_path: rel });
+            } else {
+                skipped_script += 1;
+            }
         }
     }
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto pliki z wyliczonym już rozmiarem. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto pliki z wyliczonym już rozmiarem. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
@@ -518,14 +638,36 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         // OR phase2_done IS NULL), więc wywołanie go tu "na pusto" (gdy
         // baza faktycznie jest już aktualna) jest bezpieczne i tanie.
         conn.execute(SQL_FINALIZACJA_MACIERZY, [])?;
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających weryfikacji rozmiarów. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Weryfikacja rozmiarów jest w pełni kompletna. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Kod przejdzie prosto do
+        // wygenerowania prawidłowego Dziennika Końcowego (Etap 5)!
     }
+    //        conn.execute(SQL_FINALIZACJA_MACIERZY, [])?;
+    //        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających weryfikacji rozmiarów. Baza aktualna.".to_string()));
+    //        return Ok(());
+    //    }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let activity_slots = compute_activity_slots(
         &config.io_mode,
@@ -564,7 +706,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let msg_result = rx_db.recv_timeout(Duration::from_millis(100));
 
                 // 1. ZAPAMIĘTUJEMY FLAGĘ (używając referencji `&`, nie konsumujemy wartości)
-                let is_disconnected = matches!(&msg_result, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+                let is_disconnected = matches!(
+                    &msg_result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                );
 
                 // 2. KONSUMUJEMY WYNIK
                 if let Ok(msg) = msg_result {
@@ -586,7 +731,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
                         for res in chunk {
                             if res.stats.is_some() || res.io_error == Some(true) {
-                                stmt.execute(params![res.stats.as_ref().map(|s| s.size), res.io_error, res.id])?;
+                                stmt.execute(params![
+                                    res.stats.as_ref().map(|s| s.size),
+                                    res.io_error,
+                                    res.id
+                                ])?;
                             }
                         }
                     }
@@ -598,7 +747,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let now = Instant::now();
 
                 // LOGIKA HYBRYDOWA: Commit co 10 000 rekordów LUB co 500 ms (jeśli mamy cokolwiek do zapisu)
-                if pending_records > 0 && (pending_records >= 10_000 || now.duration_since(last_commit).as_millis() > 500) {
+                if pending_records > 0
+                    && (pending_records >= 10_000
+                        || now.duration_since(last_commit).as_millis() > 500)
+                {
                     tx_trans.commit()?; // Fizyczny zrzut na dysk
                     tx_trans = conn_ref.transaction()?; // Natychmiastowe otwarcie nowej lufy
                     last_commit = now;
@@ -608,10 +760,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 // Płynne odświeżanie paska bazy danych
                 if now.duration_since(last_ui_update).as_millis() > 60 {
                     last_ui_update = now;
-                    let _ = tx_ui_ref.send(PhaseEvent::UpdateBar { 
-                        idx: 2, 
-                        current: db_inserted as u64, 
-                        message: format!("Synchronizacja: {} plików", db_inserted) 
+                    let _ = tx_ui_ref.send(PhaseEvent::UpdateBar {
+                        idx: 2,
+                        current: db_inserted as u64,
+                        message: format!("Synchronizacja: {} plików", db_inserted),
                     });
                 }
 
@@ -629,7 +781,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let _ = tx_ui_ref.send(PhaseEvent::UpdateBar {
                 idx: 2,
                 current: db_inserted as u64,
-                message: "Rozmiary w 100% zabezpieczone na dysku.".to_string()
+                message: "Rozmiary w 100% zabezpieczone na dysku.".to_string(),
             });
             Ok(())
         });
@@ -639,7 +791,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let tx2 = tx_db.clone();
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
-            
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             // TWORZYMY REFERENCJE PRZED WĄTKIEM
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -650,42 +804,124 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
                     // Tworzymy prywatną pulę wątków TYLKO dla UFS
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                opr_log: log_u,
+                                debug_log: dbg_u.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: log_u,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Zakończono odczyt I/O na UFS Explorer".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Zakończono odczyt I/O na UFS Explorer".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
                 if !script_tasks.is_empty() {
                     // Tworzymy prywatną pulę wątków TYLKO dla Skryptu
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                opr_log: log_s,
+                                debug_log: dbg_s.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: log_s,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Zakończono odczyt I/O na Skrypcie Autorskim".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Zakończono odczyt I/O na Skrypcie Autorskim".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
         } else {
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
-            
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Zakończono odczyt I/O na UFS Explorer".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: log_u,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Zakończono odczyt I/O na UFS Explorer".to_string(),
+                ));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Zakończono odczyt I/O na Skrypcie Autorskim".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: log_s,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Zakończono odczyt I/O na Skrypcie Autorskim".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -708,7 +944,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH (Wyliczenie Larger Side) ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         // ŚWIADOMA DECYZJA: tu NIE wołamy pełnej finalizacji macierzy — sesja
         // jest niekompletna (część zadań I/O mogła nie zostać w ogóle
         // wysłana/zapisana przed przerwaniem), więc dociągnięcie CASE na
@@ -723,8 +961,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa kryminalistyczne wiązanie macierzy rozmiarów w SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa kryminalistyczne wiązanie macierzy rozmiarów w SQLite...".to_string(),
+    ));
+
     conn.execute(SQL_FINALIZACJA_MACIERZY, [])?;
 
     // --- ETAP 5: ZAAWANSOWANY RAPORT KRYMINALISTYCZNY ---
@@ -764,9 +1004,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare("SELECT found_in_ufs, found_in_script, size_match, larger_side, size_ufs, size_script, io_error_ufs, io_error_script FROM files WHERE phase2_done = 1")?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, Option<bool>>(2)?,
-            row.get::<_, Option<String>>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?,
+            row.get::<_, bool>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, Option<bool>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
@@ -774,12 +1019,20 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let (in_ufs, in_script, is_match, larger, s_ufs, s_scr, err_ufs, err_scr) = r;
 
         if in_ufs {
-            if s_ufs == Some(0) { empty_ufs += 1; }
-            if err_ufs == Some(true) { errors += 1; }
+            if s_ufs == Some(0) {
+                empty_ufs += 1;
+            }
+            if err_ufs == Some(true) {
+                errors += 1;
+            }
         }
         if in_script {
-            if s_scr == Some(0) { empty_scr += 1; }
-            if err_scr == Some(true) { errors += 1; }
+            if s_scr == Some(0) {
+                empty_scr += 1;
+            }
+            if err_scr == Some(true) {
+                errors += 1;
+            }
         }
 
         match (in_ufs, in_script) {
@@ -787,17 +1040,33 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 total_common += 1;
                 if is_match == Some(true) {
                     matches += 1;
-                    if let Some(s) = s_ufs { matched_bytes += s as u64; }
-                }
-                else if is_match == Some(false) {
+                    if let Some(s) = s_ufs {
+                        matched_bytes += s as u64;
+                    }
+                } else if is_match == Some(false) {
                     mismatches += 1;
-                    if let (Some(u), Some(s)) = (s_ufs, s_scr) { mismatched_bytes_lost += u.abs_diff(s); }
-                    if larger.as_deref() == Some("UFS") { ufs_won += 1; }
-                    else if larger.as_deref() == Some("SCRIPT") { script_won += 1; }
+                    if let (Some(u), Some(s)) = (s_ufs, s_scr) {
+                        mismatched_bytes_lost += u.abs_diff(s);
+                    }
+                    if larger.as_deref() == Some("UFS") {
+                        ufs_won += 1;
+                    } else if larger.as_deref() == Some("SCRIPT") {
+                        script_won += 1;
+                    }
                 }
-            },
-            (true, false) => { only_ufs += 1; if let Some(s) = s_ufs { only_ufs_bytes += s as u64; } }
-            (false, true) => { only_script += 1; if let Some(s) = s_scr { only_script_bytes += s as u64; } }
+            }
+            (true, false) => {
+                only_ufs += 1;
+                if let Some(s) = s_ufs {
+                    only_ufs_bytes += s as u64;
+                }
+            }
+            (false, true) => {
+                only_script += 1;
+                if let Some(s) = s_scr {
+                    only_script_bytes += s as u64;
+                }
+            }
             _ => {}
         }
     }
@@ -807,34 +1076,97 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let mut final_report = String::new();
     use std::fmt::Write as FmtWrite;
-    let _ = writeln!(&mut final_report, "==========================================================================");
-    let _ = writeln!(&mut final_report, "DZIENNIK KOŃCOWY - FAZA 2 (AKWIZYCJA ROZMIARÓW I WAGI)");
+    let _ = writeln!(
+        &mut final_report,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "DZIENNIK KOŃCOWY - FAZA 2 (AKWIZYCJA ROZMIARÓW I WAGI)"
+    );
     let _ = writeln!(&mut final_report, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut final_report, "==========================================================================\n");
+    let _ = writeln!(
+        &mut final_report,
+        "==========================================================================\n"
+    );
 
-    let _ = writeln!(&mut final_report, "[ 1 ] CZĘŚĆ WSPÓLNA (Pliki w strefie rywalizacji odzysku): {} plików", total_common);
-    let _ = writeln!(&mut final_report, "   -> Zgodna waga bitowa:         {} (Zweryfikowany wolumen: {})", matches, format_bytes(matched_bytes));
-    let _ = writeln!(&mut final_report, "      Znaczenie: Pliki posiadają dokładnie taki sam rozmiar w bajtach na obu nośnikach.");
-    
+    let _ = writeln!(
+        &mut final_report,
+        "[ 1 ] CZĘŚĆ WSPÓLNA (Pliki w strefie rywalizacji odzysku): {} plików",
+        total_common
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "   -> Zgodna waga bitowa:         {} (Zweryfikowany wolumen: {})",
+        matches,
+        format_bytes(matched_bytes)
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "      Znaczenie: Pliki posiadają dokładnie taki sam rozmiar w bajtach na obu nośnikach."
+    );
+
     if mismatches > 0 {
-        let _ = writeln!(&mut final_report, "   -> Różna waga (ucięte pliki):  {} (Wyliczono stratę danych na poziomie: {})", mismatches, format_bytes(mismatched_bytes_lost));
-        let _ = writeln!(&mut final_report, "      * W {} przypadkach wersja z UFS posiadała więcej danych.", ufs_won);
-        let _ = writeln!(&mut final_report, "      * W {} przypadkach wersja ze Skryptu posiadała więcej danych.", script_won);
+        let _ = writeln!(
+            &mut final_report,
+            "   -> Różna waga (ucięte pliki):  {} (Wyliczono stratę danych na poziomie: {})",
+            mismatches,
+            format_bytes(mismatched_bytes_lost)
+        );
+        let _ = writeln!(
+            &mut final_report,
+            "      * W {} przypadkach wersja z UFS posiadała więcej danych.",
+            ufs_won
+        );
+        let _ = writeln!(
+            &mut final_report,
+            "      * W {} przypadkach wersja ze Skryptu posiadała więcej danych.",
+            script_won
+        );
     }
 
-    let _ = writeln!(&mut final_report, "\n[ 2 ] UNIKALNE TRAFIENIA (Tylko na jednym z nośników):");
-    let _ = writeln!(&mut final_report, "   -> Tylko w UFS Explorer:       {} (Wolumen: {})", only_ufs, format_bytes(only_ufs_bytes));
-    let _ = writeln!(&mut final_report, "   -> Tylko w Skrypcie Autorskim: {} (Wolumen: {})\n", only_script, format_bytes(only_script_bytes));
+    let _ = writeln!(
+        &mut final_report,
+        "\n[ 2 ] UNIKALNE TRAFIENIA (Tylko na jednym z nośników):"
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "   -> Tylko w UFS Explorer:       {} (Wolumen: {})",
+        only_ufs,
+        format_bytes(only_ufs_bytes)
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "   -> Tylko w Skrypcie Autorskim: {} (Wolumen: {})\n",
+        only_script,
+        format_bytes(only_script_bytes)
+    );
 
     let _ = writeln!(&mut final_report, "[ 3 ] ANOMALIE I BŁĘDY ODCZYTU I/O:");
-    let _ = writeln!(&mut final_report, "   -> Puste pliki (Wydmuszki 0 B): {} (UFS: {}, Skrypt: {})", empty_ufs + empty_scr, empty_ufs, empty_scr);
-    let _ = writeln!(&mut final_report, "   -> Trwałe błędy dyskowe (I/O):  {}", errors);
+    let _ = writeln!(
+        &mut final_report,
+        "   -> Puste pliki (Wydmuszki 0 B): {} (UFS: {}, Skrypt: {})",
+        empty_ufs + empty_scr,
+        empty_ufs,
+        empty_scr
+    );
+    let _ = writeln!(
+        &mut final_report,
+        "   -> Trwałe błędy dyskowe (I/O):  {}",
+        errors
+    );
 
     // Zapis do fizycznego pliku "Dziennik Końcowy" na podstawie konfiguracji Dual-Logging
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(final_report.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -857,7 +1189,6 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "Faza 2 zakończona"
     );
     Ok(())
-
 }
 
 #[cfg(test)]
@@ -896,28 +1227,40 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn utworz(sciezka: &Path, bajty: &[u8]) {
-        if let Some(r) = sciezka.parent() { fs::create_dir_all(r).unwrap(); }
-        fs::write(sciezka, bajty).unwrap();
+        if let Some(r) = sciezka.parent() {
+            fs::create_dir_all(r).expect("Nie można utworzyć katalogów nadrzędnych");
+        }
+        fs::write(sciezka, bajty).expect("Nie można zapisać danych do pliku");
     }
 
     #[test]
     fn test_odczyt_rozmiaru_zwyklego_pliku() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let plik = dir.path().join("a.bin");
         utworz(&plik, &vec![0u8; 4096]);
 
-        assert_eq!(get_file_stats(&plik).unwrap().size, 4096);
+        assert_eq!(
+            get_file_stats(&plik)
+                .expect("Nie można pobrać statystyk pliku")
+                .size,
+            4096
+        );
     }
 
     #[test]
     fn test_pusty_plik_ma_rozmiar_zero_a_nie_blad() {
         // Wydmuszka (0 B) to poprawny wynik odczytu i osobna kategoria
         // śledcza - nie wolno jej mylić z błędem I/O.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let plik = dir.path().join("pusty.bin");
         utworz(&plik, b"");
 
-        assert_eq!(get_file_stats(&plik).unwrap().size, 0);
+        assert_eq!(
+            get_file_stats(&plik)
+                .expect("Nie można pobrać statystyk pliku")
+                .size,
+            0
+        );
     }
 
     #[test]
@@ -932,20 +1275,27 @@ mod tests {
 
     #[test]
     fn test_stat_watchdog_normalny_plik_daje_taki_sam_wynik_co_bezposrednie_wywolanie() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let plik = dir.path().join("a.bin");
         utworz(&plik, &[0u8; 123]);
 
         let watchdog = StatWatchdog::new();
-        let wynik = watchdog.stat_z_limitem(plik.clone()).expect("brak anulowania - musi zwrócić Some");
+        let wynik = watchdog
+            .stat_z_limitem(plik.clone())
+            .expect("brak anulowania - musi zwrócić Some");
 
-        assert_eq!(wynik.unwrap().size, 123);
+        assert_eq!(
+            wynik.expect("Wynik statystyk powinien być obecny").size,
+            123
+        );
     }
 
     #[test]
     fn test_stat_watchdog_propaguje_blad_io_tak_jak_wywolanie_bezposrednie() {
         let watchdog = StatWatchdog::new();
-        let wynik = watchdog.stat_z_limitem(PathBuf::from("/nie/ma/takiego/pliku")).expect("brak anulowania - musi zwrócić Some");
+        let wynik = watchdog
+            .stat_z_limitem(PathBuf::from("/nie/ma/takiego/pliku"))
+            .expect("brak anulowania - musi zwrócić Some");
 
         assert!(wynik.is_err());
     }
@@ -955,15 +1305,30 @@ mod tests {
         // Sedno projektu: JEDEN wątek-towarzysz obsługuje WIELE plików pod
         // rząd (reużycie, nie jednorazowe `thread::spawn` per plik) - musi
         // poprawnie parować kolejne odpowiedzi z kolejnymi zleceniami.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let a = dir.path().join("a.bin");
         let b = dir.path().join("b.bin");
         utworz(&a, &[0u8; 10]);
         utworz(&b, &[0u8; 20]);
 
         let watchdog = StatWatchdog::new();
-        assert_eq!(watchdog.stat_z_limitem(a).unwrap().unwrap().size, 10);
-        assert_eq!(watchdog.stat_z_limitem(b).unwrap().unwrap().size, 20);
+        assert_eq!(
+            watchdog
+                .stat_z_limitem(a)
+                .expect("Wywołanie stat_z_limitem nie powiodło się")
+                .expect("Wynik statystyk powinien być obecny")
+                .size,
+            10
+        );
+
+        assert_eq!(
+            watchdog
+                .stat_z_limitem(b)
+                .expect("Wywołanie stat_z_limitem nie powiodło się")
+                .expect("Wynik statystyk powinien być obecny")
+                .size,
+            20
+        );
     }
 
     /// Sedno naprawy: gdy `CANCEL_SIGNAL` jest już ustawiony ZANIM wątek-
@@ -996,10 +1361,14 @@ mod tests {
         let czas = start.elapsed();
         CANCEL_SIGNAL.store(false, Ordering::SeqCst); // Sprzątanie stanu globalnego po teście
 
-        assert!(wynik.is_none(), "anulowanie musi dać None, nie czekać na zawieszoną odpowiedź");
+        assert!(
+            wynik.is_none(),
+            "anulowanie musi dać None, nie czekać na zawieszoną odpowiedź"
+        );
         assert!(
             czas < CANCEL_POLL_INTERVAL * 5,
-            "przerwanie musi nastąpić przy najbliższym punkcie kontrolnym, nie po arbitralnie długim czasie: {:?}", czas
+            "przerwanie musi nastąpić przy najbliższym punkcie kontrolnym, nie po arbitralnie długim czasie: {:?}",
+            czas
         );
     }
 
@@ -1012,24 +1381,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_dowiazanie_nie_jest_sledzone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let cel = dir.path().join("cel.bin");
         utworz(&cel, &vec![7u8; 10_000]);
 
         let link = dir.path().join("link.bin");
-        std::os::unix::fs::symlink(&cel, &link).unwrap();
+        std::os::unix::fs::symlink(&cel, &link)
+            .expect("Nie można utworzyć dowiązania symbolicznego");
 
-        let rozmiar_linku = get_file_stats(&link).unwrap().size;
-        assert_ne!(rozmiar_linku, 10_000, "rozmiar dowiązania nie może być rozmiarem celu");
-        assert!(rozmiar_linku > 0 && rozmiar_linku < 1000, "dowiązanie waży tyle, co jego ścieżka: {}", rozmiar_linku);
+        let rozmiar_linku = get_file_stats(&link)
+            .expect("Nie można pobrać statystyk pliku")
+            .size;
+        assert_ne!(
+            rozmiar_linku, 10_000,
+            "rozmiar dowiązania nie może być rozmiarem celu"
+        );
+        assert!(
+            rozmiar_linku > 0 && rozmiar_linku < 1000,
+            "dowiązanie waży tyle, co jego ścieżka: {}",
+            rozmiar_linku
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_wiszace_dowiazanie_nie_jest_bledem_io() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let link = dir.path().join("wiszacy.bin");
-        std::os::unix::fs::symlink(dir.path().join("nie_ma_mnie"), &link).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nie_ma_mnie"), &link)
+            .expect("Nie można utworzyć dowiązania symbolicznego");
 
         assert!(
             get_file_stats(&link).is_ok(),
@@ -1057,7 +1437,12 @@ mod tests {
 
         assert!(blok.starts_with("[UFS Explorer]"), "{}", blok);
         for oczekiwane in ["120", "1.00 MB", "7", "3"] {
-            assert!(blok.contains(oczekiwane), "brak '{}' w bloku:\n{}", oczekiwane, blok);
+            assert!(
+                blok.contains(oczekiwane),
+                "brak '{}' w bloku:\n{}",
+                oczekiwane,
+                blok
+            );
         }
     }
 
@@ -1073,12 +1458,18 @@ mod tests {
 
         let stats_w_watku = Arc::clone(&stats);
         let _ = std::thread::spawn(move || {
-            let _guard = stats_w_watku.ext_weights.lock().unwrap();
+            let _guard = stats_w_watku
+                .ext_weights
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             panic!("celowa panika testowa trzymając blokadę");
         })
         .join();
 
-        assert!(stats.ext_weights.is_poisoned(), "Setup testu: muteks MUSI być zatruty");
+        assert!(
+            stats.ext_weights.is_poisoned(),
+            "Setup testu: muteks MUSI być zatruty"
+        );
 
         {
             let mut m = stats.wagi_rozszerzen();
@@ -1087,7 +1478,11 @@ mod tests {
         assert_eq!(stats.wagi_rozszerzen().get("jpg").copied(), Some(7));
 
         let blok = build_source_block("UFS Explorer", &stats);
-        assert!(blok.contains(".jpg"), "panel boczny musi się zbudować mimo zatrutego mutexa:\n{}", blok);
+        assert!(
+            blok.contains(".jpg"),
+            "panel boczny musi się zbudować mimo zatrutego mutexa:\n{}",
+            blok
+        );
     }
 
     #[test]
@@ -1102,13 +1497,24 @@ mod tests {
         }
 
         let blok = build_source_block("UFS Explorer", &stats);
-        let linia = blok.lines().find(|l| l.contains("Top format")).expect("linia Top format");
+        let linia = blok
+            .lines()
+            .find(|l| l.contains("Top format"))
+            .expect("linia Top format");
 
         let poz_mp4 = linia.find(".mp4").expect("mp4 musi być na liście");
         let poz_dng = linia.find(".dng").expect("dng musi być na liście");
         let poz_jpg = linia.find(".jpg").expect("jpg musi być na liście");
-        assert!(poz_mp4 < poz_dng && poz_dng < poz_jpg, "kolejność wagowa: {}", linia);
-        assert!(!linia.contains(".txt"), "czwarty format nie mieści się w Top 3: {}", linia);
+        assert!(
+            poz_mp4 < poz_dng && poz_dng < poz_jpg,
+            "kolejność wagowa: {}",
+            linia
+        );
+        assert!(
+            !linia.contains(".txt"),
+            "czwarty format nie mieści się w Top 3: {}",
+            linia
+        );
     }
 
     #[test]
@@ -1119,10 +1525,21 @@ mod tests {
         stats.wagi_rozszerzen().insert("brak".into(), 42);
 
         let linia = build_source_block("UFS", &stats)
-            .lines().find(|l| l.contains("Top format")).unwrap().to_string();
+            .lines()
+            .find(|l| l.contains("Top format"))
+            .expect("Szukany element powinien znajdować się w kolekcji")
+            .to_string();
 
-        assert!(linia.contains("brak ("), "kategoria bez rozszerzenia: {}", linia);
-        assert!(!linia.contains(".brak"), "„brak” nie może udawać rozszerzenia: {}", linia);
+        assert!(
+            linia.contains("brak ("),
+            "kategoria bez rozszerzenia: {}",
+            linia
+        );
+        assert!(
+            !linia.contains(".brak"),
+            "„brak” nie może udawać rozszerzenia: {}",
+            linia
+        );
     }
 
     #[test]
@@ -1143,28 +1560,49 @@ mod tests {
         let (tx_db, rx_db) = mpsc::sync_channel(10_000);
         let (tx_ui, _rx_ui) = mpsc::channel();
         let stats = LiveStats::new(2);
-        let log = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let log = Arc::new(Mutex::new(
+            tempfile::tempfile().expect("Nie można utworzyć pliku tymczasowego dla logów"),
+        ));
 
-        process_side_stream(StreamCtx { base_path: katalog, tasks: zadania, side_label: "Test", stats: &stats, tx_db, is_ufs, tx_ui: &tx_ui, bar_idx: 0, opr_log: log, });
+        process_side_stream(StreamCtx {
+            base_path: katalog,
+            tasks: zadania,
+            side_label: "Test",
+            stats: &stats,
+            tx_db,
+            is_ufs,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            opr_log: log,
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
+        });
 
         (stats, rx_db.into_iter().collect())
     }
 
     fn wyniki(msgs: &[ScanMsg]) -> Vec<&SideResult> {
-        msgs.iter().flat_map(|m| match m {
-            ScanMsg::UfsChunk(c) | ScanMsg::ScriptChunk(c) => c.iter().collect::<Vec<_>>(),
-        }).collect()
+        msgs.iter()
+            .flat_map(|m| match m {
+                ScanMsg::UfsChunk(c) | ScanMsg::ScriptChunk(c) => c.iter().collect::<Vec<_>>(),
+            })
+            .collect()
     }
 
     #[test]
     fn test_strumien_wazy_pliki_i_sumuje_bajty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("a.jpg"), &vec![0u8; 1000]);
         utworz(&dir.path().join("pod/b.jpg"), &vec![0u8; 2000]);
 
         let zadania = vec![
-            Task { id: 1, rel_path: "a.jpg".into() },
-            Task { id: 2, rel_path: "pod/b.jpg".into() },
+            Task {
+                id: 1,
+                rel_path: "a.jpg".into(),
+            },
+            Task {
+                id: 2,
+                rel_path: "pod/b.jpg".into(),
+            },
         ];
 
         let (stats, msgs) = uruchom_strumien(dir.path(), &zadania, true);
@@ -1176,7 +1614,10 @@ mod tests {
         let w = wyniki(&msgs);
         assert_eq!(w.len(), 2);
         let rozmiary: Vec<i64> = {
-            let mut v: Vec<i64> = w.iter().filter_map(|r| r.stats.as_ref().map(|s| s.size)).collect();
+            let mut v: Vec<i64> = w
+                .iter()
+                .filter_map(|r| r.stats.as_ref().map(|s| s.size))
+                .collect();
             v.sort();
             v
         };
@@ -1185,30 +1626,51 @@ mod tests {
 
     #[test]
     fn test_strumien_liczy_wydmuszki_osobno_od_bledow() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("pusty.bin"), b"");
         utworz(&dir.path().join("pelny.bin"), &[1u8; 10]);
 
         let zadania = vec![
-            Task { id: 1, rel_path: "pusty.bin".into() },
-            Task { id: 2, rel_path: "pelny.bin".into() },
+            Task {
+                id: 1,
+                rel_path: "pusty.bin".into(),
+            },
+            Task {
+                id: 2,
+                rel_path: "pelny.bin".into(),
+            },
         ];
 
         let (stats, _) = uruchom_strumien(dir.path(), &zadania, true);
 
-        assert_eq!(stats.empty_files.load(Ordering::Relaxed), 1, "dokładnie jedna wydmuszka");
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "wydmuszka NIE jest błędem I/O");
+        assert_eq!(
+            stats.empty_files.load(Ordering::Relaxed),
+            1,
+            "dokładnie jedna wydmuszka"
+        );
+        assert_eq!(
+            stats.errors.load(Ordering::Relaxed),
+            0,
+            "wydmuszka NIE jest błędem I/O"
+        );
     }
 
     #[test]
     fn test_brakujacy_plik_jest_bledem_io_a_nie_rozmiarem_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let zadania = vec![Task { id: 1, rel_path: "nie_ma_mnie.bin".into() }];
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let zadania = vec![Task {
+            id: 1,
+            rel_path: "nie_ma_mnie.bin".into(),
+        }];
 
         let (stats, msgs) = uruchom_strumien(dir.path(), &zadania, true);
 
         assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.empty_files.load(Ordering::Relaxed), 0, "brak pliku to nie wydmuszka");
+        assert_eq!(
+            stats.empty_files.load(Ordering::Relaxed),
+            0,
+            "brak pliku to nie wydmuszka"
+        );
         assert_eq!(stats.total_bytes.load(Ordering::Relaxed), 0);
 
         let w = wyniki(&msgs);
@@ -1221,63 +1683,119 @@ mod tests {
     fn test_wagi_rozszerzen_sa_sprowadzane_do_malych_liter() {
         // Odzyskane nazwy bywają w dowolnej wielkości liter; bez normalizacji
         // ".JPG" i ".jpg" konkurowałyby ze sobą w rankingu Top format.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("a.JPG"), &[0u8; 100]);
         utworz(&dir.path().join("b.jpg"), &[0u8; 50]);
         utworz(&dir.path().join("bez_rozszerzenia"), &[0u8; 25]);
 
         let zadania = vec![
-            Task { id: 1, rel_path: "a.JPG".into() },
-            Task { id: 2, rel_path: "b.jpg".into() },
-            Task { id: 3, rel_path: "bez_rozszerzenia".into() },
+            Task {
+                id: 1,
+                rel_path: "a.JPG".into(),
+            },
+            Task {
+                id: 2,
+                rel_path: "b.jpg".into(),
+            },
+            Task {
+                id: 3,
+                rel_path: "bez_rozszerzenia".into(),
+            },
         ];
 
         let (stats, _) = uruchom_strumien(dir.path(), &zadania, true);
 
         let m = stats.wagi_rozszerzen();
-        assert_eq!(m.get("jpg"), Some(&150), "oba warianty wielkości liter w jednym koszyku: {:?}", *m);
-        assert!(!m.contains_key("JPG"), "wielkie litery nie mogą tworzyć osobnej kategorii");
-        assert_eq!(m.get("brak"), Some(&25), "pliki bez rozszerzenia mają własną kategorię");
+        assert_eq!(
+            m.get("jpg"),
+            Some(&150),
+            "oba warianty wielkości liter w jednym koszyku: {:?}",
+            *m
+        );
+        assert!(
+            !m.contains_key("JPG"),
+            "wielkie litery nie mogą tworzyć osobnej kategorii"
+        );
+        assert_eq!(
+            m.get("brak"),
+            Some(&25),
+            "pliki bez rozszerzenia mają własną kategorię"
+        );
     }
 
     #[test]
     fn test_wyniki_trafiaja_do_wlasciwego_kanalu() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         utworz(&dir.path().join("x.bin"), b"x");
-        let zadania = vec![Task { id: 1, rel_path: "x.bin".into() }];
+        let zadania = vec![Task {
+            id: 1,
+            rel_path: "x.bin".into(),
+        }];
 
         let (_, msgs_ufs) = uruchom_strumien(dir.path(), &zadania, true);
-        assert!(msgs_ufs.iter().all(|m| matches!(m, ScanMsg::UfsChunk(_))), "przy is_ufs=true tylko kanał UFS");
+        assert!(
+            msgs_ufs.iter().all(|m| matches!(m, ScanMsg::UfsChunk(_))),
+            "przy is_ufs=true tylko kanał UFS"
+        );
 
         let (_, msgs_scr) = uruchom_strumien(dir.path(), &zadania, false);
-        assert!(msgs_scr.iter().all(|m| matches!(m, ScanMsg::ScriptChunk(_))), "przy is_ufs=false tylko kanał Skryptu");
+        assert!(
+            msgs_scr
+                .iter()
+                .all(|m| matches!(m, ScanMsg::ScriptChunk(_))),
+            "przy is_ufs=false tylko kanał Skryptu"
+        );
     }
 
     #[test]
     fn test_identyfikatory_zadan_wracaja_nienaruszone() {
         // Wynik jest wiązany z wierszem bazy po `id`. Pomyłka tutaj
         // przypisałaby rozmiar jednego pliku do zupełnie innego.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         for i in 0..5 {
-            utworz(&dir.path().join(format!("p{}.bin", i)), &vec![0u8; (i + 1) * 100]);
+            utworz(
+                &dir.path().join(format!("p{}.bin", i)),
+                &vec![0u8; (i + 1) * 100],
+            );
         }
         let zadania: Vec<Task> = (0..5)
-            .map(|i| Task { id: 1000 + i, rel_path: format!("p{}.bin", i) })
+            .map(|i| Task {
+                id: 1000 + i,
+                rel_path: format!("p{}.bin", i),
+            })
             .collect();
 
         let (_, msgs) = uruchom_strumien(dir.path(), &zadania, true);
 
-        let mut pary: Vec<(i32, i64)> = wyniki(&msgs).iter()
-            .map(|r| (r.id, r.stats.as_ref().unwrap().size))
+        let mut pary: Vec<(i32, i64)> = wyniki(&msgs)
+            .iter()
+            .map(|r| {
+                (
+                    r.id,
+                    r.stats
+                        .as_ref()
+                        .expect("Wartość w Option powinna być obecna")
+                        .size,
+                )
+            })
             .collect();
         pary.sort();
 
-        assert_eq!(pary, vec![(1000, 100), (1001, 200), (1002, 300), (1003, 400), (1004, 500)]);
+        assert_eq!(
+            pary,
+            vec![
+                (1000, 100),
+                (1001, 200),
+                (1002, 300),
+                (1003, 400),
+                (1004, 500)
+            ]
+        );
     }
 
     #[test]
     fn test_pusta_lista_zadan_nic_nie_wysyla() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let (stats, msgs) = uruchom_strumien(dir.path(), &[], true);
 
         assert_eq!(stats.processed.load(Ordering::Relaxed), 0);
@@ -1289,29 +1807,37 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn baza_z_plikiem() -> Connection {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script) VALUES (1, 'a.jpg', 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         conn
     }
 
     fn rozmiary(conn: &Connection) -> (Option<i64>, Option<i64>, Option<bool>, Option<bool>) {
         conn.query_row(
             "SELECT size_ufs, size_script, io_error_ufs, io_error_script FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).unwrap()
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("Odczyt z bazy danych nie powiódł się")
     }
 
     #[test]
     fn test_zapis_rozmiaru_z_obu_stron_nie_miesza_kolumn() {
         let conn = baza_z_plikiem();
 
-        conn.execute(SQL_ZAPIS_UFS, params![Some(500i64), Some(false), 1]).unwrap();
-        conn.execute(SQL_ZAPIS_SCRIPT, params![Some(700i64), Some(false), 1]).unwrap();
+        conn.execute(SQL_ZAPIS_UFS, params![Some(500i64), Some(false), 1])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
+        conn.execute(SQL_ZAPIS_SCRIPT, params![Some(700i64), Some(false), 1])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        assert_eq!(rozmiary(&conn), (Some(500), Some(700), Some(false), Some(false)));
+        assert_eq!(
+            rozmiary(&conn),
+            (Some(500), Some(700), Some(false), Some(false))
+        );
     }
 
     /// Sedno `COALESCE`: nieudany odczyt niesie `size = NULL` i NIE MOŻE
@@ -1320,11 +1846,17 @@ mod tests {
     fn test_pozniejszy_blad_nie_kasuje_zmierzonego_rozmiaru() {
         let conn = baza_z_plikiem();
 
-        conn.execute(SQL_ZAPIS_UFS, params![Some(1234i64), Some(false), 1]).unwrap();
-        conn.execute(SQL_ZAPIS_UFS, params![None::<i64>, Some(true), 1]).unwrap();
+        conn.execute(SQL_ZAPIS_UFS, params![Some(1234i64), Some(false), 1])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
+        conn.execute(SQL_ZAPIS_UFS, params![None::<i64>, Some(true), 1])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         let (rozmiar, _, blad, _) = rozmiary(&conn);
-        assert_eq!(rozmiar, Some(1234), "zmierzony rozmiar musi przetrwać późniejszy błąd odczytu");
+        assert_eq!(
+            rozmiar,
+            Some(1234),
+            "zmierzony rozmiar musi przetrwać późniejszy błąd odczytu"
+        );
         assert_eq!(blad, Some(true), "sam błąd musi zostać odnotowany");
     }
 
@@ -1335,41 +1867,54 @@ mod tests {
     /// Wstawia wiersz o zadanym stanie i zwraca wynik finalizacji:
     /// `(size_match, larger_side, phase2_done)`.
     fn finalizuj(
-        found_ufs: bool, found_script: bool,
-        size_ufs: Option<i64>, size_script: Option<i64>,
-        err_ufs: Option<bool>, err_script: Option<bool>,
+        found_ufs: bool,
+        found_script: bool,
+        size_ufs: Option<i64>,
+        size_script: Option<i64>,
+        err_ufs: Option<bool>,
+        err_script: Option<bool>,
     ) -> (Option<i64>, Option<String>, bool) {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
              VALUES (1, 'a.jpg', ?1, ?2, ?3, ?4, ?5, ?6, 0)",
             params![found_ufs, found_script, size_ufs, size_script, err_ufs, err_script],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        conn.execute(SQL_FINALIZACJA_MACIERZY, []).unwrap();
+        conn.execute(SQL_FINALIZACJA_MACIERZY, [])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
         conn.query_row(
             "SELECT size_match, larger_side, phase2_done FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap()
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("Odczyt z bazy danych nie powiódł się")
     }
 
     #[test]
     fn test_zgodne_rozmiary_daja_dopasowanie_bez_wiekszej_strony() {
-        let (zgodnosc, wieksza, gotowe) = finalizuj(true, true, Some(900), Some(900), Some(false), Some(false));
+        let (zgodnosc, wieksza, gotowe) =
+            finalizuj(true, true, Some(900), Some(900), Some(false), Some(false));
         assert_eq!(zgodnosc, Some(1));
-        assert_eq!(wieksza, None, "przy równych rozmiarach żadna strona nie jest większa");
+        assert_eq!(
+            wieksza, None,
+            "przy równych rozmiarach żadna strona nie jest większa"
+        );
         assert!(gotowe);
     }
 
     #[test]
     fn test_rozne_rozmiary_wskazuja_wieksza_strone() {
-        let (zgodnosc, wieksza, gotowe) = finalizuj(true, true, Some(500), Some(900), Some(false), Some(false));
+        let (zgodnosc, wieksza, gotowe) =
+            finalizuj(true, true, Some(500), Some(900), Some(false), Some(false));
         assert_eq!(zgodnosc, Some(0));
         assert_eq!(wieksza.as_deref(), Some("SCRIPT"));
         assert!(gotowe);
 
-        let (_, wieksza2, _) = finalizuj(true, true, Some(900), Some(500), Some(false), Some(false));
+        let (_, wieksza2, _) =
+            finalizuj(true, true, Some(900), Some(500), Some(false), Some(false));
         assert_eq!(wieksza2.as_deref(), Some("UFS"));
     }
 
@@ -1380,19 +1925,28 @@ mod tests {
     /// podstawie nieodczytanego pliku.
     #[test]
     fn test_blad_io_daje_brak_rozstrzygniecia_a_nie_niezgodnosc() {
-        let (zgodnosc, _, gotowe) = finalizuj(true, true, Some(900), Some(900), Some(true), Some(false));
+        let (zgodnosc, _, gotowe) =
+            finalizuj(true, true, Some(900), Some(900), Some(true), Some(false));
         assert_eq!(zgodnosc, None, "po błędzie I/O porównanie jest niemożliwe");
-        assert!(gotowe, "błąd też domyka stronę - plik nie wraca w nieskończoność do kolejki");
+        assert!(
+            gotowe,
+            "błąd też domyka stronę - plik nie wraca w nieskończoność do kolejki"
+        );
 
-        let (zgodnosc2, _, _) = finalizuj(true, true, Some(100), Some(200), Some(false), Some(true));
+        let (zgodnosc2, _, _) =
+            finalizuj(true, true, Some(100), Some(200), Some(false), Some(true));
         assert_eq!(zgodnosc2, None, "błąd po drugiej stronie działa tak samo");
     }
 
     #[test]
     fn test_plik_tylko_po_jednej_stronie_nie_ma_czego_porownywac() {
-        let (zgodnosc, wieksza, gotowe) = finalizuj(true, false, Some(900), None, Some(false), None);
+        let (zgodnosc, wieksza, gotowe) =
+            finalizuj(true, false, Some(900), None, Some(false), None);
         assert_eq!(zgodnosc, None, "bez drugiej kopii nie ma porównania");
-        assert_eq!(wieksza, None, "porównanie z NULL nie wskazuje większej strony");
+        assert_eq!(
+            wieksza, None,
+            "porównanie z NULL nie wskazuje większej strony"
+        );
         assert!(gotowe, "strona nieobecna jest z definicji rozstrzygnięta");
     }
 
@@ -1402,23 +1956,33 @@ mod tests {
     #[test]
     fn test_niedokonczony_pomiar_wraca_do_kolejki() {
         let (_, _, gotowe) = finalizuj(true, true, Some(900), None, Some(false), None);
-        assert!(!gotowe, "brak pomiaru po jednej ze stron musi zostawić plik do ponowienia");
+        assert!(
+            !gotowe,
+            "brak pomiaru po jednej ze stron musi zostawić plik do ponowienia"
+        );
     }
 
     #[test]
     fn test_finalizacja_nie_rusza_wierszy_juz_zakonczonych() {
-        let conn = crate::db::init_db(":memory:").unwrap();
+        let conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, size_match, phase2_done)
              VALUES (1, 'stary.jpg', 1, 1, 10, 20, 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        conn.execute(SQL_FINALIZACJA_MACIERZY, []).unwrap();
+        conn.execute(SQL_FINALIZACJA_MACIERZY, [])
+            .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let zgodnosc: Option<i64> = conn.query_row("SELECT size_match FROM files WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let zgodnosc: Option<i64> = conn
+            .query_row("SELECT size_match FROM files WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("Odczyt z bazy danych nie powiódł się");
         assert_eq!(
-            zgodnosc, Some(1),
+            zgodnosc,
+            Some(1),
             "wiersz z phase2_done = 1 jest poza zakresem zapytania - jego wcześniejszy wynik zostaje nietknięty"
         );
     }
@@ -1440,35 +2004,58 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn test_run_finalizuje_macierz_mimo_braku_nowych_zadan_io() {
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
              VALUES (1, 'utkniety.jpg', 1, 1, 500, 500, 0, 0, 0)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let log_dir = tempfile::tempdir().unwrap();
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let mut config = Ustawienia::default();
         config.log_path = log_dir.path().to_string_lossy().to_string();
         config.raporty_faz.clear(); // wymusza gałąź unwrap_or_else -> katalog = log_path (tempdir)
         config.max_threads = 1;
 
         let (tx_ui, _rx_ui) = mpsc::channel();
-        run(&mut conn, &config, tx_ui).expect("run() nie może zwrócić błędu przy pustej liście nowych zadań");
+        run(&mut conn, &config, tx_ui)
+            .expect("run() nie może zwrócić błędu przy pustej liście nowych zadań");
 
-        let (zgodnosc, gotowe): (Option<i64>, bool) = conn.query_row(
-            "SELECT size_match, phase2_done FROM files WHERE id = 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (zgodnosc, gotowe): (Option<i64>, bool) = conn
+            .query_row(
+                "SELECT size_match, phase2_done FROM files WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("Odczyt z bazy danych nie powiódł się");
 
         assert_eq!(
-            zgodnosc, Some(1),
+            zgodnosc,
+            Some(1),
             "finalizacja macierzy musi się wykonać mimo braku nowych zadań I/O w tej sesji"
         );
         assert!(
             gotowe,
             "wiersz nie może zostać trwale utknięty z phase2_done = 0 tylko dlatego, że rozmiary zapisano w poprzedniej sesji"
         );
+    }
+
+    /// Dziennik Końcowy niesie teraz znacznik czasu w nazwie (patrz
+    /// `utils::stamp_filename`) — testy nie mogą już czytać stałej nazwy
+    /// pliku, muszą odnaleźć go po prefiksie w katalogu logów.
+    fn znajdz_dziennik_koncowy(log_dir: &Path) -> std::path::PathBuf {
+        std::fs::read_dir(log_dir)
+            .expect("Nie można odczytać katalogu logów")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("dziennik_koncowy_faza2"))
+            })
+            .expect("Dziennik Końcowy (ze znacznikiem czasu) musi powstać w katalogu logów")
     }
 
     /// REGRESJA (measure twice — druga weryfikacja Gemini, todo.faza02.md
@@ -1481,7 +2068,8 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn test_dziennik_koncowy_liczy_puste_pliki_i_bledy_z_calej_bazy_nie_tylko_biezacej_sesji() {
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         // Dwa wiersze UDAJĄCE stan z POPRZEDNIEJ sesji: już zmierzone/oznaczone
         // jako gotowe (phase2_done=1), więc liczniki RAM (LiveStats) TEJ sesji
         // zostają na zerze dla obu - żaden z nich nie wygeneruje nowego zadania I/O.
@@ -1489,12 +2077,12 @@ mod tests {
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
              VALUES (1, 'pusty_z_poprzedniej_sesji.jpg', 1, 0, 0, NULL, 0, NULL, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, size_script, io_error_ufs, io_error_script, phase2_done)
              VALUES (2, 'blad_io_z_poprzedniej_sesji.jpg', 0, 1, NULL, NULL, NULL, 1, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         // Trzeci wiersz, GENUINE nowe zadanie tej sesji (phase2_done=0, brak
         // zmierzonego rozmiaru) - niezbędny, żeby run() faktycznie doszedł do
         // ETAPU 5 (gałąź `total_db_rows == 0` kończy się wcześniej, bez
@@ -1503,13 +2091,18 @@ mod tests {
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, phase2_done)
              VALUES (3, 'nowy.jpg', 1, 0, 0)",
             [],
-        ).unwrap();
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let ufs_dir = tempfile::tempdir().unwrap();
-        let script_dir = tempfile::tempdir().unwrap();
-        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc").unwrap();
+        let ufs_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc")
+            .expect("Nie można zapisać danych do pliku");
 
-        let log_dir = tempfile::tempdir().unwrap();
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let mut config = Ustawienia::default();
         config.ufs_path = ufs_dir.path().to_string_lossy().to_string();
         config.script_path = script_dir.path().to_string_lossy().to_string();
@@ -1520,16 +2113,18 @@ mod tests {
         let (tx_ui, _rx_ui) = mpsc::channel();
         run(&mut conn, &config, tx_ui).expect("run() musi wygenerować Dziennik Końcowy");
 
-        let dziennik = std::fs::read_to_string(log_dir.path().join("dziennik_koncowy_faza2.txt"))
+        let dziennik = std::fs::read_to_string(znajdz_dziennik_koncowy(log_dir.path()))
             .expect("Dziennik Końcowy musi powstać nawet bez nowych zadań tej sesji");
 
         assert!(
             dziennik.contains("Puste pliki (Wydmuszki 0 B): 1 (UFS: 1, Skrypt: 0)"),
-            "raport musi zliczyć pusty plik zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}", dziennik
+            "raport musi zliczyć pusty plik zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}",
+            dziennik
         );
         assert!(
             dziennik.contains("Trwałe błędy dyskowe (I/O):  1"),
-            "raport musi zliczyć błąd I/O zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}", dziennik
+            "raport musi zliczyć błąd I/O zapisany w POPRZEDNIEJ sesji, nie tylko bieżącej (RAM=0):\n{}",
+            dziennik
         );
     }
 
@@ -1540,17 +2135,18 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn test_dziennik_koncowy_pokazuje_wolumen_plikow_unikalnych() {
-        let mut conn = crate::db::init_db(":memory:").unwrap();
+        let mut conn =
+            crate::db::init_db(":memory:").expect("Inicjalizacja bazy danych nie powiodła się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_ufs, phase2_done)
              VALUES (1, 'tylko_ufs.bin', 1, 0, 5000, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         conn.execute(
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, size_script, phase2_done)
              VALUES (2, 'tylko_skrypt.bin', 0, 1, 3000, 1)",
             [],
-        ).unwrap();
+        ).expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
         // Trzeci wiersz, genuine nowe zadanie — inaczej run() kończy się
         // wcześniej w gałęzi `total_db_rows == 0`, bez zapisania Dziennika.
         // Obecny po OBU stronach (found_in_ufs=1, found_in_script=1) - musi
@@ -1560,14 +2156,20 @@ mod tests {
             "INSERT INTO files (id, relative_path, found_in_ufs, found_in_script, phase2_done)
              VALUES (3, 'nowy.jpg', 1, 1, 0)",
             [],
-        ).unwrap();
+        )
+        .expect("Wykonanie zapytania SQL na bazie danych nie powiodło się");
 
-        let ufs_dir = tempfile::tempdir().unwrap();
-        let script_dir = tempfile::tempdir().unwrap();
-        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc").unwrap();
-        fs::write(script_dir.path().join("nowy.jpg"), b"tresc").unwrap();
+        let ufs_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        let script_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
+        fs::write(ufs_dir.path().join("nowy.jpg"), b"tresc")
+            .expect("Nie można zapisać danych do pliku");
+        fs::write(script_dir.path().join("nowy.jpg"), b"tresc")
+            .expect("Nie można zapisać danych do pliku");
 
-        let log_dir = tempfile::tempdir().unwrap();
+        let log_dir =
+            tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
         let mut config = Ustawienia::default();
         config.ufs_path = ufs_dir.path().to_string_lossy().to_string();
         config.script_path = script_dir.path().to_string_lossy().to_string();
@@ -1578,15 +2180,24 @@ mod tests {
         let (tx_ui, _rx_ui) = mpsc::channel();
         run(&mut conn, &config, tx_ui).expect("run() musi wygenerować Dziennik Końcowy");
 
-        let dziennik = std::fs::read_to_string(log_dir.path().join("dziennik_koncowy_faza2.txt")).unwrap();
+        let dziennik = std::fs::read_to_string(znajdz_dziennik_koncowy(log_dir.path()))
+            .expect("Nie można odczytać pliku");
 
         assert!(
-            dziennik.contains(&format!("Tylko w UFS Explorer:       1 (Wolumen: {})", format_bytes(5000))),
-            "brak wolumenu plików unikalnych UFS w raporcie:\n{}", dziennik
+            dziennik.contains(&format!(
+                "Tylko w UFS Explorer:       1 (Wolumen: {})",
+                format_bytes(5000)
+            )),
+            "brak wolumenu plików unikalnych UFS w raporcie:\n{}",
+            dziennik
         );
         assert!(
-            dziennik.contains(&format!("Tylko w Skrypcie Autorskim: 1 (Wolumen: {})", format_bytes(3000))),
-            "brak wolumenu plików unikalnych Skryptu w raporcie:\n{}", dziennik
+            dziennik.contains(&format!(
+                "Tylko w Skrypcie Autorskim: 1 (Wolumen: {})",
+                format_bytes(3000)
+            )),
+            "brak wolumenu plików unikalnych Skryptu w raporcie:\n{}",
+            dziennik
         );
     }
 }

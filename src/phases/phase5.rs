@@ -28,10 +28,10 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent; // <--- NAPRAWIONY IMPORT
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -41,29 +41,49 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 // --- FALLBACKS DLA WINDOWS (Aby IDE nie świeciło na czerwono) ---
 #[cfg(not(unix))]
 trait DummyUnixMeta {
-    fn uid(&self) -> u32 { 0 }
-    fn gid(&self) -> u32 { 0 }
-    fn mode(&self) -> u32 { 0o777 }
-    fn ctime(&self) -> i64 { 0 }
-    fn ctime_nsec(&self) -> i64 { 0 }
-    fn blocks(&self) -> u64 { 0 }
+    fn uid(&self) -> u32 {
+        0
+    }
+    fn gid(&self) -> u32 {
+        0
+    }
+    fn mode(&self) -> u32 {
+        0o777
+    }
+    fn ctime(&self) -> i64 {
+        0
+    }
+    fn ctime_nsec(&self) -> i64 {
+        0
+    }
+    fn blocks(&self) -> u64 {
+        0
+    }
 }
 #[cfg(not(unix))]
 impl DummyUnixMeta for std::fs::Metadata {}
 
 #[cfg(not(unix))]
 trait DummyUnixFileType {
-    fn is_fifo(&self) -> bool { false }
-    fn is_socket(&self) -> bool { false }
-    fn is_char_device(&self) -> bool { false }
-    fn is_block_device(&self) -> bool { false }
+    fn is_fifo(&self) -> bool {
+        false
+    }
+    fn is_socket(&self) -> bool {
+        false
+    }
+    fn is_char_device(&self) -> bool {
+        false
+    }
+    fn is_block_device(&self) -> bool {
+        false
+    }
 }
 #[cfg(not(unix))]
 impl DummyUnixFileType for std::fs::FileType {}
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -82,22 +102,38 @@ const CHUNK_SIZE: usize = 100;
 /// wykonywalnego na `s`/`S` (SUID/SGID) lub `t`/`T` (sticky bit) gdy ustawiony.
 fn format_permissions(mode: u32, is_symlink: bool, is_dir: bool) -> String {
     let mut s = String::with_capacity(10);
-    
-    if is_symlink { s.push('l'); }
-    else if is_dir { s.push('d'); }
-    else { s.push('-'); }
+
+    if is_symlink {
+        s.push('l');
+    } else if is_dir {
+        s.push('d');
+    } else {
+        s.push('-');
+    }
 
     s.push(if mode & 0o400 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o200 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o4000 != 0 { if mode & 0o100 != 0 { 's' } else { 'S' } } else { if mode & 0o100 != 0 { 'x' } else { '-' } });
+    s.push(if mode & 0o4000 != 0 {
+        if mode & 0o100 != 0 { 's' } else { 'S' }
+    } else {
+        if mode & 0o100 != 0 { 'x' } else { '-' }
+    });
 
     s.push(if mode & 0o040 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o020 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o2000 != 0 { if mode & 0o010 != 0 { 's' } else { 'S' } } else { if mode & 0o010 != 0 { 'x' } else { '-' } });
+    s.push(if mode & 0o2000 != 0 {
+        if mode & 0o010 != 0 { 's' } else { 'S' }
+    } else {
+        if mode & 0o010 != 0 { 'x' } else { '-' }
+    });
 
     s.push(if mode & 0o004 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o002 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o1000 != 0 { if mode & 0o001 != 0 { 't' } else { 'T' } } else { if mode & 0o001 != 0 { 'x' } else { '-' } });
+    s.push(if mode & 0o1000 != 0 {
+        if mode & 0o001 != 0 { 't' } else { 'T' }
+    } else {
+        if mode & 0o001 != 0 { 'x' } else { '-' }
+    });
 
     s
 }
@@ -208,7 +244,7 @@ pub(crate) struct LiveStats {
     /// bo koszt to liczba wywołań `lstat()`, nie objętość odczytanych danych).
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
-    
+
     ext_weights: Mutex<HashMap<String, u64>>,
     /// Zliczenia wystąpień per UID właściciela — do wykrycia dominującego konta.
     uid_counts: Mutex<HashMap<u32, usize>>,
@@ -281,7 +317,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA (UFS albo Skrypt) —
@@ -298,45 +338,91 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_files = processed as f64 / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
 
     let top_uid = {
-        let map = stats.uid_counts.lock().unwrap();
+        let map = stats.uid_counts.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(u, c)| format!("UID {} ({})", u, c)).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(u, c)| format!("UID {} ({})", u, c))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_uid = if top_uid.is_empty() { "...".to_string() } else { top_uid };
+    let display_uid = if top_uid.is_empty() {
+        "...".to_string()
+    } else {
+        top_uid
+    };
 
     let top_gid = {
-        let map = stats.gid_counts.lock().unwrap();
+        let map = stats.gid_counts.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(g, c)| format!("GID {} ({})", g, c)).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(g, c)| format!("GID {} ({})", g, c))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_gid = if top_gid.is_empty() { "...".to_string() } else { top_gid };
+    let display_gid = if top_gid.is_empty() {
+        "...".to_string()
+    } else {
+        top_gid
+    };
 
     let top_mode = {
-        let map = stats.mode_counts.lock().unwrap();
+        let map = stats.mode_counts.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(m, c)| format!("{} ({})", m, c)).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(m, c)| format!("{} ({})", m, c))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_mode = if top_mode.is_empty() { "...".to_string() } else { top_mode };
+    let display_mode = if top_mode.is_empty() {
+        "...".to_string()
+    } else {
+        top_mode
+    };
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\nPrędkość: {:.0} plików/s\nTop format: {}\nTop UID: {}\nTop GID: {}\nTop uprawnienia: {}\nDowiązania miękkie: {}\nDowiązania twarde: {}\nWłaściciel root: {}\nSUID/SGID: {}\nPliki wykonywalne: {}\nEpoka zerowa (1970): {}\nPrzepełnienie znacznika czasu: {}\nEpoka zerowa ctime (1970): {}\nPrzepełnienie znacznika ctime: {}\nPliki rzadkie (sparse): {}\nPliki specjalne (FIFO/socket/urządzenie): {}\nWątki lstat (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_files, display_ext, display_uid, display_gid, display_mode,
+        label,
+        speed_files,
+        display_ext,
+        display_uid,
+        display_gid,
+        display_mode,
         stats.symlinks.load(Ordering::Relaxed),
         stats.hardlinks.load(Ordering::Relaxed),
         stats.root_owned.load(Ordering::Relaxed),
@@ -374,12 +460,26 @@ pub struct StreamCtx<'a> {
     pub bar_idx: usize,
     pub opr_log: Arc<Mutex<File>>,
     pub start_time: Instant,
+    pub debug_log: crate::debug_log::DebugLog,
 }
 
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, opr_log, start_time } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        start_time,
+        debug_log,
+    } = ctx;
+    let metoda = "symlink_metadata (lstat)";
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -397,6 +497,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
             let full_path = base_path.join(&task.rel_path);
             let ext = Path::new(&task.rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
 
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [START ] [Metoda: {:<24}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, full_path.display()
+                );
+            }
+
+            let call_start = debug_log.is_active().then(Instant::now);
             let (stats_opt, io_err) = match stats.thread_activity.track_current(|| fs::symlink_metadata(&full_path)) {
                 Ok(meta) => {
                     // NAPRAWA (przepełnienie i64): patrz dokumentacja `compute_precise_mtime`.
@@ -487,6 +596,17 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                     (None, Some(true))
                 }
             };
+            let wynik = if io_err == Some(true) { "BŁĄD I/O" } else { "OK" };
+            if let Some(t) = call_start {
+                debug_log.log(side_label, metoda, &task.rel_path, t.elapsed(), wynik);
+            }
+            if let Ok(mut f) = opr_log.lock() {
+                let _ = writeln!(
+                    f,
+                    "[{}] [{:<15}] [KONIEC] [Metoda: {:<24}] [Wynik: {}] Źródło: \"{}\"",
+                    crate::utils::log_timestamp(), side_label, metoda, wynik, full_path.display()
+                );
+            }
 
             let current = stats.processed.fetch_add(1, Ordering::Relaxed) + 1;
             
@@ -509,19 +629,19 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now;
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_uid_counts.is_empty() {
-                    let mut global_uid = stats.uid_counts.lock().unwrap();
+                    let mut global_uid = stats.uid_counts.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_uid_counts.drain() { *global_uid.entry(k).or_insert(0) += v; }
                 }
                 if !local_gid_counts.is_empty() {
-                    let mut global_gid = stats.gid_counts.lock().unwrap();
+                    let mut global_gid = stats.gid_counts.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_gid_counts.drain() { *global_gid.entry(k).or_insert(0) += v; }
                 }
                 if !local_mode_counts.is_empty() {
-                    let mut global_mode = stats.mode_counts.lock().unwrap();
+                    let mut global_mode = stats.mode_counts.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_mode_counts.drain() { *global_mode.entry(k).or_insert(0) += v; }
                 }
 
@@ -533,7 +653,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 });
                 let _ = tx_ui.send(PhaseEvent::UpdateBottomPath {
                     idx: bar_idx,
-                    path: full_path.to_string_lossy().to_string(),
+                    path: format!("[{}] {}", metoda, full_path.to_string_lossy()),
                 });
 
                 // PANEL BOCZNY: pełny, samodzielny blok TEGO źródła
@@ -547,15 +667,15 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_uid_counts.is_empty() {
-            let mut global_uid = stats.uid_counts.lock().unwrap();
+            let mut global_uid = stats.uid_counts.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_uid_counts.drain() { *global_uid.entry(k).or_insert(0) += v; }
         }
         if !local_mode_counts.is_empty() {
-            let mut global_mode = stats.mode_counts.lock().unwrap();
+            let mut global_mode = stats.mode_counts.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_mode_counts.drain() { *global_mode.entry(k).or_insert(0) += v; }
         }
 
@@ -589,20 +709,39 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 /// plików obecnych na obu); (4) generuje Dziennik Końcowy (rozkład anomalii
 /// i-node, top UID/uprawnienia) do pliku i do UI.
 #[instrument(skip(conn, config, tx_ui), fields(ufs_path = %config.ufs_path, script_path = %config.script_path))]
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     crate::utils::CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 5").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza5.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza5.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 5")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza5.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza5.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
-    let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
-    let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+    // Wszystkie pliki tego przebiegu fazy niosą ten sam znacznik czasu, więc
+    // łatwo je ze sobą powiązać na dysku, a kolejne uruchomienia się nie
+    // nadpisują.
+    let stamp = crate::utils::run_timestamp();
+    let opr_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_operacyjny, &stamp));
+    let dz_path = Path::new(&raport_cfg.katalog)
+        .join(crate::utils::stamp_filename(&raport_cfg.plik_dziennika, &stamp));
+    let debug_log = crate::debug_log::DebugLog::maybe_open(
+        &raport_cfg.katalog,
+        &crate::utils::stamp_filename("dziennik_debug_faza5.txt", &stamp),
+        &config.log_level,
+    );
+
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -610,22 +749,42 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 5 (STRUKTURY I-NODE) ===");
-        let _ = writeln!(f, "Zestawienie plików z podejrzanymi atrybutami (Błędy odzysku Epoki 0, Hardlinki, SUID/ROOT):\n");
+        let _ = writeln!(
+            f,
+            "Zestawienie plików z podejrzanymi atrybutami (Błędy odzysku Epoki 0, Hardlinki, SUID/ROOT):\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 5. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 5. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -635,7 +794,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT id, relative_path, found_in_ufs, found_in_script, mtime_ufs, mtime_script, io_error_ufs, io_error_script 
          FROM files WHERE phase5_done = 0 OR phase5_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped_ufs = 0;
@@ -643,8 +802,14 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
@@ -652,31 +817,67 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let (id, rel, in_ufs, in_script, m_ufs, m_scr, err_ufs, err_scr) = r;
 
         if in_ufs {
-            if wymaga_ponownego_odczytu(m_ufs, err_ufs) { ufs_tasks.push(Task { id, rel_path: rel.clone() }); }
-            else { skipped_ufs += 1; }
+            if wymaga_ponownego_odczytu(m_ufs, err_ufs) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                });
+            } else {
+                skipped_ufs += 1;
+            }
         }
 
         if in_script {
-            if wymaga_ponownego_odczytu(m_scr, err_scr) { script_tasks.push(Task { id, rel_path: rel }); }
-            else { skipped_script += 1; }
+            if wymaga_ponownego_odczytu(m_scr, err_scr) {
+                script_tasks.push(Task { id, rel_path: rel });
+            } else {
+                skipped_script += 1;
+            }
         }
     }
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto pliki z wyliczonymi metadanymi. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto pliki z wyliczonymi metadanymi. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających weryfikacji i-node. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Odczyt metadanych i-node jest kompletny. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Pozwala to skryptowi wejść
+        // w Etap 4 i odznaczyć zablokowane pliki!
     }
 
+    //    let total_db_rows = ufs_tasks.len() + script_tasks.len();
+    //    if total_db_rows == 0 {
+    //        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających weryfikacji i-node. Baza aktualna.".to_string()));
+    //        return Ok(());
+    //    }
+
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Metadane)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Metadane)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Metadane)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Metadane)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = std::cmp::max(1, actual_threads / 2);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -766,6 +967,8 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let tx2 = tx_db.clone();
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -784,43 +987,130 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
             s.spawn(move || {
                 if !ufs_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                opr_log: log_u,
+                                start_time,
+                                debug_log: dbg_u.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: log_u,
+                            start_time,
+                            debug_log: dbg_u.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Odczyt atrybutów UFS zakończony.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Odczyt atrybutów UFS zakończony.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
                 if !script_tasks.is_empty() {
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                opr_log: log_s,
+                                start_time,
+                                debug_log: dbg_s.clone(),
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: log_s,
+                            start_time,
+                            debug_log: dbg_s.clone(),
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Odczyt atrybutów Skryptu zakończony.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Odczyt atrybutów Skryptu zakończony.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
-
         } else {
             let log_u = opr_log.clone();
             let log_s = opr_log.clone();
-            
+            let dbg_u = debug_log.clone();
+            let dbg_s = debug_log.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: log_u, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Odczyt atrybutów UFS zakończony.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: log_u,
+                    start_time,
+                    debug_log: dbg_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Odczyt atrybutów UFS zakończony.".to_string(),
+                ));
             }
-            
+
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: log_s, start_time, });
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Odczyt atrybutów Skryptu zakończony.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: log_s,
+                    start_time,
+                    debug_log: dbg_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Odczyt atrybutów Skryptu zakończony.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -843,12 +1133,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa wiązanie macierzy metadanych w SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa wiązanie macierzy metadanych w SQLite...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files 
          SET meta_match = CASE 
@@ -887,94 +1181,230 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT uid_ufs, uid_script, gid_ufs, gid_script, mode_ufs, mode_script, mtime_ufs, mtime_script, is_symlink_ufs, is_symlink_script 
          FROM files WHERE phase5_done = 1 AND found_in_ufs = 1 AND found_in_script = 1 AND io_error_ufs = 0 AND io_error_script = 0"
     )?;
-    
+
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, u32>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?,
-            row.get::<_, u32>(4)?, row.get::<_, u32>(5)?, row.get::<_, i64>(6)?, row.get::<_, i64>(7)?,
-            row.get::<_, bool>(8)?, row.get::<_, bool>(9)?
+            row.get::<_, u32>(0)?,
+            row.get::<_, u32>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, u32>(3)?,
+            row.get::<_, u32>(4)?,
+            row.get::<_, u32>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?, // 🟢 NAPRAWIONE: Użycie Option
+            row.get::<_, bool>(8)?,
+            row.get::<_, bool>(9)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (u_uid, s_uid, u_gid, s_gid, u_mode, s_mode, u_mtime, s_mtime, u_sym, s_sym) = r;
-        
-        if u_uid == s_uid && u_gid == s_gid && u_mode == s_mode && u_mtime == s_mtime && u_sym == s_sym {
+
+        if u_uid == s_uid
+            && u_gid == s_gid
+            && u_mode == s_mode
+            && u_mtime == s_mtime
+            && u_sym == s_sym
+        {
             match_count += 1;
         } else {
             if u_mtime != s_mtime {
                 mismatch_mtime_count += 1;
-                if u_mtime < s_mtime { ufs_older_count += 1; } else { script_older_count += 1; }
+
+                // 🟢 NAPRAWIONE: Bezpieczne porównywanie Option w Rust
+                match (u_mtime, s_mtime) {
+                    (Some(u), Some(s)) => {
+                        if u < s {
+                            ufs_older_count += 1;
+                        } else {
+                            script_older_count += 1;
+                        }
+                    }
+                    (Some(_), None) => ufs_older_count += 1, // UFS odczytał datę, Skrypt ma zniszczoną (NULL)
+                    (None, Some(_)) => script_older_count += 1, // Skrypt odczytał, UFS ma zniszczoną (NULL)
+                    (None, None) => {} // Sytuacja teoretycznie wykluczona przez u_mtime != s_mtime
+                }
             } else {
                 mismatch_perms_count += 1;
-                if u_uid != s_uid || u_gid != s_gid { mismatch_uid_count += 1; }
-                if u_mode != s_mode { mismatch_mode_count += 1; }
+                if u_uid != s_uid || u_gid != s_gid {
+                    mismatch_uid_count += 1;
+                }
+                if u_mode != s_mode {
+                    mismatch_mode_count += 1;
+                }
             }
         }
     }
     drop(stmt);
 
-    let errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
     let elapsed = start_time.elapsed();
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 5 (ATRYBUTY ZEWNĘTRZNE I-NODE)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 5 (ATRYBUTY ZEWNĘTRZNE I-NODE)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
-    
-    let _ = writeln!(&mut log_out, "[ 1 ] FIZYCZNY ROZKŁAD STRUKTURY (Anomalie Systemu Plików):");
-    let print_anom_txt = |out: &mut String, name: &str, u_val: usize, s_val: usize, explanation: &str| {
-        if u_val > 0 || s_val > 0 {
-            let _ = writeln!(out, "   -> {}: UFS [{}], Skrypt [{}]", name, u_val, s_val);
-            let _ = writeln!(out, "      [ ZNACZENIE ]: {}", explanation);
-        }
-    };
-    print_anom_txt(&mut log_out, "Utracone Daty (Epoka 1970 r.)", ufs_stats.epoch_zero.load(Ordering::SeqCst), script_stats.epoch_zero.load(Ordering::SeqCst), "Data modyfikacji pliku została zniszczona lub system przywrócił ją do absolutnego zera (1 Stycznia 1970).");
-    print_anom_txt(&mut log_out, "Dowiązania Twarde (Hardlinks)", ufs_stats.hardlinks.load(Ordering::SeqCst), script_stats.hardlinks.load(Ordering::SeqCst), "Kilka różnych plików wskazuje na ten sam fizyczny blok danych na dysku. Ważne dla deduplikacji.");
-    print_anom_txt(&mut log_out, "Dowiązania Miękkie (Symlinks)", ufs_stats.symlinks.load(Ordering::SeqCst), script_stats.symlinks.load(Ordering::SeqCst), "Są to tylko skróty do innych ścieżek. Po odzyskaniu często prowadzą donikąd.");
-    print_anom_txt(&mut log_out, "Złamanie Właściciela (UID = 0 / ROOT)", ufs_stats.root_owned.load(Ordering::SeqCst), script_stats.root_owned.load(Ordering::SeqCst), "Pliki z uprawnieniami superużytkownika. Może to być systemowy sterownik, lub ślad iniekcji.");
-    print_anom_txt(&mut log_out, "Podwyższone Uprawnienia (SUID/SGID)", ufs_stats.suid_sgid.load(Ordering::SeqCst), script_stats.suid_sgid.load(Ordering::SeqCst), "Krytyczne ryzyko bezpieczeństwa. Uruchomienie tego pliku nadaje użytkownikowi prawa właściciela pliku.");
-    print_anom_txt(&mut log_out, "Przepełnienie Znacznika Czasu (i64)", ufs_stats.mtime_overflow.load(Ordering::SeqCst), script_stats.mtime_overflow.load(Ordering::SeqCst), "Pole czasu i-node jest fizycznie zniszczone do wartości, której nie da się już zapisać jako precyzyjny znacznik nanosekundowy. mtime pozostaje NULL w bazie (zamiast fałszywej, zawiniętej daty).");
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
+
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] FIZYCZNY ROZKŁAD STRUKTURY (Anomalie Systemu Plików):"
+    );
+    let print_anom_txt =
+        |out: &mut String, name: &str, u_val: usize, s_val: usize, explanation: &str| {
+            if u_val > 0 || s_val > 0 {
+                let _ = writeln!(out, "   -> {}: UFS [{}], Skrypt [{}]", name, u_val, s_val);
+                let _ = writeln!(out, "      [ ZNACZENIE ]: {}", explanation);
+            }
+        };
+    print_anom_txt(
+        &mut log_out,
+        "Utracone Daty (Epoka 1970 r.)",
+        ufs_stats.epoch_zero.load(Ordering::SeqCst),
+        script_stats.epoch_zero.load(Ordering::SeqCst),
+        "Data modyfikacji pliku została zniszczona lub system przywrócił ją do absolutnego zera (1 Stycznia 1970).",
+    );
+    print_anom_txt(
+        &mut log_out,
+        "Dowiązania Twarde (Hardlinks)",
+        ufs_stats.hardlinks.load(Ordering::SeqCst),
+        script_stats.hardlinks.load(Ordering::SeqCst),
+        "Kilka różnych plików wskazuje na ten sam fizyczny blok danych na dysku. Ważne dla deduplikacji.",
+    );
+    print_anom_txt(
+        &mut log_out,
+        "Dowiązania Miękkie (Symlinks)",
+        ufs_stats.symlinks.load(Ordering::SeqCst),
+        script_stats.symlinks.load(Ordering::SeqCst),
+        "Są to tylko skróty do innych ścieżek. Po odzyskaniu często prowadzą donikąd.",
+    );
+    print_anom_txt(
+        &mut log_out,
+        "Złamanie Właściciela (UID = 0 / ROOT)",
+        ufs_stats.root_owned.load(Ordering::SeqCst),
+        script_stats.root_owned.load(Ordering::SeqCst),
+        "Pliki z uprawnieniami superużytkownika. Może to być systemowy sterownik, lub ślad iniekcji.",
+    );
+    print_anom_txt(
+        &mut log_out,
+        "Podwyższone Uprawnienia (SUID/SGID)",
+        ufs_stats.suid_sgid.load(Ordering::SeqCst),
+        script_stats.suid_sgid.load(Ordering::SeqCst),
+        "Krytyczne ryzyko bezpieczeństwa. Uruchomienie tego pliku nadaje użytkownikowi prawa właściciela pliku.",
+    );
+    print_anom_txt(
+        &mut log_out,
+        "Przepełnienie Znacznika Czasu (i64)",
+        ufs_stats.mtime_overflow.load(Ordering::SeqCst),
+        script_stats.mtime_overflow.load(Ordering::SeqCst),
+        "Pole czasu i-node jest fizycznie zniszczone do wartości, której nie da się już zapisać jako precyzyjny znacznik nanosekundowy. mtime pozostaje NULL w bazie (zamiast fałszywej, zawiniętej daty).",
+    );
     let _ = writeln!(&mut log_out);
 
-    let _ = writeln!(&mut log_out, "[ 2 ] KORELACJA Z BAZĄ DANYCH (Porównanie Odzysków):");
-    let _ = writeln!(&mut log_out, "   -> Zgodne w 100% (Prawa + Data): {}", match_count);
-    
+    let _ = writeln!(
+        &mut log_out,
+        "[ 2 ] KORELACJA Z BAZĄ DANYCH (Porównanie Odzysków):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zgodne w 100% (Prawa + Data): {}",
+        match_count
+    );
+
     if mismatch_mtime_count > 0 {
-        let _ = writeln!(&mut log_out, "   -> Różne Daty Modyfikacji:       {}", mismatch_mtime_count);
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Metadane czasu uległy uszkodzeniu w jednym ze skanerów.");
-        let _ = writeln!(&mut log_out, "      * W {} przypadkach UFS Explorer odratował STARSZĄ (prawdopodobnie oryginalną) datę.", ufs_older_count);
-        let _ = writeln!(&mut log_out, "      * W {} przypadkach Skrypt Autorski odratował STARSZĄ datę.", script_older_count);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Różne Daty Modyfikacji:       {}",
+            mismatch_mtime_count
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Metadane czasu uległy uszkodzeniu w jednym ze skanerów."
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      * W {} przypadkach UFS Explorer odratował STARSZĄ (prawdopodobnie oryginalną) datę.",
+            ufs_older_count
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      * W {} przypadkach Skrypt Autorski odratował STARSZĄ datę.",
+            script_older_count
+        );
     }
     if mismatch_perms_count > 0 {
-        let _ = writeln!(&mut log_out, "   -> Różne Prawa/Właściciel:       {}", mismatch_perms_count);
-        let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Podczas odzyskiwania, system nadpisał strukturę i-node domyślnymi uprawnieniami.");
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Różne Prawa/Właściciel:       {}",
+            mismatch_perms_count
+        );
+        let _ = writeln!(
+            &mut log_out,
+            "      [ ZNACZENIE ]: Podczas odzyskiwania, system nadpisał strukturę i-node domyślnymi uprawnieniami."
+        );
         if mismatch_uid_count > 0 {
-            let _ = writeln!(&mut log_out, "      * Różni właściciele pliku w:         {} przypadkach", mismatch_uid_count);
+            let _ = writeln!(
+                &mut log_out,
+                "      * Różni właściciele pliku w:         {} przypadkach",
+                mismatch_uid_count
+            );
         }
         if mismatch_mode_count > 0 {
-            let _ = writeln!(&mut log_out, "      * Złamana flaga CHMOD w:             {} przypadkach", mismatch_mode_count);
+            let _ = writeln!(
+                &mut log_out,
+                "      * Złamana flaga CHMOD w:             {} przypadkach",
+                mismatch_mode_count
+            );
         }
     }
-    
+
     // PRZYWRÓCONE: Zestawienie wagowe formatów i-node
     let _ = writeln!(&mut log_out, "\n[ 3 ] ZESTAWIENIE WAGOWE FORMATÓW (Top 5):");
     let print_all_exts = |out_str: &mut String, map: &HashMap<String, u64>, label: &str| {
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
 
     // PRZYWRÓCONE: Zestawienie Właścicieli
     let _ = writeln!(&mut log_out, "\n[ 4 ] TOP 3 WŁAŚCICIELI PLIKÓW (UID):");
@@ -982,12 +1412,30 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        for (uid, count) in sorted.into_iter().take(3) { 
-            let _ = writeln!(out_str, "      - UID: {:<5} przypisano do {} plików", uid, count);
+        for (uid, count) in sorted.into_iter().take(3) {
+            let _ = writeln!(
+                out_str,
+                "      - UID: {:<5} przypisano do {} plików",
+                uid, count
+            );
         }
     };
-    print_top_uid(&mut log_out, &ufs_stats.uid_counts.lock().unwrap(), "UFS Explorer");
-    print_top_uid(&mut log_out, &script_stats.uid_counts.lock().unwrap(), "Skrypt Autorski");
+    print_top_uid(
+        &mut log_out,
+        &ufs_stats
+            .uid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_top_uid(
+        &mut log_out,
+        &script_stats
+            .uid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
 
     // PRZYWRÓCONE: Zestawienie Uprawnień
     let _ = writeln!(&mut log_out, "\n[ 5 ] TOP 3 STRUKTUR UPRAWNIEŃ (CHMOD):");
@@ -995,23 +1443,50 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        for (mode, count) in sorted.into_iter().take(3) { 
-            let _ = writeln!(out_str, "      - Prawa: {:<12} wystąpiły w {} plikach", mode, count);
+        for (mode, count) in sorted.into_iter().take(3) {
+            let _ = writeln!(
+                out_str,
+                "      - Prawa: {:<12} wystąpiły w {} plikach",
+                mode, count
+            );
         }
     };
-    print_top_mode(&mut log_out, &ufs_stats.mode_counts.lock().unwrap(), "UFS Explorer");
-    print_top_mode(&mut log_out, &script_stats.mode_counts.lock().unwrap(), "Skrypt Autorski");
+    print_top_mode(
+        &mut log_out,
+        &ufs_stats
+            .mode_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_top_mode(
+        &mut log_out,
+        &script_stats
+            .mode_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
 
     if errors > 0 {
-        let _ = writeln!(&mut log_out, "\n[ 6 ] BŁĘDY FIZYCZNE I/O (Brak dostępu do węzła):");
+        let _ = writeln!(
+            &mut log_out,
+            "\n[ 6 ] BŁĘDY FIZYCZNE I/O (Brak dostępu do węzła):"
+        );
         let _ = writeln!(&mut log_out, "   -> Błędy odczytu (I/O): {}", errors);
     }
 
     // Zapis do fizycznego pliku "Dziennik Końcowy"
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -1065,7 +1540,10 @@ mod tests {
 
     #[test]
     fn test_compute_precise_mtime_normal_value() {
-        assert_eq!(compute_precise_mtime(1_700_000_000, 123_456_789), Some(1_700_000_000_123_456_789));
+        assert_eq!(
+            compute_precise_mtime(1_700_000_000, 123_456_789),
+            Some(1_700_000_000_123_456_789)
+        );
     }
 
     #[test]
@@ -1080,7 +1558,10 @@ mod tests {
     #[test]
     fn test_compute_precise_mtime_exact_i64_max_boundary_fits() {
         // sec * 1e9 + nsec == i64::MAX dokładnie - musi się zmieścić.
-        assert_eq!(compute_precise_mtime(9_223_372_036, 854_775_807), Some(i64::MAX));
+        assert_eq!(
+            compute_precise_mtime(9_223_372_036, 854_775_807),
+            Some(i64::MAX)
+        );
     }
 
     #[test]
@@ -1112,7 +1593,10 @@ mod tests {
 
     #[test]
     fn test_nie_wymaga_ponownego_odczytu_gdy_mtime_policzone() {
-        assert!(!wymaga_ponownego_odczytu(Some(1_700_000_000_000_000_000), None));
+        assert!(!wymaga_ponownego_odczytu(
+            Some(1_700_000_000_000_000_000),
+            None
+        ));
     }
 
     #[test]
@@ -1235,7 +1719,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki lstat")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki lstat"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki lstat (Wariant A): {G:1} {R:2}");
     }
 
@@ -1253,32 +1740,68 @@ mod tests {
     #[test]
     fn test_build_source_block_top_uid_by_frequency() {
         let stats = LiveStats::new(4);
-        stats.uid_counts.lock().unwrap().insert(1000, 5);
-        stats.uid_counts.lock().unwrap().insert(0, 20); // root - powinien wygrać
+        stats
+            .uid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1000, 5);
+        stats
+            .uid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, 20); // root - powinien wygrać
 
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let uid_line = block.lines().find(|l| l.starts_with("Top UID:")).unwrap();
+        let uid_line = block
+            .lines()
+            .find(|l| l.starts_with("Top UID:"))
+            .expect("Szukany element powinien znajdować się w kolekcji");
         // UID 0 (20 wystąpień) powinien pojawić się przed UID 1000 (5 wystąpień)
-        let pos_root = uid_line.find("UID 0 (20)").expect("UID 0 powinien być na liście");
-        let pos_other = uid_line.find("UID 1000 (5)").expect("UID 1000 powinien być na liście");
-        assert!(pos_root < pos_other, "Częstszy UID powinien być wymieniony pierwszy");
+        let pos_root = uid_line
+            .find("UID 0 (20)")
+            .expect("UID 0 powinien być na liście");
+        let pos_other = uid_line
+            .find("UID 1000 (5)")
+            .expect("UID 1000 powinien być na liście");
+        assert!(
+            pos_root < pos_other,
+            "Częstszy UID powinien być wymieniony pierwszy"
+        );
     }
 
     #[test]
     fn test_build_source_block_top_gid_by_frequency() {
         let stats = LiveStats::new(4);
-        stats.gid_counts.lock().unwrap().insert(100, 3);
-        stats.gid_counts.lock().unwrap().insert(0, 9);
+        stats
+            .gid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(100, 3);
+        stats
+            .gid_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, 9);
 
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let gid_line = block.lines().find(|l| l.starts_with("Top GID:")).unwrap();
-        let pos_root = gid_line.find("GID 0 (9)").expect("GID 0 powinien być na liście");
-        let pos_other = gid_line.find("GID 100 (3)").expect("GID 100 powinien być na liście");
-        assert!(pos_root < pos_other, "Częstszy GID powinien być wymieniony pierwszy");
+        let gid_line = block
+            .lines()
+            .find(|l| l.starts_with("Top GID:"))
+            .expect("Szukany element powinien znajdować się w kolekcji");
+        let pos_root = gid_line
+            .find("GID 0 (9)")
+            .expect("GID 0 powinien być na liście");
+        let pos_other = gid_line
+            .find("GID 100 (3)")
+            .expect("GID 100 powinien być na liście");
+        assert!(
+            pos_root < pos_other,
+            "Częstszy GID powinien być wymieniony pierwszy"
+        );
     }
 
     #[test]
@@ -1310,11 +1833,22 @@ mod tests {
         let (tx_db, _rx_db) = mpsc::sync_channel(100);
         let (tx_ui, _rx_ui) = mpsc::channel();
         let stats = LiveStats::new(1);
-        let opr_log = Arc::new(Mutex::new(File::create(katalog.join("_test_log.txt")).unwrap()));
+        let opr_log = Arc::new(Mutex::new(
+            File::create(katalog.join("_test_log.txt")).expect("Nie można utworzyć pliku"),
+        ));
 
         process_side_stream(StreamCtx {
-            base_path: katalog, tasks: zadania, side_label: "Test", stats: &stats,
-            tx_db, is_ufs: true, tx_ui: &tx_ui, bar_idx: 0, opr_log, start_time: Instant::now(),
+            base_path: katalog,
+            tasks: zadania,
+            side_label: "Test",
+            stats: &stats,
+            tx_db,
+            is_ufs: true,
+            tx_ui: &tx_ui,
+            bar_idx: 0,
+            opr_log,
+            start_time: Instant::now(),
+            debug_log: crate::debug_log::DebugLog::maybe_open("", "", "INFO"),
         });
 
         stats
@@ -1322,31 +1856,58 @@ mod tests {
 
     #[test]
     fn test_e2e_wykrywa_plik_rzadki_i_fifo_na_prawdziwych_obiektach() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("Nie można utworzyć katalogu tymczasowego dla testu");
 
         // Plik rzadki: 10 MB zadeklarowanego rozmiaru, zero fizycznie zapisanych bajtów.
         let sparse_path = dir.path().join("rzadki.bin");
         {
-            let f = File::create(&sparse_path).unwrap();
-            f.set_len(10 * 1024 * 1024).unwrap();
+            let f = File::create(&sparse_path).expect("Nie można utworzyć pliku");
+            f.set_len(10 * 1024 * 1024)
+                .expect("Ustawienie rozmiaru pliku nie powiodło się");
         }
 
         // FIFO: prawdziwy węzeł kolejki nazwanej, nie symulacja.
         let fifo_path = dir.path().join("kolejka.fifo");
-        let fifo_cstr = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let fifo_cstr = std::ffi::CString::new(
+            fifo_path
+                .to_str()
+                .expect("Konwersja ścieżki do stringa nie powiodła się"),
+        )
+        .expect("Konwersja ścieżki do stringa nie powiodła się");
         let wynik_mkfifo = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
-        assert_eq!(wynik_mkfifo, 0, "mkfifo musi się udać w katalogu tymczasowym");
+        assert_eq!(
+            wynik_mkfifo, 0,
+            "mkfifo musi się udać w katalogu tymczasowym"
+        );
 
         let zadania = vec![
-            Task { id: 1, rel_path: "rzadki.bin".to_string() },
-            Task { id: 2, rel_path: "kolejka.fifo".to_string() },
+            Task {
+                id: 1,
+                rel_path: "rzadki.bin".to_string(),
+            },
+            Task {
+                id: 2,
+                rel_path: "kolejka.fifo".to_string(),
+            },
         ];
 
         let stats = uruchom(dir.path(), &zadania);
 
-        assert_eq!(stats.sparse_files.load(Ordering::Relaxed), 1, "10 MB zadeklarowane, ~0 B zaalokowane - musi wykryć plik rzadki");
-        assert_eq!(stats.special_files.load(Ordering::Relaxed), 1, "FIFO musi zostać wykryte jako plik specjalny");
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 0, "oba obiekty muszą się dać odczytać przez lstat() bez błędu I/O");
+        assert_eq!(
+            stats.sparse_files.load(Ordering::Relaxed),
+            1,
+            "10 MB zadeklarowane, ~0 B zaalokowane - musi wykryć plik rzadki"
+        );
+        assert_eq!(
+            stats.special_files.load(Ordering::Relaxed),
+            1,
+            "FIFO musi zostać wykryte jako plik specjalny"
+        );
+        assert_eq!(
+            stats.errors.load(Ordering::Relaxed),
+            0,
+            "oba obiekty muszą się dać odczytać przez lstat() bez błędu I/O"
+        );
     }
 
     #[test]
@@ -1371,7 +1932,12 @@ mod tests {
     /// ręcznego sprawdzenia w UI.
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki lstat (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki lstat (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(1);
         let start_time = Instant::now() - Duration::from_millis(500);
@@ -1379,16 +1945,26 @@ mod tests {
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta '{}' z panelu Fazy 5 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+                "etykieta '{}' z panelu Fazy 5 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 14, "panel powinien mieć dokładnie 14 etykiet wymagających wyjaśnienia");
+        assert_eq!(
+            sprawdzonych, 14,
+            "panel powinien mieć dokładnie 14 etykiet wymagających wyjaśnienia"
+        );
     }
 }
