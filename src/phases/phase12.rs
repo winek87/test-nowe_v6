@@ -1,7 +1,7 @@
 // src/phases/phase12.rs
 
 //! # Faza 12: Głęboka Walidacja Metadanych Obrazów i Wideo (EXIF / HEIF / MP4)
-//! 
+//!
 //! Weryfikuje integralność plików multimedialnych. Wykorzystuje potężny system
 //! dualnego odczytu: `exiftool-rs` jako narzędzie GŁÓWNE oraz CLI ExifTool jako Fallback.
 //! Wyłapuje błędy, daty i profiluje urządzenia. Zapisuje wyniki do SQLite dla Fazy 9.
@@ -31,16 +31,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -54,10 +54,9 @@ const CHUNK_SIZE: usize = 100;
 // `mime_family_for_ext` (żadna z tych czterech nie ma dedykowanej reguły
 // w `evaluate_metadata`, dokładnie jak `.webp`/`.avi` już wcześniej).
 const MEDIA_EXTS: &[&str] = &[
-    ".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif", ".dng", ".cr2", ".nef", ".arw", ".png", ".webp", ".bmp",
-    ".gif", ".avif",
-    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".ts", ".3gp", ".3g2",
-    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"
+    ".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif", ".dng", ".cr2", ".nef", ".arw", ".png",
+    ".webp", ".bmp", ".gif", ".avif", ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
+    ".m4v", ".ts", ".3gp", ".3g2", ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
 ];
 
 /// Lata-widma: typowe wartości domyślne zegara aparatu po rozładowaniu
@@ -78,9 +77,13 @@ fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3600;
     let mins = (seconds % 3600) / 60;
     let secs = seconds % 60;
-    if hours > 0 { format!("{}h {}m {}s", hours, mins, secs) }
-    else if mins > 0 { format!("{}m {}s", mins, secs) }
-    else { format!("{}s", secs) }
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, secs)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 /// Wyprowadza oczekiwaną "rodzinę" MIME (`"image"`, `"video"`, `"audio"`) z
@@ -92,8 +95,11 @@ fn format_duration(seconds: u64) -> String {
 /// jednoznacznej rodziny (nie blokuje ich, po prostu nie stosuje tej reguły).
 fn mime_family_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
-        "jpg" | "jpeg" | "tif" | "tiff" | "heic" | "heif" | "dng" | "cr2" | "nef" | "arw" | "png" | "webp" | "bmp" | "gif" | "avif" => Some("image"),
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "ts" | "3gp" | "3g2" => Some("video"),
+        "jpg" | "jpeg" | "tif" | "tiff" | "heic" | "heif" | "dng" | "cr2" | "nef" | "arw"
+        | "png" | "webp" | "bmp" | "gif" | "avif" => Some("image"),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "ts" | "3gp" | "3g2" => {
+            Some("video")
+        }
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => Some("audio"),
         _ => None,
     }
@@ -156,9 +162,16 @@ fn parse_dms_coordinate(s: &str) -> Option<f64> {
 /// dziesiętnego — patrz [`parse_dms_coordinate`] dla uzasadnienia, czemu
 /// samo `parse_all_floats` nie wystarcza dla DMS.
 fn parse_gps_values(s: &str) -> Vec<f64> {
-    let segmenty: Vec<&str> = s.split(',').map(|seg| seg.trim()).filter(|seg| !seg.is_empty()).collect();
+    let segmenty: Vec<&str> = s
+        .split(',')
+        .map(|seg| seg.trim())
+        .filter(|seg| !seg.is_empty())
+        .collect();
     if !segmenty.is_empty() {
-        let dms: Vec<f64> = segmenty.iter().filter_map(|seg| parse_dms_coordinate(seg)).collect();
+        let dms: Vec<f64> = segmenty
+            .iter()
+            .filter_map(|seg| parse_dms_coordinate(seg))
+            .collect();
         if dms.len() == segmenty.len() {
             return dms;
         }
@@ -172,7 +185,9 @@ fn parse_gps_values(s: &str) -> Vec<f64> {
 /// wskazująca na punkt na środku Oceanu Atlantyckiego, gdzie nikt realnie
 /// nie robi zdjęć w praktyce odzysku danych.
 fn is_gps_suspicious(lat: f64, lon: f64) -> bool {
-    if lat == 0.0 && lon == 0.0 { return true; }
+    if lat == 0.0 && lon == 0.0 {
+        return true;
+    }
     !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon)
 }
 
@@ -180,7 +195,11 @@ fn is_gps_suspicious(lat: f64, lon: f64) -> bool {
 /// `"YYYY-MM-DD..."`) — pierwsze 4 znaki, jeśli są cyframi.
 fn extract_year(date_str: &str) -> Option<i32> {
     let prefix: String = date_str.chars().take(4).collect();
-    if prefix.len() == 4 { prefix.parse::<i32>().ok() } else { None }
+    if prefix.len() == 4 {
+        prefix.parse::<i32>().ok()
+    } else {
+        None
+    }
 }
 
 /// Dwie różne dowodowo sytuacje ukryte pod jedną flagą "nieprawdopodobny
@@ -199,9 +218,13 @@ enum ImplausibleYearKind {
 /// albo `None`, gdy jest wiarygodny. `current_year` jest parametrem, nie
 /// zegarem systemowym — dla pełnej determinizmu w testach.
 fn classify_implausible_year(year: i32, current_year: i32) -> Option<ImplausibleYearKind> {
-    if SENTINEL_YEARS.contains(&year) { Some(ImplausibleYearKind::Sentinel) }
-    else if year > current_year { Some(ImplausibleYearKind::Future) }
-    else { None }
+    if SENTINEL_YEARS.contains(&year) {
+        Some(ImplausibleYearKind::Sentinel)
+    } else if year > current_year {
+        Some(ImplausibleYearKind::Future)
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -223,7 +246,7 @@ pub(crate) struct Task {
 struct MediaAnalysis {
     is_valid: bool,
     reason: Option<String>,
-    mime_type: String, 
+    mime_type: String,
     dimensions: Option<String>,
     device: Option<String>,
     original_date: Option<String>,
@@ -245,7 +268,7 @@ struct MediaAnalysis {
 pub(crate) struct SideMediaResult {
     id: i32,
     analysis: Option<MediaAnalysis>,
-    engine: Option<String>, 
+    engine: Option<String>,
     io_error: Option<bool>,
 }
 
@@ -266,31 +289,43 @@ pub(crate) struct LiveStats {
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
-    
-    ok_common: AtomicUsize, ok_unique: AtomicUsize,
+
+    ok_common: AtomicUsize,
+    ok_unique: AtomicUsize,
     engine_rs: AtomicUsize,
-    engine_cli: AtomicUsize,  
+    engine_cli: AtomicUsize,
     last_engine: Mutex<String>,
 
-    err_trunc_common: AtomicUsize,   err_trunc_unique: AtomicUsize,
-    err_nodim_common: AtomicUsize,   err_nodim_unique: AtomicUsize,
+    err_trunc_common: AtomicUsize,
+    err_trunc_unique: AtomicUsize,
+    err_nodim_common: AtomicUsize,
+    err_nodim_unique: AtomicUsize,
     /// Wymiary obecne, ale degeneracyjne (0 lub 1x1) — patrz [`is_dimension_degenerate`].
-    err_zerodim_common: AtomicUsize, err_zerodim_unique: AtomicUsize,
-    err_mime_common: AtomicUsize,    err_mime_unique: AtomicUsize,
-    err_trail_common: AtomicUsize,   err_trail_unique: AtomicUsize,
+    err_zerodim_common: AtomicUsize,
+    err_zerodim_unique: AtomicUsize,
+    err_mime_common: AtomicUsize,
+    err_mime_unique: AtomicUsize,
+    err_trail_common: AtomicUsize,
+    err_trail_unique: AtomicUsize,
 
-    feat_gps_common: AtomicUsize,    feat_gps_unique: AtomicUsize,
-    feat_date_common: AtomicUsize,   feat_date_unique: AtomicUsize,
+    feat_gps_common: AtomicUsize,
+    feat_gps_unique: AtomicUsize,
+    feat_date_common: AtomicUsize,
+    feat_date_unique: AtomicUsize,
     /// INFORMACYJNE: GPS obecny, ale geograficznie niewiarygodny.
-    gps_suspicious_common: AtomicUsize, gps_suspicious_unique: AtomicUsize,
+    gps_suspicious_common: AtomicUsize,
+    gps_suspicious_unique: AtomicUsize,
     /// INFORMACYJNE: data obecna, ale rok-widmo (reset zegara aparatu) —
     /// dowodowo mniej znacząca niż `date_implausible_future` niżej.
-    date_implausible_sentinel_common: AtomicUsize, date_implausible_sentinel_unique: AtomicUsize,
+    date_implausible_sentinel_common: AtomicUsize,
+    date_implausible_sentinel_unique: AtomicUsize,
     /// INFORMACYJNE: data obecna, ale z przyszłości — możliwa manipulacja
     /// lub uszkodzenie metadanych, dowodowo istotniejsze niż rok-widmo.
-    date_implausible_future_common: AtomicUsize, date_implausible_future_unique: AtomicUsize,
+    date_implausible_future_common: AtomicUsize,
+    date_implausible_future_unique: AtomicUsize,
     /// INFORMACYJNE: plik nosi ślad przetworzenia narzędziem (pole Software).
-    edited_common: AtomicUsize, edited_unique: AtomicUsize,
+    edited_common: AtomicUsize,
+    edited_unique: AtomicUsize,
 
     total_duration_sec: AtomicU64,
     top_devices: Mutex<HashMap<String, usize>>,
@@ -304,23 +339,39 @@ impl LiveStats {
     fn new(slot_count: usize) -> Self {
         Self {
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
-            processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
+            processed_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            errors: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
-            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0),
-            engine_rs: AtomicUsize::new(0), engine_cli: AtomicUsize::new(0),
+            ok_common: AtomicUsize::new(0),
+            ok_unique: AtomicUsize::new(0),
+            engine_rs: AtomicUsize::new(0),
+            engine_cli: AtomicUsize::new(0),
             last_engine: Mutex::new("exiftool-rs".to_string()),
-            err_trunc_common: AtomicUsize::new(0), err_trunc_unique: AtomicUsize::new(0),
-            err_nodim_common: AtomicUsize::new(0), err_nodim_unique: AtomicUsize::new(0),
-            err_zerodim_common: AtomicUsize::new(0), err_zerodim_unique: AtomicUsize::new(0),
-            err_mime_common: AtomicUsize::new(0), err_mime_unique: AtomicUsize::new(0), 
-            err_trail_common: AtomicUsize::new(0), err_trail_unique: AtomicUsize::new(0),
-            feat_gps_common: AtomicUsize::new(0), feat_gps_unique: AtomicUsize::new(0),
-            feat_date_common: AtomicUsize::new(0), feat_date_unique: AtomicUsize::new(0),
-            gps_suspicious_common: AtomicUsize::new(0), gps_suspicious_unique: AtomicUsize::new(0),
-            date_implausible_sentinel_common: AtomicUsize::new(0), date_implausible_sentinel_unique: AtomicUsize::new(0),
-            date_implausible_future_common: AtomicUsize::new(0), date_implausible_future_unique: AtomicUsize::new(0),
-            edited_common: AtomicUsize::new(0), edited_unique: AtomicUsize::new(0),
-            total_duration_sec: AtomicU64::new(0), top_devices: Mutex::new(HashMap::new()),
+            err_trunc_common: AtomicUsize::new(0),
+            err_trunc_unique: AtomicUsize::new(0),
+            err_nodim_common: AtomicUsize::new(0),
+            err_nodim_unique: AtomicUsize::new(0),
+            err_zerodim_common: AtomicUsize::new(0),
+            err_zerodim_unique: AtomicUsize::new(0),
+            err_mime_common: AtomicUsize::new(0),
+            err_mime_unique: AtomicUsize::new(0),
+            err_trail_common: AtomicUsize::new(0),
+            err_trail_unique: AtomicUsize::new(0),
+            feat_gps_common: AtomicUsize::new(0),
+            feat_gps_unique: AtomicUsize::new(0),
+            feat_date_common: AtomicUsize::new(0),
+            feat_date_unique: AtomicUsize::new(0),
+            gps_suspicious_common: AtomicUsize::new(0),
+            gps_suspicious_unique: AtomicUsize::new(0),
+            date_implausible_sentinel_common: AtomicUsize::new(0),
+            date_implausible_sentinel_unique: AtomicUsize::new(0),
+            date_implausible_future_common: AtomicUsize::new(0),
+            date_implausible_future_unique: AtomicUsize::new(0),
+            edited_common: AtomicUsize::new(0),
+            edited_unique: AtomicUsize::new(0),
+            total_duration_sec: AtomicU64::new(0),
+            top_devices: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -343,26 +394,71 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+
+    //    let top_ext = {
+    //        let map = stats.ext_weights.lock().unwrap();
+    //        let mut sorted: Vec<_> = map.iter().collect();
+    //        sorted.sort_by(|a, b| b.1.cmp(a.1));
+    //        sorted.into_iter().take(3).map(|(ext, w)| {
+    //            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+    //            format!("{} ({})", e, format_bytes(*w))
+    //        }).collect::<Vec<_>>().join(", ")
+    //    };
+
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
 
     let top_devices = {
-        let map = stats.top_devices.lock().unwrap();
+        let map = stats.top_devices.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        let s = sorted.into_iter().take(2).map(|(d, c)| format!("{} ({})", d, c)).collect::<Vec<_>>().join(", ");
+        let s = sorted
+            .into_iter()
+            .take(2)
+            .map(|(d, c)| format!("{} ({})", d, c))
+            .collect::<Vec<_>>()
+            .join(", ");
         if s.is_empty() { "-".to_string() } else { s }
     };
 
+    //    let top_devices = {
+    //        let map = stats.top_devices.lock().unwrap();
+    //        let mut sorted: Vec<_> = map.iter().collect();
+    //        sorted.sort_by(|a, b| b.1.cmp(a.1));
+    //        let s = sorted.into_iter().take(2).map(|(d, c)| format!("{} ({})", d, c)).collect::<Vec<_>>().join(", ");
+    //        if s.is_empty() { "-".to_string() } else { s }
+    //    };
+
     // Aktywny silnik na zielono, nieaktywny na czerwono - patrz docstring.
-    let current_engine = stats.last_engine.lock().unwrap().clone();
+
+    let current_engine = stats
+        .last_engine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    //    let current_engine = stats.last_engine.lock().unwrap().clone();
+
     let (engine_name, rs_tag, cli_tag) = if current_engine == "RS" {
         ("{G:Exiftool-rs}", "{G:RS}", "{R:CLI}")
     } else {
@@ -370,7 +466,11 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     };
     let engine_line = format!(
         "{} ({}: {} | {}: {})",
-        engine_name, rs_tag, stats.engine_rs.load(Ordering::Relaxed), cli_tag, stats.engine_cli.load(Ordering::Relaxed)
+        engine_name,
+        rs_tag,
+        stats.engine_rs.load(Ordering::Relaxed),
+        cli_tag,
+        stats.engine_cli.load(Ordering::Relaxed)
     );
 
     format!(
@@ -393,10 +493,12 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         Edytowane narzędziem: {} wspólne / {} unikalne\n \
         Wątki dekodowania (Wariant A): {}\n \
         Błędy I/O: {}",
-        label, speed_mb,
+        label,
+        speed_mb,
         display_ext,
         engine_line,
-        stats.ok_common.load(Ordering::Relaxed), stats.ok_unique.load(Ordering::Relaxed),
+        stats.ok_common.load(Ordering::Relaxed),
+        stats.ok_unique.load(Ordering::Relaxed),
         top_devices,
         stats.err_trunc_common.load(Ordering::Relaxed),
         stats.err_trunc_unique.load(Ordering::Relaxed),
@@ -414,8 +516,12 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
         stats.gps_suspicious_unique.load(Ordering::Relaxed),
         stats.feat_date_common.load(Ordering::Relaxed),
         stats.feat_date_unique.load(Ordering::Relaxed),
-        stats.date_implausible_sentinel_common.load(Ordering::Relaxed),
-        stats.date_implausible_sentinel_unique.load(Ordering::Relaxed),
+        stats
+            .date_implausible_sentinel_common
+            .load(Ordering::Relaxed),
+        stats
+            .date_implausible_sentinel_unique
+            .load(Ordering::Relaxed),
         stats.date_implausible_future_common.load(Ordering::Relaxed),
         stats.date_implausible_future_unique.load(Ordering::Relaxed),
         stats.edited_common.load(Ordering::Relaxed),
@@ -426,18 +532,33 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
 }
 
 type ExtMap = HashMap<String, Vec<String>>;
-struct SourceAnomalies { ufs: ExtMap, script: ExtMap }
-impl SourceAnomalies { fn new() -> Self { Self { ufs: HashMap::new(), script: HashMap::new() } } }
+struct SourceAnomalies {
+    ufs: ExtMap,
+    script: ExtMap,
+}
+impl SourceAnomalies {
+    fn new() -> Self {
+        Self {
+            ufs: HashMap::new(),
+            script: HashMap::new(),
+        }
+    }
+}
 
 struct AnomalyCategory {
     name: &'static str,
     icon: &'static str,
-    common: SourceAnomalies, 
+    common: SourceAnomalies,
     unique: SourceAnomalies,
 }
 impl AnomalyCategory {
     fn new(name: &'static str, icon: &'static str) -> Self {
-        Self { name, icon, common: SourceAnomalies::new(), unique: SourceAnomalies::new() }
+        Self {
+            name,
+            icon,
+            common: SourceAnomalies::new(),
+            unique: SourceAnomalies::new(),
+        }
     }
 }
 
@@ -459,15 +580,15 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
         "Warning",
         "MIMEType",
         "ImageWidth",
-        "ImageHeight", 
+        "ImageHeight",
         "Make",
         "Model",
         "DateTimeOriginal",
         "CreateDate",
-        "GPSLatitude", 
+        "GPSLatitude",
         "GPSPosition",
         "Duration",
-        "Software"
+        "Software",
     ];
 
     // REGRESJA (BŁĄD KRYTYCZNY): `exiftool_rs::image_info` wołane było tu
@@ -479,7 +600,9 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
     // hooku, patrz `logging.rs`) zamiast duplikować identyczną infrastrukturę
     // `thread_local` w tym pliku — panika w środku zamienia się na `None`,
     // traktowane identycznie jak zwykły `Err`: kod spada na fallback CLI.
-    if let Some(Ok(info)) = crate::generic_image::decode_guarded(|| exiftool_rs::image_info(path_str)) {
+    if let Some(Ok(info)) =
+        crate::generic_image::decode_guarded(|| exiftool_rs::image_info(path_str))
+    {
         for k in keys {
             if let Some(v) = info.get(k) {
                 let val_str = v.to_string().trim_matches('"').to_string();
@@ -496,17 +619,20 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
     let cli_result = std::process::Command::new("exiftool")
         .args(["-S", "-n", "-fast", path_str])
         .output();
-        
+
     if let Ok(output) = cli_result
-        && output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some((k, v)) = line.split_once(": ") {
-                    map.insert(k.trim().to_string(), v.trim().to_string());
-                }
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some((k, v)) = line.split_once(": ") {
+                map.insert(k.trim().to_string(), v.trim().to_string());
             }
-            if !map.is_empty() { return Ok((map, "CLI".to_string())); }
         }
+        if !map.is_empty() {
+            return Ok((map, "CLI".to_string()));
+        }
+    }
 
     Err("Zupa binarna - ExifTool nie potrafił odczytać pliku".into())
 }
@@ -532,11 +658,24 @@ fn read_exif(path: &Path) -> std::result::Result<(HashMap<String, String>, Strin
 /// ekstrakcja urządzenia (Make+Model), daty, GPS + sanity-check GPS
 /// ([`is_gps_suspicious`]) i daty ([`classify_implausible_year`]), oraz wykrycie
 /// narzędzia edycji (pole `Software`).
-fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i32) -> MediaAnalysis {
+fn evaluate_metadata(
+    meta: &HashMap<String, String>,
+    ext: &str,
+    current_year: i32,
+) -> MediaAnalysis {
     let empty_analysis = |reason: &str, mime: &str| MediaAnalysis {
-        is_valid: false, reason: Some(reason.to_string()), mime_type: mime.to_string(),
-        dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-        has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
+        is_valid: false,
+        reason: Some(reason.to_string()),
+        mime_type: mime.to_string(),
+        dimensions: None,
+        device: None,
+        original_date: None,
+        has_gps: false,
+        duration_sec: 0,
+        has_suspicious_gps: false,
+        has_implausible_date: false,
+        implausible_date_kind: None,
+        editing_software: None,
     };
 
     if meta.is_empty() {
@@ -557,7 +696,10 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
         }
     }
 
-    let mime_type = meta.get("MIMEType").cloned().unwrap_or_else(|| "unknown".to_string());
+    let mime_type = meta
+        .get("MIMEType")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
 
     let is_fake = match ext {
         "jpg" | "jpeg" => !mime_type.contains("jpeg"),
@@ -577,9 +719,21 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
 
     if is_fake {
         return MediaAnalysis {
-            is_valid: false, reason: Some(format!("Fałszywe rozszerzenie (Wewnątrz to: {})", mime_type)),
-            mime_type, dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-            has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
+            is_valid: false,
+            reason: Some(format!(
+                "Fałszywe rozszerzenie (Wewnątrz to: {})",
+                mime_type
+            )),
+            mime_type,
+            dimensions: None,
+            device: None,
+            original_date: None,
+            has_gps: false,
+            duration_sec: 0,
+            has_suspicious_gps: false,
+            has_implausible_date: false,
+            implausible_date_kind: None,
+            editing_software: None,
         };
     }
 
@@ -587,69 +741,126 @@ fn evaluate_metadata(meta: &HashMap<String, String>, ext: &str, current_year: i3
     let height = meta.get("ImageHeight");
     let is_visual = mime_type.starts_with("image/") || mime_type.starts_with("video/");
 
-    let dimensions = if let (Some(w), Some(h)) = (width, height) { Some(format!("{}x{}", w, h)) } else { None };
+    let dimensions = if let (Some(w), Some(h)) = (width, height) {
+        Some(format!("{}x{}", w, h))
+    } else {
+        None
+    };
 
     if is_visual && dimensions.is_none() {
         return MediaAnalysis {
-            is_valid: false, reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)".into()),
-            mime_type, dimensions: None, device: None, original_date: None, has_gps: false, duration_sec: 0,
-            has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
+            is_valid: false,
+            reason: Some("Zniszczony Nagłówek (Brak Wymiarów X/Y)".into()),
+            mime_type,
+            dimensions: None,
+            device: None,
+            original_date: None,
+            has_gps: false,
+            duration_sec: 0,
+            has_suspicious_gps: false,
+            has_implausible_date: false,
+            implausible_date_kind: None,
+            editing_software: None,
         };
     }
 
     if is_visual
         && let (Some(w), Some(h)) = (width, height)
-            && is_dimension_degenerate(w, h) {
-                return MediaAnalysis {
-                    is_valid: false, reason: Some("Zniszczony Nagłówek (Wymiary zerowe/1x1)".into()),
-                    mime_type, dimensions, device: None, original_date: None, has_gps: false, duration_sec: 0,
-                    has_suspicious_gps: false, has_implausible_date: false, implausible_date_kind: None, editing_software: None,
-                };
-            }
+        && is_dimension_degenerate(w, h)
+    {
+        return MediaAnalysis {
+            is_valid: false,
+            reason: Some("Zniszczony Nagłówek (Wymiary zerowe/1x1)".into()),
+            mime_type,
+            dimensions,
+            device: None,
+            original_date: None,
+            has_gps: false,
+            duration_sec: 0,
+            has_suspicious_gps: false,
+            has_implausible_date: false,
+            implausible_date_kind: None,
+            editing_software: None,
+        };
+    }
 
     let make = meta.get("Make").map(|s| s.trim().to_string());
     let model = meta.get("Model").map(|s| s.trim().to_string());
     let device = if let (Some(ma), Some(mo)) = (&make, &model) {
-        if mo.starts_with(ma.as_str()) { Some(mo.clone()) } else { Some(format!("{} {}", ma, mo)) }
-    } else { make.or(model) };
+        if mo.starts_with(ma.as_str()) {
+            Some(mo.clone())
+        } else {
+            Some(format!("{} {}", ma, mo))
+        }
+    } else {
+        make.or(model)
+    };
 
-    let original_date = meta.get("DateTimeOriginal").or(meta.get("CreateDate")).cloned();
-    let implausible_date_kind = original_date.as_deref()
+    let original_date = meta
+        .get("DateTimeOriginal")
+        .or(meta.get("CreateDate"))
+        .cloned();
+    let implausible_date_kind = original_date
+        .as_deref()
         .and_then(extract_year)
         .and_then(|y| classify_implausible_year(y, current_year));
     let has_implausible_date = implausible_date_kind.is_some();
 
     let has_gps = meta.get("GPSLatitude").is_some() || meta.get("GPSPosition").is_some();
     let has_suspicious_gps = if has_gps {
-        let raw = meta.get("GPSPosition").or(meta.get("GPSLatitude")).map(|s| s.as_str()).unwrap_or("");
+        let raw = meta
+            .get("GPSPosition")
+            .or(meta.get("GPSLatitude"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let floats = parse_gps_values(raw);
         match (floats.first(), floats.get(1)) {
             (Some(&lat), Some(&lon)) => is_gps_suspicious(lat, lon),
             (Some(&lat), None) => !(-90.0..=90.0).contains(&lat),
             _ => false,
         }
-    } else { false };
+    } else {
+        false
+    };
 
     let mut duration_sec = 0;
     if let Some(dur_str) = meta.get("Duration")
-        && let Ok(d) = dur_str.parse::<f64>() { duration_sec = d as u64; }
+        && let Ok(d) = dur_str.parse::<f64>()
+    {
+        duration_sec = d as u64;
+    }
 
     let editing_software = meta.get("Software").cloned();
 
     MediaAnalysis {
-        is_valid: true, reason: None, mime_type, dimensions, device, original_date, has_gps, duration_sec,
-        has_suspicious_gps, has_implausible_date, implausible_date_kind, editing_software,
+        is_valid: true,
+        reason: None,
+        mime_type,
+        dimensions,
+        device,
+        original_date,
+        has_gps,
+        duration_sec,
+        has_suspicious_gps,
+        has_implausible_date,
+        implausible_date_kind,
+        editing_software,
     }
 }
 
 /// Wrapper łączący I/O ([`read_exif`]) z czystą logiką ([`evaluate_metadata`]).
 fn analyze_media(path: &Path) -> std::result::Result<(MediaAnalysis, String), String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let (meta, engine) = read_exif(path)?;
-    let current_year = 1970 + (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 31_557_600)
-        .unwrap_or(0)) as i32;
+    let current_year = 1970
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 31_557_600)
+            .unwrap_or(0)) as i32;
     Ok((evaluate_metadata(&meta, &ext, current_year), engine))
 }
 
@@ -676,7 +887,19 @@ pub struct StreamCtx<'a> {
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, start_time, tx_ui, bar_idx, opr_log, info_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        start_time,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        info_log,
+    } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -702,13 +925,21 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 Ok((ana, engine_used)) => {
                     let kategoria = if task.is_common { "Wspólne" } else { "Osobne" };
 
-                    if engine_used == "RS" { 
-                        stats.engine_rs.fetch_add(1, Ordering::Relaxed); 
-                        *stats.last_engine.lock().unwrap() = "RS".to_string();
-                    } else { 
-                        stats.engine_cli.fetch_add(1, Ordering::Relaxed); 
-                        *stats.last_engine.lock().unwrap() = "CLI".to_string();
+                    if engine_used == "RS" {
+                        stats.engine_rs.fetch_add(1, Ordering::Relaxed);
+                        *stats.last_engine.lock().unwrap_or_else(|e| e.into_inner()) = "RS".to_string();
+                    } else {
+                        stats.engine_cli.fetch_add(1, Ordering::Relaxed);
+                        *stats.last_engine.lock().unwrap_or_else(|e| e.into_inner()) = "CLI".to_string();
                     }
+
+//                    if engine_used == "RS" { 
+//                        stats.engine_rs.fetch_add(1, Ordering::Relaxed); 
+//                        *stats.last_engine.lock().unwrap() = "RS".to_string();
+//                    } else { 
+//                        stats.engine_cli.fetch_add(1, Ordering::Relaxed); 
+//                        *stats.last_engine.lock().unwrap() = "CLI".to_string();
+//                    }
 
                     if ana.is_valid {
                         if task.is_common { stats.ok_common.fetch_add(1, Ordering::Relaxed); } else { stats.ok_unique.fetch_add(1, Ordering::Relaxed); }
@@ -789,13 +1020,22 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now; 
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_devices.is_empty() {
-                    let mut global_dev = stats.top_devices.lock().unwrap();
+                    let mut global_dev = stats.top_devices.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_devices.drain() { *global_dev.entry(k).or_insert(0) += v; }
                 }
+
+//                if !local_ext_weights.is_empty() {
+//                    let mut global_map = stats.ext_weights.lock().unwrap();
+//                    for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
+//                }
+//                if !local_devices.is_empty() {
+//                    let mut global_dev = stats.top_devices.lock().unwrap();
+//                    for (k, v) in local_devices.drain() { *global_dev.entry(k).or_insert(0) += v; }
+//                }
 
                 // PASEK: wyłącznie postęp + bieżący plik (bez liczników)
                 let _ = tx_ui.send(PhaseEvent::UpdateBar {
@@ -824,13 +1064,22 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_devices.is_empty() {
-            let mut global_dev = stats.top_devices.lock().unwrap();
+            let mut global_dev = stats.top_devices.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_devices.drain() { *global_dev.entry(k).or_insert(0) += v; }
         }
+
+//        if !local_ext_weights.is_empty() {
+//            let mut global_map = stats.ext_weights.lock().unwrap();
+//            for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
+//        }
+//        if !local_devices.is_empty() {
+//            let mut global_dev = stats.top_devices.lock().unwrap();
+//            for (k, v) in local_devices.drain() { *global_dev.entry(k).or_insert(0) += v; }
+//        }
 
         if !results.is_empty() {
             if is_ufs { let _ = tx_db.send(ScanMsg::UfsChunk(results)); } 
@@ -863,15 +1112,35 @@ fn compute_half_threads(total_threads: usize) -> usize {
 /// wyniki w SQLite; (4) buduje hierarchiczny Dziennik Końcowy z kategorii
 /// błędów, listą top urządzeń i statystyką wykorzystanych silników (RS/CLI,
 /// liczone bezwarunkowo dla OBU stron — patrz naprawiony bug w dokumentacji modułu).
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 12. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora: {}", actual_threads)));
-    let _ = tx_ui.send(PhaseEvent::Log("Główny silnik EXIF: exiftool-rs (Zapasowo: systemowy exiftool CLI)".to_string()));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 12. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora: {}",
+        actual_threads
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Główny silnik EXIF: exiftool-rs (Zapasowo: systemowy exiftool CLI)".to_string(),
+    ));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -881,30 +1150,56 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let _ = conn.execute("ALTER TABLE files ADD COLUMN media_reason_script TEXT", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN exif_engine_ufs TEXT", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN exif_engine_script TEXT", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN media_duration_ufs INTEGER", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN media_duration_script INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN media_duration_ufs INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN media_duration_script INTEGER",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE files ADD COLUMN media_device_ufs TEXT", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN media_device_script TEXT", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN has_gps_ufs BOOLEAN", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN has_gps_script BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN gps_suspicious_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN gps_suspicious_script BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN date_implausible_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN date_implausible_script BOOLEAN", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN gps_suspicious_ufs BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN gps_suspicious_script BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN date_implausible_ufs BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN date_implausible_script BOOLEAN",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE files ADD COLUMN editing_software_ufs TEXT", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN editing_software_script TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN editing_software_script TEXT",
+        [],
+    );
 
     // INICJALIZACJA DUAL-LOGGING
-    let raport_cfg = config.raporty_faz.get("Faza 12").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza12.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza12.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 12")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza12.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza12.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
     let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    let info_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza12_zdrowe_media.txt");
+    let info_path =
+        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza12_zdrowe_media.txt");
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -913,72 +1208,170 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let log_anom_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let log_anom = Arc::new(Mutex::new(log_anom_file));
-    let log_info = Arc::new(Mutex::new(File::create(&info_path).unwrap()));
-    
+
+    let log_info = match File::create(&info_path) {
+        Ok(f) => Arc::new(Mutex::new(f)),
+        Err(e) => {
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku informacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
+            return Ok(());
+        }
+    };
+
     {
-        let mut f_anom = log_anom.lock().unwrap();
-        let _ = writeln!(f_anom, "=== RAPORT OPERACYJNY - FAZA 12 (ZEPSUTE MULTIMEDIA) ===");
-        let _ = writeln!(f_anom, "Zestawienie plików multimedialnych ze zniszczonymi nagłówkami lub fałszywym MIME.\n");
-        
-        let mut f_info = log_info.lock().unwrap();
-        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 12 (ZDROWE MULTIMEDIA) ===");
-        let _ = writeln!(f_info, "Ekstrakcja śledcza: Oryginalne daty z przeszłości, Koordynaty GPS i Typy Kamery.\n");
+        let mut f_anom = log_anom.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_anom,
+            "=== RAPORT OPERACYJNY - FAZA 12 (ZEPSUTE MULTIMEDIA) ==="
+        );
+        let _ = writeln!(
+            f_anom,
+            "Zestawienie plików multimedialnych ze zniszczonymi nagłówkami lub fałszywym MIME.\n"
+        );
+
+        let mut f_info = log_info.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_info,
+            "=== RAPORT OPERACYJNY - FAZA 12 (ZDROWE MULTIMEDIA) ==="
+        );
+        let _ = writeln!(
+            f_info,
+            "Ekstrakcja śledcza: Oryginalne daty z przeszłości, Koordynaty GPS i Typy Kamery.\n"
+        );
     }
+
+    //    {
+    //        let mut f_anom = log_anom.lock().unwrap();
+    //        let _ = writeln!(f_anom, "=== RAPORT OPERACYJNY - FAZA 12 (ZEPSUTE MULTIMEDIA) ===");
+    //        let _ = writeln!(f_anom, "Zestawienie plików multimedialnych ze zniszczonymi nagłówkami lub fałszywym MIME.\n");
+    //
+    //        let mut f_info = log_info.lock().unwrap();
+    //        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 12 (ZDROWE MULTIMEDIA) ===");
+    //        let _ = writeln!(f_info, "Ekstrakcja śledcza: Oryginalne daty z przeszłości, Koordynaty GPS i Typy Kamery.\n");
+    //    }
 
     // --- ETAP 1: POBIERANIE ZADAŃ Z BAZY ---
     let mut stmt = conn.prepare(
         "SELECT id, relative_path, found_in_ufs, found_in_script, exif_ok_ufs, exif_ok_script, io_error_ufs, io_error_script 
          FROM files WHERE phase12_done = 0 OR phase12_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
+    let mut non_media_ids = Vec::new(); // 🟢 NOWOŚĆ: Kolejka plików zignorowanych (np. archiwa, teksty)
     let mut skipped_ufs = 0;
     let mut skipped_script = 0;
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, ok_ufs, ok_scr, err_ufs, err_scr) = r;
-        
+
         if is_media_extension(&rel) {
             let is_common = in_ufs && in_script;
             if in_ufs {
-                if ok_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); } 
-                else { skipped_ufs += 1; }
+                if ok_ufs.is_none() && err_ufs != Some(true) {
+                    ufs_tasks.push(Task {
+                        id,
+                        rel_path: rel.clone(),
+                        is_common,
+                    });
+                } else {
+                    skipped_ufs += 1;
+                }
             }
             if in_script {
-                if ok_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common }); } 
-                else { skipped_script += 1; }
+                if ok_scr.is_none() && err_scr != Some(true) {
+                    script_tasks.push(Task {
+                        id,
+                        rel_path: rel,
+                        is_common,
+                    });
+                } else {
+                    skipped_script += 1;
+                }
             }
+        } else {
+            // 🟢 Plik nie jest multimedium - oznaczamy do natychmiastowego zwolnienia z kolejki
+            non_media_ids.push(id);
         }
     }
     drop(stmt);
 
+    // 🟢 Natychmiastowe zwalnianie plików nietrafnych z radaru bazy danych
+    if !non_media_ids.is_empty() {
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Zwalnianie {} plików innych typów z radaru kolejki...",
+            non_media_ids.len()
+        )));
+        let tx_trans = conn.transaction()?;
+        // SQLite pozwala na max 999 parametrów w IN (?), więc dzielimy na małe paczki
+        for chunk in non_media_ids.chunks(900) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let query = format!(
+                "UPDATE files SET phase12_done = 1 WHERE id IN ({})",
+                placeholders
+            );
+            tx_trans.execute(&query, rusqlite::params_from_iter(chunk))?;
+        }
+        tx_trans.commit()?;
+    }
+
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto multimedia z wyliczoną już strukturą EXIF. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto multimedia z wyliczoną już strukturą EXIF. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak multimediów do walidacji. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Walidacja EXIF/HEIF jest kompletna. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Brak `return Ok(());`.
     }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (EXIF)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (EXIF)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (EXIF)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (EXIF)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let ufs_stats = LiveStats::new(rayon::current_num_threads());
     let script_stats = LiveStats::new(rayon::current_num_threads());
@@ -1051,9 +1444,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -1063,43 +1459,130 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let half_threads = compute_half_threads(actual_threads);
 
             s.spawn(move || {
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !ufs_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                start_time,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                opr_log: anom_u,
+                                info_log: info_u,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            start_time,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: anom_u,
+                            info_log: info_u,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja EXIF (UFS) zakończona.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Walidacja EXIF (UFS) zakończona.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !script_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                start_time,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                opr_log: anom_s,
+                                info_log: info_s,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            start_time,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: anom_s,
+                            info_log: info_s,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja EXIF (Skrypt) zakończona.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Walidacja EXIF (Skrypt) zakończona.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
+        } else {
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
 
-        } 
-            else
-        {
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
-            
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja EXIF (UFS) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    start_time,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: anom_u,
+                    info_log: info_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Walidacja EXIF (UFS) zakończona.".to_string(),
+                ));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja EXIF (Skrypt) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    start_time,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: anom_s,
+                    info_log: info_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Walidacja EXIF (Skrypt) zakończona.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -1122,18 +1605,23 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET phase12_done = CASE 
             WHEN (found_in_ufs = 0 OR exif_ok_ufs IS NOT NULL OR io_error_ufs = 1) 
              AND (found_in_script = 0 OR exif_ok_script IS NOT NULL OR io_error_script = 1) THEN 1 
             ELSE 0 
-        END WHERE phase12_done = 0 OR phase12_done IS NULL", []
+        END WHERE phase12_done = 0 OR phase12_done IS NULL",
+        [],
     )?;
 
     // --- ETAP 5: HIERARCHICZNY RAPORT KRYMINALISTYCZNY ---
@@ -1141,7 +1629,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT relative_path, found_in_ufs, found_in_script, 
                 exif_ok_ufs, exif_ok_script, media_reason_ufs, media_reason_script,
                 exif_engine_ufs, exif_engine_script
-         FROM files WHERE phase12_done = 1"
+         FROM files WHERE phase12_done = 1",
     )?;
 
     let mut cat_trunc = AnomalyCategory::new("Ucięte Wideo / Zniszczony Nagłówek Obrazu", "✂️");
@@ -1157,72 +1645,194 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<bool>>(3)?, row.get::<_, Option<bool>>(4)?,
-            row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (rel_path, in_ufs, in_scr, u_ufs, u_scr, reason_ufs, reason_scr, eng_ufs, eng_scr) = r;
         let is_common = in_ufs && in_scr;
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
 
-        if in_ufs
-            && let Some(e) = eng_ufs { if e == "RS" { total_engine_rs += 1; } else if e == "CLI" { total_engine_cli += 1; } }
-        if in_scr
-            && let Some(e) = eng_scr { if e == "RS" { total_engine_rs += 1; } else if e == "CLI" { total_engine_cli += 1; } }
+        if in_ufs && let Some(e) = eng_ufs {
+            if e == "RS" {
+                total_engine_rs += 1;
+            } else if e == "CLI" {
+                total_engine_cli += 1;
+            }
+        }
+        if in_scr && let Some(e) = eng_scr {
+            if e == "RS" {
+                total_engine_rs += 1;
+            } else if e == "CLI" {
+                total_engine_cli += 1;
+            }
+        }
 
         let add_to_cat = |cat: &mut AnomalyCategory, is_ufs_source: bool| {
-            let target = if is_common { &mut cat.common } else { &mut cat.unique };
-            let map = if is_ufs_source { &mut target.ufs } else { &mut target.script };
+            let target = if is_common {
+                &mut cat.common
+            } else {
+                &mut cat.unique
+            };
+            let map = if is_ufs_source {
+                &mut target.ufs
+            } else {
+                &mut target.script
+            };
             map.entry(ext.clone()).or_default().push(rel_path.clone());
         };
 
         let mut process_reason = |ok: Option<bool>, reason: Option<String>, is_ufs_source: bool| {
             if ok == Some(false) {
                 if let Some(r) = reason {
-                    if r.contains("Fałszywe") { add_to_cat(&mut cat_fake, is_ufs_source); }
-                    else if r.contains("Śmieci") { add_to_cat(&mut cat_trail, is_ufs_source); }
-                    else { add_to_cat(&mut cat_trunc, is_ufs_source); }
+                    if r.contains("Fałszywe") {
+                        add_to_cat(&mut cat_fake, is_ufs_source);
+                    } else if r.contains("Śmieci") {
+                        add_to_cat(&mut cat_trail, is_ufs_source);
+                    } else {
+                        add_to_cat(&mut cat_trunc, is_ufs_source);
+                    }
                 } else {
                     add_to_cat(&mut cat_trunc, is_ufs_source);
                 }
             }
         };
 
-        if in_ufs { process_reason(u_ufs, reason_ufs, true); }
-        if in_scr { process_reason(u_scr, reason_scr, false); }
+        if in_ufs {
+            process_reason(u_ufs, reason_ufs, true);
+        }
+        if in_scr {
+            process_reason(u_scr, reason_scr, false);
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 12 (METADANE EXIF / HEIF / MP4)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 12 (METADANE EXIF / HEIF / MP4)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
-    let sum_duration = format_duration(ufs_stats.total_duration_sec.load(Ordering::SeqCst) + script_stats.total_duration_sec.load(Ordering::SeqCst));
-    
-    let _ = writeln!(&mut log_out, "[ 1 ] WYDOBYTE DOWODY (Tylko w 100% sprawne pliki multimedialne):");
-    let _ = writeln!(&mut log_out, "   -> Odnaleziono koordynaty GPS w:  {} plikach", ufs_stats.feat_gps_common.load(Ordering::SeqCst) + script_stats.feat_gps_common.load(Ordering::SeqCst) + ufs_stats.feat_gps_unique.load(Ordering::SeqCst) + script_stats.feat_gps_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> ...z czego geograficznie podejrzanych (poza zakresem/Null Island): {}", ufs_stats.gps_suspicious_common.load(Ordering::SeqCst) + script_stats.gps_suspicious_common.load(Ordering::SeqCst) + ufs_stats.gps_suspicious_unique.load(Ordering::SeqCst) + script_stats.gps_suspicious_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Zrekonstruowano Daty w:        {} plikach", ufs_stats.feat_date_common.load(Ordering::SeqCst) + script_stats.feat_date_common.load(Ordering::SeqCst) + ufs_stats.feat_date_unique.load(Ordering::SeqCst) + script_stats.feat_date_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> ...z czego rok-widmo (reset zegara aparatu): {}", ufs_stats.date_implausible_sentinel_common.load(Ordering::SeqCst) + script_stats.date_implausible_sentinel_common.load(Ordering::SeqCst) + ufs_stats.date_implausible_sentinel_unique.load(Ordering::SeqCst) + script_stats.date_implausible_sentinel_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> ...z czego data z przyszłości (możliwa manipulacja): {}", ufs_stats.date_implausible_future_common.load(Ordering::SeqCst) + script_stats.date_implausible_future_common.load(Ordering::SeqCst) + ufs_stats.date_implausible_future_unique.load(Ordering::SeqCst) + script_stats.date_implausible_future_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Pliki edytowane narzędziem (Software): {}", ufs_stats.edited_common.load(Ordering::SeqCst) + script_stats.edited_common.load(Ordering::SeqCst) + ufs_stats.edited_unique.load(Ordering::SeqCst) + script_stats.edited_unique.load(Ordering::SeqCst));
-    let _ = writeln!(&mut log_out, "   -> Sumaryczny Czas Trwania Wideo: {}", sum_duration);
-    let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Algorytm Smart Merge w kolejnej Fazie weźmie te wskaźniki pod uwagę, wybierając kopię wideo o najdłuższym czasie trwania i zachowanym GPS-ie.\n");
+    let sum_duration = format_duration(
+        ufs_stats.total_duration_sec.load(Ordering::SeqCst)
+            + script_stats.total_duration_sec.load(Ordering::SeqCst),
+    );
+
+    let _ = writeln!(
+        &mut log_out,
+        "[ 1 ] WYDOBYTE DOWODY (Tylko w 100% sprawne pliki multimedialne):"
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Odnaleziono koordynaty GPS w:  {} plikach",
+        ufs_stats.feat_gps_common.load(Ordering::SeqCst)
+            + script_stats.feat_gps_common.load(Ordering::SeqCst)
+            + ufs_stats.feat_gps_unique.load(Ordering::SeqCst)
+            + script_stats.feat_gps_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> ...z czego geograficznie podejrzanych (poza zakresem/Null Island): {}",
+        ufs_stats.gps_suspicious_common.load(Ordering::SeqCst)
+            + script_stats.gps_suspicious_common.load(Ordering::SeqCst)
+            + ufs_stats.gps_suspicious_unique.load(Ordering::SeqCst)
+            + script_stats.gps_suspicious_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zrekonstruowano Daty w:        {} plikach",
+        ufs_stats.feat_date_common.load(Ordering::SeqCst)
+            + script_stats.feat_date_common.load(Ordering::SeqCst)
+            + ufs_stats.feat_date_unique.load(Ordering::SeqCst)
+            + script_stats.feat_date_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> ...z czego rok-widmo (reset zegara aparatu): {}",
+        ufs_stats
+            .date_implausible_sentinel_common
+            .load(Ordering::SeqCst)
+            + script_stats
+                .date_implausible_sentinel_common
+                .load(Ordering::SeqCst)
+            + ufs_stats
+                .date_implausible_sentinel_unique
+                .load(Ordering::SeqCst)
+            + script_stats
+                .date_implausible_sentinel_unique
+                .load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> ...z czego data z przyszłości (możliwa manipulacja): {}",
+        ufs_stats
+            .date_implausible_future_common
+            .load(Ordering::SeqCst)
+            + script_stats
+                .date_implausible_future_common
+                .load(Ordering::SeqCst)
+            + ufs_stats
+                .date_implausible_future_unique
+                .load(Ordering::SeqCst)
+            + script_stats
+                .date_implausible_future_unique
+                .load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Pliki edytowane narzędziem (Software): {}",
+        ufs_stats.edited_common.load(Ordering::SeqCst)
+            + script_stats.edited_common.load(Ordering::SeqCst)
+            + ufs_stats.edited_unique.load(Ordering::SeqCst)
+            + script_stats.edited_unique.load(Ordering::SeqCst)
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Sumaryczny Czas Trwania Wideo: {}",
+        sum_duration
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "      [ ZNACZENIE ]: Algorytm Smart Merge w kolejnej Fazie weźmie te wskaźniki pod uwagę, wybierając kopię wideo o najdłuższym czasie trwania i zachowanym GPS-ie.\n"
+    );
 
     let write_section_txt = |out: &mut String, title: &str, is_common: bool| {
         let _ = writeln!(out, "[ KATEGORIA BŁĘDÓW: {} ]", title);
@@ -1233,16 +1843,29 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             let src_anom = if is_common { &cat.common } else { &cat.unique };
             let ufs_total: usize = src_anom.ufs.values().map(|v| v.len()).sum();
             let scr_total: usize = src_anom.script.values().map(|v| v.len()).sum();
-            
+
             if ufs_total > 0 || scr_total > 0 {
                 has_any = true;
-                let _ = writeln!(out, "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})", cat.icon, cat.name, ufs_total, scr_total);
+                let _ = writeln!(
+                    out,
+                    "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})",
+                    cat.icon, cat.name, ufs_total, scr_total
+                );
                 if cat.name.contains("Ucięte") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Plik stracił swój nagłówek definiujący rozdzielczość, lub środek wideo uległ fragmentacji. Plik po uruchomieniu zawiesi odtwarzacz.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Plik stracił swój nagłówek definiujący rozdzielczość, lub środek wideo uległ fragmentacji. Plik po uruchomieniu zawiesi odtwarzacz."
+                    );
                 } else if cat.name.contains("Fałszywe") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Program do odzyskiwania mylnie rozpoznał początek i nadał mu złe rozszerzenie. (Np. Wideo .mov zapisane jako .mp4, lub zdjęcie webp jako jpg).");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Program do odzyskiwania mylnie rozpoznał początek i nadał mu złe rozszerzenie. (Np. Wideo .mov zapisane jako .mp4, lub zdjęcie webp jako jpg)."
+                    );
                 } else if cat.name.contains("Doklejone") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Na samym końcu pliku skaner znalazł tzw. 'Trailer Garbage'. Są to najczęściej doklejone śmieci binarne pochodzące z innej partycji dysku.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Na samym końcu pliku skaner znalazł tzw. 'Trailer Garbage'. Są to najczęściej doklejone śmieci binarne pochodzące z innej partycji dysku."
+                    );
                 }
 
                 let mut print_exts = |map: &ExtMap, label: &str| {
@@ -1251,7 +1874,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         let mut sorted: Vec<_> = map.iter().collect();
                         sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
                         for (ext, paths) in sorted.into_iter().take(3) {
-                            let _ = writeln!(out, "         .{:<5} : {} plików (Przykł: {})", ext, paths.len(), paths[0]);
+                            let _ = writeln!(
+                                out,
+                                "         .{:<5} : {} plików (Przykł: {})",
+                                ext,
+                                paths.len(),
+                                paths[0]
+                            );
                         }
                     }
                 };
@@ -1266,11 +1895,24 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     };
 
     write_section_txt(&mut log_out, "Część Wspólna (Oba źródła)", true);
-    write_section_txt(&mut log_out, "Osobne ścieżki (Unikalne dla jednego źródła)", false);
+    write_section_txt(
+        &mut log_out,
+        "Osobne ścieżki (Unikalne dla jednego źródła)",
+        false,
+    );
 
-    let devs = ufs_stats.top_devices.lock().unwrap();
+    let devs = ufs_stats
+        .top_devices
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    //    let devs = ufs_stats.top_devices.lock().unwrap();
+
     if !devs.is_empty() {
-        let _ = writeln!(&mut log_out, "[ TOP 5 URZĄDZEŃ W ZABEZPIECZONYCH ZDJĘCIACH ]");
+        let _ = writeln!(
+            &mut log_out,
+            "[ TOP 5 URZĄDZEŃ W ZABEZPIECZONYCH ZDJĘCIACH ]"
+        );
         let mut sorted_devs: Vec<_> = devs.iter().collect();
         sorted_devs.sort_by(|a, b| b.1.cmp(a.1));
         for (dev, count) in sorted_devs.into_iter().take(5) {
@@ -1280,18 +1922,37 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
 
     let _ = writeln!(&mut log_out, "[ WYKORZYSTANE SILNIKI PARSUJĄCE ]");
-    let _ = writeln!(&mut log_out, "   -> Biblioteka natywna exiftool-rs: {} plików zdekodowanych w RAM", total_engine_rs);
-    let _ = writeln!(&mut log_out, "   -> Zapasowy proces CLI (exiftool): {} plików odczytanych awaryjnie\n", total_engine_cli);
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Biblioteka natywna exiftool-rs: {} plików zdekodowanych w RAM",
+        total_engine_rs
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "   -> Zapasowy proces CLI (exiftool): {} plików odczytanych awaryjnie\n",
+        total_engine_cli
+    );
 
     if total_io_errors > 0 {
         let _ = writeln!(&mut log_out, "[ 🚨 BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Błędy odczytu (I/O): {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy odczytu (I/O): {}",
+            total_io_errors
+        );
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}", opr_path.display(), info_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}",
+            opr_path.display(),
+            info_path.display()
+        )));
     }
 
     for line in log_out.lines() {
@@ -1299,7 +1960,9 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     }
 
     info!(
-        total_io_errors, total_engine_rs, total_engine_cli,
+        total_io_errors,
+        total_engine_rs,
+        total_engine_cli,
         czas_trwania_sek = elapsed.as_secs_f64(),
         "Faza 12 zakończona"
     );
@@ -1318,7 +1981,10 @@ mod tests {
     const CURRENT_YEAR: i32 = 2026;
 
     fn meta_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -1352,7 +2018,11 @@ mod tests {
 
     #[test]
     fn test_evaluate_gif_via_generic_family_fallback() {
-        let meta = meta_map(&[("MIMEType", "image/gif"), ("ImageWidth", "320"), ("ImageHeight", "240")]);
+        let meta = meta_map(&[
+            ("MIMEType", "image/gif"),
+            ("ImageWidth", "320"),
+            ("ImageHeight", "240"),
+        ]);
         let a = evaluate_metadata(&meta, "gif", CURRENT_YEAR);
         assert!(a.is_valid);
     }
@@ -1362,8 +2032,20 @@ mod tests {
         let meta = meta_map(&[("MIMEType", "video/mp4")]);
         let a = evaluate_metadata(&meta, "gif", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Fałszywe"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia (reason) powinien być obecny dla fałszywego GIF-a")
+                .contains("Fałszywe")
+        );
     }
+
+    //    #[test]
+    //    fn test_evaluate_fake_gif_caught_by_generic_family_fallback() {
+    //        let meta = meta_map(&[("MIMEType", "video/mp4")]);
+    //        let a = evaluate_metadata(&meta, "gif", CURRENT_YEAR);
+    //        assert!(!a.is_valid);
+    //        assert!(a.reason.unwrap().contains("Fałszywe"));
+    //    }
 
     #[test]
     fn test_format_duration_variants() {
@@ -1451,15 +2133,18 @@ mod tests {
 
     #[test]
     fn test_parse_dms_coordinate_north_east_is_positive() {
-        let lat = parse_dms_coordinate("48 deg 51' 24\" N").unwrap();
+        let lat = parse_dms_coordinate("48 deg 51' 24\" N")
+            .expect("Parsowanie współrzędnej N powinno się udać");
         assert!((lat - 48.8567).abs() < 0.001, "otrzymano {}", lat);
     }
 
     #[test]
     fn test_parse_dms_coordinate_south_west_is_negative() {
         // Dokładnie scenariusz z zadania: -48.8567 / -2.3519
-        let lat = parse_dms_coordinate("48 deg 51' 24\" S").unwrap();
-        let lon = parse_dms_coordinate("2 deg 21' 7\" W").unwrap();
+        let lat = parse_dms_coordinate("48 deg 51' 24\" S")
+            .expect("Parsowanie współrzędnej S powinno się udać");
+        let lon = parse_dms_coordinate("2 deg 21' 7\" W")
+            .expect("Parsowanie współrzędnej W powinno się udać");
         assert!((lat - (-48.8567)).abs() < 0.001, "otrzymano {}", lat);
         assert!((lon - (-2.3519)).abs() < 0.001, "otrzymano {}", lon);
     }
@@ -1504,9 +2189,20 @@ mod tests {
         // sprawdzamy wprost wynik parse_gps_values użyty przez evaluate_metadata,
         // nie samą flagę has_suspicious_gps).
         let mut meta = HashMap::new();
-        meta.insert("GPSPosition".to_string(), "34 deg 36' 0\" S, 58 deg 22' 48\" W".to_string());
-        let vals = parse_gps_values(meta.get("GPSPosition").unwrap());
-        assert!(vals[0] < 0.0 && vals[1] < 0.0, "Buenos Aires musi dać obie współrzędne ujemne: {:?}", vals);
+        meta.insert(
+            "GPSPosition".to_string(),
+            "34 deg 36' 0\" S, 58 deg 22' 48\" W".to_string(),
+        );
+
+        let vals = parse_gps_values(
+            meta.get("GPSPosition")
+                .expect("Pole GPSPosition powinno być obecne w metadanych"),
+        );
+        assert!(
+            vals[0] < 0.0 && vals[1] < 0.0,
+            "Buenos Aires musi dać obie współrzędne ujemne: {:?}",
+            vals
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1525,14 +2221,26 @@ mod tests {
 
     #[test]
     fn test_implausible_year_sentinels_classify_as_sentinel() {
-        assert_eq!(classify_implausible_year(0, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
-        assert_eq!(classify_implausible_year(1900, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
-        assert_eq!(classify_implausible_year(1904, CURRENT_YEAR), Some(ImplausibleYearKind::Sentinel));
+        assert_eq!(
+            classify_implausible_year(0, CURRENT_YEAR),
+            Some(ImplausibleYearKind::Sentinel)
+        );
+        assert_eq!(
+            classify_implausible_year(1900, CURRENT_YEAR),
+            Some(ImplausibleYearKind::Sentinel)
+        );
+        assert_eq!(
+            classify_implausible_year(1904, CURRENT_YEAR),
+            Some(ImplausibleYearKind::Sentinel)
+        );
     }
 
     #[test]
     fn test_implausible_year_future_classifies_as_future() {
-        assert_eq!(classify_implausible_year(CURRENT_YEAR + 1, CURRENT_YEAR), Some(ImplausibleYearKind::Future));
+        assert_eq!(
+            classify_implausible_year(CURRENT_YEAR + 1, CURRENT_YEAR),
+            Some(ImplausibleYearKind::Future)
+        );
     }
 
     #[test]
@@ -1550,7 +2258,11 @@ mod tests {
         let meta = meta_map(&[]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Nierozpoznany"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla pustych metadanych")
+                .contains("Nierozpoznany")
+        );
     }
 
     #[test]
@@ -1558,31 +2270,57 @@ mod tests {
         let meta = meta_map(&[("Error", "File is empty")]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Błąd Krytyczny"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla błędu krytycznego")
+                .contains("Błąd Krytyczny")
+        );
     }
 
     #[test]
     fn test_evaluate_warning_truncated() {
-        let meta = meta_map(&[("MIMEType", "image/jpeg"), ("Warning", "File format error - truncated")]);
+        let meta = meta_map(&[
+            ("MIMEType", "image/jpeg"),
+            ("Warning", "File format error - truncated"),
+        ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Ucięty"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla uciętego pliku")
+                .contains("Ucięty")
+        );
     }
 
     #[test]
     fn test_evaluate_warning_trailer_garbage() {
-        let meta = meta_map(&[("MIMEType", "image/jpeg"), ("Warning", "Trailer data after JPEG EOI")]);
+        let meta = meta_map(&[
+            ("MIMEType", "image/jpeg"),
+            ("Warning", "Trailer data after JPEG EOI"),
+        ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Śmieci"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla śmieci za znacznikiem EOI")
+                .contains("Śmieci")
+        );
     }
 
     #[test]
     fn test_evaluate_fake_jpg_explicit_rule() {
-        let meta = meta_map(&[("MIMEType", "video/mp4"), ("ImageWidth", "100"), ("ImageHeight", "100")]);
+        let meta = meta_map(&[
+            ("MIMEType", "video/mp4"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
+        ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Fałszywe"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla fałszywego JPG")
+                .contains("Fałszywe")
+        );
     }
 
     #[test]
@@ -1590,13 +2328,24 @@ mod tests {
         // .webp bez szczegółowej reguły, ale rodzina "image" nie zgadza się z audio/mpeg
         let meta = meta_map(&[("MIMEType", "audio/mpeg")]);
         let a = evaluate_metadata(&meta, "webp", CURRENT_YEAR);
-        assert!(!a.is_valid, "Generyczny fallback rodziny MIME powinien złapać tę niezgodność");
-        assert!(a.reason.unwrap().contains("Fałszywe"));
+        assert!(
+            !a.is_valid,
+            "Generyczny fallback rodziny MIME powinien złapać tę niezgodność"
+        );
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla niezgodności rodziny MIME")
+                .contains("Fałszywe")
+        );
     }
 
     #[test]
     fn test_evaluate_generic_family_fallback_passes_when_matching() {
-        let meta = meta_map(&[("MIMEType", "image/webp"), ("ImageWidth", "800"), ("ImageHeight", "600")]);
+        let meta = meta_map(&[
+            ("MIMEType", "image/webp"),
+            ("ImageWidth", "800"),
+            ("ImageHeight", "600"),
+        ]);
         let a = evaluate_metadata(&meta, "webp", CURRENT_YEAR);
         assert!(a.is_valid);
     }
@@ -1606,15 +2355,27 @@ mod tests {
         let meta = meta_map(&[("MIMEType", "image/jpeg")]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Brak Wymiarów"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla brakujących wymiarów")
+                .contains("Brak Wymiarów")
+        );
     }
 
     #[test]
     fn test_evaluate_degenerate_dimensions_for_visual_file() {
-        let meta = meta_map(&[("MIMEType", "image/jpeg"), ("ImageWidth", "1"), ("ImageHeight", "1")]);
+        let meta = meta_map(&[
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "1"),
+            ("ImageHeight", "1"),
+        ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("zerowe/1x1"));
+        assert!(
+            a.reason
+                .expect("Powód odrzucenia powinien być obecny dla zdegenerowanych wymiarów")
+                .contains("zerowe/1x1")
+        );
     }
 
     #[test]
@@ -1633,8 +2394,10 @@ mod tests {
     fn test_evaluate_valid_file_full_extraction() {
         let meta = meta_map(&[
             ("MIMEType", "image/jpeg"),
-            ("ImageWidth", "4032"), ("ImageHeight", "3024"),
-            ("Make", "Apple"), ("Model", "iPhone 13"),
+            ("ImageWidth", "4032"),
+            ("ImageHeight", "3024"),
+            ("Make", "Apple"),
+            ("Model", "iPhone 13"),
             ("DateTimeOriginal", "2023:06:15 14:30:00"),
             ("GPSPosition", "52.2297, 21.0122"),
         ]);
@@ -1650,17 +2413,26 @@ mod tests {
     #[test]
     fn test_evaluate_device_model_already_contains_make_no_duplication() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
-            ("Make", "Canon"), ("Model", "Canon EOS 90D"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
+            ("Make", "Canon"),
+            ("Model", "Canon EOS 90D"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
-        assert_eq!(a.device, Some("Canon EOS 90D".to_string()), "Model już zawiera Make - nie powinno się dublować");
+        assert_eq!(
+            a.device,
+            Some("Canon EOS 90D".to_string()),
+            "Model już zawiera Make - nie powinno się dublować"
+        );
     }
 
     #[test]
     fn test_evaluate_device_from_model_only() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
             ("Model", "Pixel 7"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
@@ -1670,11 +2442,16 @@ mod tests {
     #[test]
     fn test_evaluate_suspicious_gps_flagged_but_still_valid() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
             ("GPSPosition", "0.0, 0.0"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
-        assert!(a.is_valid, "Podejrzany GPS jest informacyjny, nie unieważnia pliku");
+        assert!(
+            a.is_valid,
+            "Podejrzany GPS jest informacyjny, nie unieważnia pliku"
+        );
         assert!(a.has_gps);
         assert!(a.has_suspicious_gps);
     }
@@ -1682,20 +2459,31 @@ mod tests {
     #[test]
     fn test_evaluate_implausible_date_flagged_but_still_valid() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
             ("DateTimeOriginal", "1900:01:01 00:00:00"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(a.is_valid);
         assert!(a.has_implausible_date);
-        assert_eq!(a.implausible_date_kind, Some(ImplausibleYearKind::Sentinel), "rok 1900 musi klasyfikować się jako rok-widmo, nie przyszłość");
+        assert_eq!(
+            a.implausible_date_kind,
+            Some(ImplausibleYearKind::Sentinel),
+            "rok 1900 musi klasyfikować się jako rok-widmo, nie przyszłość"
+        );
     }
 
     #[test]
     fn test_evaluate_future_date_classifies_as_future_not_sentinel() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
-            ("DateTimeOriginal", format!("{}:01:01 00:00:00", CURRENT_YEAR + 5).as_str()),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
+            (
+                "DateTimeOriginal",
+                format!("{}:01:01 00:00:00", CURRENT_YEAR + 5).as_str(),
+            ),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
         assert!(a.is_valid);
@@ -1706,7 +2494,9 @@ mod tests {
     #[test]
     fn test_evaluate_plausible_date_has_no_implausible_kind() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
             ("DateTimeOriginal", "2023:06:15 14:30:00"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
@@ -1717,7 +2507,9 @@ mod tests {
     #[test]
     fn test_evaluate_editing_software_detected_informationally() {
         let meta = meta_map(&[
-            ("MIMEType", "image/jpeg"), ("ImageWidth", "100"), ("ImageHeight", "100"),
+            ("MIMEType", "image/jpeg"),
+            ("ImageWidth", "100"),
+            ("ImageHeight", "100"),
             ("Software", "Adobe Photoshop 24.0"),
         ]);
         let a = evaluate_metadata(&meta, "jpg", CURRENT_YEAR);
@@ -1728,8 +2520,10 @@ mod tests {
     #[test]
     fn test_evaluate_duration_parsed_for_video() {
         let meta = meta_map(&[
-            ("MIMEType", "video/mp4"), ("Duration", "125.5"),
-            ("ImageWidth", "1920"), ("ImageHeight", "1080"),
+            ("MIMEType", "video/mp4"),
+            ("Duration", "125.5"),
+            ("ImageWidth", "1920"),
+            ("ImageHeight", "1080"),
         ]);
         let a = evaluate_metadata(&meta, "mp4", CURRENT_YEAR);
         assert!(a.is_valid);
@@ -1746,8 +2540,12 @@ mod tests {
         let stats = LiveStats::new(rayon::current_num_threads());
         stats.err_zerodim_common.store(2, Ordering::Relaxed);
         stats.gps_suspicious_unique.store(1, Ordering::Relaxed);
-        stats.date_implausible_sentinel_common.store(3, Ordering::Relaxed);
-        stats.date_implausible_future_unique.store(5, Ordering::Relaxed);
+        stats
+            .date_implausible_sentinel_common
+            .store(3, Ordering::Relaxed);
+        stats
+            .date_implausible_future_unique
+            .store(5, Ordering::Relaxed);
         stats.edited_unique.store(4, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -1777,7 +2575,7 @@ mod tests {
         let stats = LiveStats::new(rayon::current_num_threads());
         stats.engine_rs.store(15, Ordering::Relaxed);
         stats.engine_cli.store(3, Ordering::Relaxed);
-        *stats.last_engine.lock().unwrap() = "CLI".to_string();
+        *stats.last_engine.lock().unwrap_or_else(|e| e.into_inner()) = "CLI".to_string();
 
         let start_time = Instant::now();
         let block = build_source_block("Skrypt Autorski", &stats, start_time);
@@ -1791,7 +2589,7 @@ mod tests {
         let stats = LiveStats::new(rayon::current_num_threads());
         stats.engine_rs.store(8, Ordering::Relaxed);
         stats.engine_cli.store(0, Ordering::Relaxed);
-        *stats.last_engine.lock().unwrap() = "RS".to_string();
+        *stats.last_engine.lock().unwrap_or_else(|e| e.into_inner()) = "RS".to_string();
 
         let start_time = Instant::now();
         let block = build_source_block("UFS Explorer", &stats, start_time);
@@ -1815,7 +2613,12 @@ mod tests {
 
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki dekodowania (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki dekodowania (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(2);
         let block = build_source_block("UFS Explorer", &stats, Instant::now());
@@ -1823,17 +2626,27 @@ mod tests {
         let mut sprawdzonych = 0;
         for line in block.lines() {
             let line = line.trim();
-            if line.starts_with('[') || line.is_empty() { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') || line.is_empty() {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta \"{}\" z panelu Fazy 12 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+                "etykieta \"{}\" z panelu Fazy 12 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 14, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza12_multimedia.rs");
+        assert_eq!(
+            sprawdzonych, 14,
+            "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza12_multimedia.rs"
+        );
     }
 
     /// Konwencja „(Wariant A)" musi być identyczna we WSZYSTKICH fazach
@@ -1854,5 +2667,4 @@ mod tests {
 
         assert_eq!(line, "Wątki dekodowania (Wariant A): {R:1} {G:2}");
     }
-
 }

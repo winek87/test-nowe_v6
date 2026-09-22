@@ -32,16 +32,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent; // <--- NAPRAWIONY IMPORT
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
@@ -60,7 +60,7 @@ pub(crate) struct Task {
     rel_path: String,
     /// `true` gdy plik jest obecny na OBU stronach — decyduje o klasyfikacji
     /// wykrytej anomalii do liczników `_common` czy `_unique`.
-    is_common: bool, 
+    is_common: bool,
 }
 
 /// Wynik obliczenia entropii jednego pliku, przekazywany przez MPSC do wątku zapisu SQLite.
@@ -90,20 +90,20 @@ pub(crate) struct LiveStats {
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
-    
+
     /// Biały szum/śmieci (entropia > 7.995) w plikach WSPÓLNYCH.
-    noise_common: AtomicUsize,   
+    noise_common: AtomicUsize,
     noise_unique: AtomicUsize,
     /// Podejrzanie wysoka entropia (>7.5) dla formatu NIE-skompresowanego —
     /// sugeruje szyfrowanie lub nadpisanie losowymi danymi.
-    crypto_common: AtomicUsize,  
+    crypto_common: AtomicUsize,
     crypto_unique: AtomicUsize,
     /// Podejrzanie niska entropia (<6.0) dla formatu Z ZAŁOŻENIA skompresowanego
     /// (zip/jpg/mp4/...) — sugeruje uszkodzoną/przerwaną kompresję.
-    broken_common: AtomicUsize, 
+    broken_common: AtomicUsize,
     broken_unique: AtomicUsize,
     /// Bardzo niska entropia (0.0-1.0) — wydmuszka/pusty blok (mało unikalnych bajtów).
-    low_common: AtomicUsize,     
+    low_common: AtomicUsize,
     low_unique: AtomicUsize,
 
     /// Wariant A: licznik wystąpień per rozszerzenie dla kategorii "szum".
@@ -167,7 +167,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 // Struktury dla Raportu Hierarchicznego
@@ -187,7 +191,10 @@ struct SourceAnomalies {
 
 impl SourceAnomalies {
     fn new() -> Self {
-        Self { ufs: HashMap::new(), script: HashMap::new() }
+        Self {
+            ufs: HashMap::new(),
+            script: HashMap::new(),
+        }
     }
 }
 
@@ -257,14 +264,11 @@ const FORMATY_SKOMPRESOWANE: &[&str] = &[
     // Archiwa
     "zip", "rar", "7z", "gz", "bz2", "xz", "zst", "jar",
     // Kontenery biurowe oparte na ZIP
-    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk",
-    // Obrazy
-    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif",
-    // Wideo
+    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk", // Obrazy
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", // Wideo
     "mp4", "mkv", "mov", "avi", "webm", "m4v", "flv", "wmv", "ts", "m2ts", "mts",
     // Audio
-    "mp3", "ogg", "oga", "opus", "aac", "m4a", "wma", "flac",
-    // Dokumenty
+    "mp3", "ogg", "oga", "opus", "aac", "m4a", "wma", "flac", // Dokumenty
     "pdf",
 ];
 
@@ -299,23 +303,34 @@ fn calculate_entropy(path: &Path) -> std::result::Result<f64, std::io::Error> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
 
-    if file_len == 0 { return Ok(0.0); }
+    if file_len == 0 {
+        return Ok(0.0);
+    }
 
     let mut byte_counts = [0u64; 256];
-    let mut buffer = [0u8; 131_072]; 
+    let mut buffer = [0u8; 131_072];
     let mut total_bytes = 0u64;
 
     loop {
-        if CANCEL_SIGNAL.load(Ordering::Relaxed) { 
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Przerwano przez użytkownika")); 
+        if CANCEL_SIGNAL.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Przerwano przez użytkownika",
+            ));
         }
         let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
-        for &byte in &buffer[..n] { byte_counts[byte as usize] += 1; }
+        if n == 0 {
+            break;
+        }
+        for &byte in &buffer[..n] {
+            byte_counts[byte as usize] += 1;
+        }
         total_bytes += n as u64;
     }
 
-    if total_bytes == 0 { return Ok(0.0); }
+    if total_bytes == 0 {
+        return Ok(0.0);
+    }
 
     let mut entropy = 0.0;
     for &count in &byte_counts {
@@ -341,41 +356,85 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant) -> St
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
 
     // Wariant A: najczęściej dotknięte rozszerzenie per kategoria (nazwa + liczba)
     let top_one = |map: &Mutex<HashMap<String, usize>>| -> String {
-        let m = map.lock().unwrap();
-        m.iter().max_by_key(|&(_, &count)| count).map(|(ext, count)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, count)
-        }).unwrap_or_else(|| "-".to_string())
+        let m = map.lock().unwrap_or_else(|e| e.into_inner());
+        m.iter()
+            .max_by_key(|&(_, &count)| count)
+            .map(|(ext, count)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, count)
+            })
+            .unwrap_or_else(|| "-".to_string())
     };
 
     let analyzed = stats.analyzed_ok.load(Ordering::Relaxed);
-    let avg_entropy = if analyzed > 0 { *stats.entropy_sum.lock().unwrap() / analyzed as f64 } else { 0.0 };
-    let min_entropy = stats.entropy_min.lock().unwrap().unwrap_or(0.0);
-    let max_entropy = stats.entropy_max.lock().unwrap().unwrap_or(0.0);
+    let avg_entropy = if analyzed > 0 {
+        *stats.entropy_sum.lock().unwrap_or_else(|e| e.into_inner()) / analyzed as f64
+    } else {
+        0.0
+    };
+    let min_entropy = stats
+        .entropy_min
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(0.0);
+    let max_entropy = stats
+        .entropy_max
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(0.0);
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
 
     format!(
         "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nSzum/Śmieci (H>7.99): {} wspólne / {} unikalne | top: {}\nSzyfrowanie (H>7.5): {} wspólne / {} unikalne | top: {}\nZepsuta kompresja (H<6.0): {} wspólne / {} unikalne | top: {}\nWydmuszki (H<1.0): {} wspólne / {} unikalne | top: {}\nŚrednia entropia w próbce: {:.3} bit/B\nZakres entropii w próbce: {:.3} - {:.3} bit/B\nWątki entropii (Wariant A): {}\nBłędy I/O: {}",
-        label, speed_mb, display_ext,
-        stats.noise_common.load(Ordering::Relaxed), stats.noise_unique.load(Ordering::Relaxed), top_one(&stats.noise_ext),
-        stats.crypto_common.load(Ordering::Relaxed), stats.crypto_unique.load(Ordering::Relaxed), top_one(&stats.crypto_ext),
-        stats.broken_common.load(Ordering::Relaxed), stats.broken_unique.load(Ordering::Relaxed), top_one(&stats.broken_ext),
-        stats.low_common.load(Ordering::Relaxed), stats.low_unique.load(Ordering::Relaxed), top_one(&stats.low_ext),
+        label,
+        speed_mb,
+        display_ext,
+        stats.noise_common.load(Ordering::Relaxed),
+        stats.noise_unique.load(Ordering::Relaxed),
+        top_one(&stats.noise_ext),
+        stats.crypto_common.load(Ordering::Relaxed),
+        stats.crypto_unique.load(Ordering::Relaxed),
+        top_one(&stats.crypto_ext),
+        stats.broken_common.load(Ordering::Relaxed),
+        stats.broken_unique.load(Ordering::Relaxed),
+        top_one(&stats.broken_ext),
+        stats.low_common.load(Ordering::Relaxed),
+        stats.low_unique.load(Ordering::Relaxed),
+        top_one(&stats.low_ext),
         avg_entropy,
-        min_entropy, max_entropy,
+        min_entropy,
+        max_entropy,
         activity_markup,
         stats.errors.load(Ordering::Relaxed),
     )
@@ -407,8 +466,18 @@ pub struct StreamCtx<'a> {
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, tx_ui, bar_idx, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        tx_ui,
+        bar_idx,
+        start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+        opr_log,
+    } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -466,13 +535,13 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                         None => {}
                     }
 
-                    *stats.entropy_sum.lock().unwrap() += ent;
+                    *stats.entropy_sum.lock().unwrap_or_else(|e| e.into_inner()) += ent;
                     {
-                        let mut m = stats.entropy_min.lock().unwrap();
+                        let mut m = stats.entropy_min.lock().unwrap_or_else(|e| e.into_inner());
                         *m = Some(m.map_or(ent, |cur| cur.min(ent)));
                     }
                     {
-                        let mut m = stats.entropy_max.lock().unwrap();
+                        let mut m = stats.entropy_max.lock().unwrap_or_else(|e| e.into_inner());
                         *m = Some(m.map_or(ent, |cur| cur.max(ent)));
                     }
                     stats.analyzed_ok.fetch_add(1, Ordering::Relaxed);
@@ -526,23 +595,23 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now; 
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_noise_ext.is_empty() {
-                    let mut global_map = stats.noise_ext.lock().unwrap();
+                    let mut global_map = stats.noise_ext.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_noise_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_crypto_ext.is_empty() {
-                    let mut global_map = stats.crypto_ext.lock().unwrap();
+                    let mut global_map = stats.crypto_ext.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_crypto_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_broken_ext.is_empty() {
-                    let mut global_map = stats.broken_ext.lock().unwrap();
+                    let mut global_map = stats.broken_ext.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_broken_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
                 if !local_low_ext.is_empty() {
-                    let mut global_map = stats.low_ext.lock().unwrap();
+                    let mut global_map = stats.low_ext.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_low_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
 
@@ -568,23 +637,23 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_noise_ext.is_empty() {
-            let mut global_map = stats.noise_ext.lock().unwrap();
+            let mut global_map = stats.noise_ext.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_noise_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_crypto_ext.is_empty() {
-            let mut global_map = stats.crypto_ext.lock().unwrap();
+            let mut global_map = stats.crypto_ext.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_crypto_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_broken_ext.is_empty() {
-            let mut global_map = stats.broken_ext.lock().unwrap();
+            let mut global_map = stats.broken_ext.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_broken_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
         if !local_low_ext.is_empty() {
-            let mut global_map = stats.low_ext.lock().unwrap();
+            let mut global_map = stats.low_ext.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_low_ext.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
 
@@ -617,20 +686,28 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
 /// wypełniane są [`AnomalyCategory`]/[`SourceAnomalies`] pełnym zapytaniem
 /// SQL do całej tabeli, z przykładowymi ścieżkami per rozszerzenie i stronę.
 #[instrument(skip(conn, config, tx_ui), fields(ufs_path = %config.ufs_path, script_path = %config.script_path))]
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
     // 1. INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 7").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza7.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza7.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 7")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza7.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza7.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
     let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
+
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
     // między `create_dir_all` a tym miejscem — cały bieg fazy ginął z
@@ -638,22 +715,45 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let opr_log_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let opr_log = Arc::new(Mutex::new(opr_log_file));
     {
-        let mut f = opr_log.lock().unwrap();
-        let _ = writeln!(f, "=== RAPORT OPERACYJNY - FAZA 7 (ANALIZA ENTROPII SHANNONA) ===");
-        let _ = writeln!(f, "Zestawienie plików obarczonych wadami matematycznymi (Szum, Nadpisanie, Błędy Kompresji).\n");
+        let mut f = opr_log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f,
+            "=== RAPORT OPERACYJNY - FAZA 7 (ANALIZA ENTROPII SHANNONA) ==="
+        );
+        let _ = writeln!(
+            f,
+            "Zestawienie plików obarczonych wadami matematycznymi (Szum, Nadpisanie, Błędy Kompresji).\n"
+        );
     }
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 7. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 7. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
 
     let start_time = Instant::now();
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -663,7 +763,7 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT id, relative_path, found_in_ufs, found_in_script, entropy_ufs, entropy_script, io_error_ufs, io_error_script 
          FROM files WHERE phase7_done = 0 OR phase7_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
     let mut skipped_ufs = 0;
@@ -684,32 +784,66 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, e_ufs, e_scr, err_ufs, err_scr) = r;
         let is_common = in_ufs && in_script;
-        
+
         if in_ufs {
-            if e_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); } 
-            else { skipped_ufs += 1; }
+            if e_ufs.is_none() && err_ufs != Some(true) {
+                ufs_tasks.push(Task {
+                    id,
+                    rel_path: rel.clone(),
+                    is_common,
+                });
+            } else {
+                skipped_ufs += 1;
+            }
         }
         if in_script {
-            if e_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common }); } 
-            else { skipped_script += 1; }
+            if e_scr.is_none() && err_scr != Some(true) {
+                script_tasks.push(Task {
+                    id,
+                    rel_path: rel,
+                    is_common,
+                });
+            } else {
+                skipped_script += 1;
+            }
         }
     }
     drop(stmt);
 
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto pliki z wyliczoną już entropią. UFS Explorer: {}, Skrypt Autorski: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto pliki z wyliczoną już entropią. UFS Explorer: {}, Skrypt Autorski: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak plików wymagających analizy entropii. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Entropia Shannona w pełni przeliczona. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Brak `return Ok(());`. Skrypt wejdzie gładko w Etap 4 i uwolni radary!
     }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Entropia)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Entropia)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Entropia)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Entropia)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = std::cmp::max(1, actual_threads / 2);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -780,8 +914,10 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let rep_u = opr_log.clone(); let rep_s = opr_log.clone();
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let rep_u = opr_log.clone();
+            let rep_s = opr_log.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -794,49 +930,123 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             // Wyliczone wcześniej, tu tylko używane.
 
             s.spawn(move || {
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !ufs_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_path,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                                opr_log: rep_u,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_path,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                            opr_log: rep_u,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza matematyczna (UFS Explorer) zakończona.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Analiza matematyczna (UFS Explorer) zakończona.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !script_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_path,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                                opr_log: rep_s,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_path,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                            opr_log: rep_s,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza matematyczna (Skrypt Autorski) zakończona.".to_string()));
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Analiza matematyczna (Skrypt Autorski) zakończona.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
-        } 
-        else {
-            let rep_u = opr_log.clone(); let rep_s = opr_log.clone();
-            
+        } else {
+            let rep_u = opr_log.clone();
+            let rep_s = opr_log.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_path, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, tx_ui: tx_ui_ref, bar_idx: 0, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_u, }); 
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza matematyczna (UFS Explorer) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_path,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                    opr_log: rep_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Analiza matematyczna (UFS Explorer) zakończona.".to_string(),
+                ));
             }
 
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_path, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, tx_ui: tx_ui_ref, bar_idx: 1, start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
-    opr_log: rep_s, }); 
-                let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Analiza matematyczna (Skrypt Autorski) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_path,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    start_time, // <--- DODANO BRAKUJĄCY ARGUMENT
+                    opr_log: rep_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Analiza matematyczna (Skrypt Autorski) zakończona.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -859,24 +1069,29 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa generowanie hierarchicznego raportu w bazie SQLite...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa generowanie hierarchicznego raportu w bazie SQLite...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET phase7_done = CASE 
             WHEN (found_in_ufs = 0 OR entropy_ufs IS NOT NULL OR io_error_ufs = 1) 
              AND (found_in_script = 0 OR entropy_script IS NOT NULL OR io_error_script = 1) THEN 1 
             ELSE 0 
-        END WHERE phase7_done = 0 OR phase7_done IS NULL", []
+        END WHERE phase7_done = 0 OR phase7_done IS NULL",
+        [],
     )?;
 
     // --- ETAP 5: HIERARCHICZNY RAPORT KRYMINALISTYCZNY ---
     let mut stmt = conn.prepare(
         "SELECT relative_path, found_in_ufs, found_in_script, entropy_ufs, entropy_script 
-         FROM files WHERE phase7_done = 1"
+         FROM files WHERE phase7_done = 1",
     )?;
 
     let mut cat_noise = AnomalyCategory::new("Biały Szum / Śmieci (H>7.99)", "💥");
@@ -886,20 +1101,35 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<f64>>(3)?, row.get::<_, Option<f64>>(4)?
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (rel_path, in_ufs, in_scr, e_ufs, e_scr) = r;
         let is_common = in_ufs && in_scr;
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
         let is_compressed = jest_formatem_skompresowanym(&ext);
 
         let add_to_cat = |cat: &mut AnomalyCategory, is_ufs_source: bool| {
-            let target = if is_common { &mut cat.common } else { &mut cat.unique };
-            let map = if is_ufs_source { &mut target.ufs } else { &mut target.script };
+            let target = if is_common {
+                &mut cat.common
+            } else {
+                &mut cat.unique
+            };
+            let map = if is_ufs_source {
+                &mut target.ufs
+            } else {
+                &mut target.script
+            };
             map.entry(ext.clone()).or_default().push(rel_path.clone());
         };
 
@@ -911,61 +1141,82 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         // liczony w panelu TUI, ale znikał bez klasyfikacji z persystentnego,
         // archiwizowanego pliku `dziennik_koncowy_faza7.txt`. Wywołanie
         // wspólnej funkcji eliminuje drugie źródło prawdy.
-        if in_ufs
-            && let Some(e) = e_ufs {
-                match klasyfikuj_entropie(e, is_compressed) {
-                    Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, true),
-                    Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, true),
-                    Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, true),
-                    Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, true),
-                    None => {}
-                }
+        if in_ufs && let Some(e) = e_ufs {
+            match klasyfikuj_entropie(e, is_compressed) {
+                Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, true),
+                Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, true),
+                Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, true),
+                Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, true),
+                None => {}
             }
+        }
 
-        if in_scr
-            && let Some(e) = e_scr {
-                match klasyfikuj_entropie(e, is_compressed) {
-                    Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, false),
-                    Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, false),
-                    Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, false),
-                    Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, false),
-                    None => {}
-                }
+        if in_scr && let Some(e) = e_scr {
+            match klasyfikuj_entropie(e, is_compressed) {
+                Some(KategoriaEntropii::Szum) => add_to_cat(&mut cat_noise, false),
+                Some(KategoriaEntropii::Zaszyfrowany) => add_to_cat(&mut cat_crypto, false),
+                Some(KategoriaEntropii::ZepsutaKompresja) => add_to_cat(&mut cat_broken, false),
+                Some(KategoriaEntropii::Wydmuszka) => add_to_cat(&mut cat_low, false),
+                None => {}
             }
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
 
     // -- GENEROWANIE DZIENNIKA KOŃCOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 7 (MATEMATYCZNA ANALIZA ENTROPII SHANNONA)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 7 (MATEMATYCZNA ANALIZA ENTROPII SHANNONA)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
     // PRZYWRÓCONE: Wzbogacony generator raportu z użyciem IKON
     let write_section_txt = |out: &mut String, title: &str, is_common: bool| {
         let _ = writeln!(out, "[ {} ]", title);
         let categories = [&cat_noise, &cat_crypto, &cat_broken, &cat_low];
-        
+
         let mut has_any = false;
         for cat in &categories {
             let src_anom = if is_common { &cat.common } else { &cat.unique };
             let ufs_total: usize = src_anom.ufs.values().map(|v| v.len()).sum();
             let scr_total: usize = src_anom.script.values().map(|v| v.len()).sum();
-            
+
             if ufs_total > 0 || scr_total > 0 {
                 has_any = true;
-                let _ = writeln!(out, "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})", cat.icon, cat.name, ufs_total, scr_total);
-                let _ = writeln!(out, "      [ ZNACZENIE ]: Wartość entropii wskazuje na matematyczny chaos lub brak spójności danych.");
-                
+                let _ = writeln!(
+                    out,
+                    "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})",
+                    cat.icon, cat.name, ufs_total, scr_total
+                );
+                let _ = writeln!(
+                    out,
+                    "      [ ZNACZENIE ]: Wartość entropii wskazuje na matematyczny chaos lub brak spójności danych."
+                );
+
                 // Macierz rozszerzeń w raporcie TXT
                 let mut print_exts = |map: &ExtMap, label: &str| {
                     if !map.is_empty() {
@@ -973,7 +1224,13 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                         let mut sorted: Vec<_> = map.iter().collect();
                         sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
                         for (ext, paths) in sorted.into_iter().take(3) {
-                            let _ = writeln!(out, "         .{:<5} : {} plików (Przykł: {})", ext, paths.len(), paths[0]);
+                            let _ = writeln!(
+                                out,
+                                "         .{:<5} : {} plików (Przykł: {})",
+                                ext,
+                                paths.len(),
+                                paths[0]
+                            );
                         }
                     }
                 };
@@ -982,14 +1239,22 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
                 let _ = writeln!(out);
             }
         }
-        
+
         if !has_any {
             let _ = writeln!(out, "   ✔ Brak anomalii w tej puli.\n");
         }
     };
 
-    write_section_txt(&mut log_out, "CZĘŚĆ WSPÓLNA (Odnalezione przez oba programy)", true);
-    write_section_txt(&mut log_out, "OSOBNE ŚCIEŻKI (Unikalne dla jednego źródła)", false);
+    write_section_txt(
+        &mut log_out,
+        "CZĘŚĆ WSPÓLNA (Odnalezione przez oba programy)",
+        true,
+    );
+    write_section_txt(
+        &mut log_out,
+        "OSOBNE ŚCIEŻKI (Unikalne dla jednego źródła)",
+        false,
+    );
 
     // PRZYWRÓCONE: Zestawienie wagowe formatów dla raportu
     let _ = writeln!(&mut log_out, "[ PODSUMOWANIE WAGOWE FORMATÓW ]");
@@ -997,25 +1262,55 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
     let _ = writeln!(&mut log_out);
 
     if total_io_errors > 0 {
         let _ = writeln!(&mut log_out, "[ 🚨 BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Błędy odczytu (I/O): {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy odczytu (I/O): {}",
+            total_io_errors
+        );
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raport Operacyjny (Live) w: {}", opr_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raport Operacyjny (Live) w: {}",
+            opr_path.display()
+        )));
     }
 
     // Wysyłamy również do Ratatui Log Panel
@@ -1043,6 +1338,14 @@ mod tests {
     use std::time::Duration;
     use tempfile::NamedTempFile;
 
+    /// Serializuje testy, które manipulują globalnym `CANCEL_SIGNAL` (bezpośrednio
+    /// albo pośrednio przez `calculate_entropy`, która go sprawdza między odczytami
+    /// bufora) — bez tego dwa równoległe testy mogłyby się wzajemnie sabotować,
+    /// bo `cargo test` domyślnie uruchamia testy w wielu wątkach. Ten sam wzorzec
+    /// (zamiast crate `serial_test`) co `phase8::integration_tests::CANCEL_LOCK` —
+    /// jedna linia więcej, zero dodatkowej zależności.
+    static CANCEL_LOCK: Mutex<()> = Mutex::new(());
+
     // ------------------------------------------------------------------
     // compute_activity_slots (identyczna logika z Fazy 3/4/5/6)
     // ------------------------------------------------------------------
@@ -1061,8 +1364,9 @@ mod tests {
     const EPS: f64 = 1e-9;
 
     fn make_temp_file(content: &[u8]) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(content).unwrap();
+        let mut f = NamedTempFile::new().expect("Operacja nie powiodła się");
+        f.write_all(content)
+            .expect("Zapis danych do pliku nie powiódł się");
         f
     }
 
@@ -1072,45 +1376,58 @@ mod tests {
 
     #[test]
     fn test_entropy_all_zeros_is_zero() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Jedna powtarzająca się wartość bajtu => zero niepewności informacyjnej
         let f = make_temp_file(&vec![0x00u8; 1000]);
-        let h = calculate_entropy(f.path()).unwrap();
+        let h = calculate_entropy(f.path()).expect("Operacja nie powiodła się");
         assert!((h - 0.0).abs() < EPS);
     }
 
     #[test]
     fn test_entropy_single_repeated_nonzero_byte_is_zero() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let f = make_temp_file(&vec![0x41u8; 500]); // same 'A'
-        let h = calculate_entropy(f.path()).unwrap();
+        let h = calculate_entropy(f.path()).expect("Operacja nie powiodła się");
         assert!((h - 0.0).abs() < EPS);
     }
 
     #[test]
     fn test_entropy_two_symbols_50_50_is_one_bit() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Dokładnie dwie wartości bajtu w równych proporcjach:
         // H = -[0.5*log2(0.5) + 0.5*log2(0.5)] = 1.0 bit/bajt
-        let content: Vec<u8> = (0..1000).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect();
+        let content: Vec<u8> = (0..1000)
+            .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
+            .collect();
         let f = make_temp_file(&content);
-        let h = calculate_entropy(f.path()).unwrap();
+        let h = calculate_entropy(f.path()).expect("Operacja nie powiodła się");
         assert!((h - 1.0).abs() < EPS, "Oczekiwano H=1.0, otrzymano {}", h);
     }
 
     #[test]
     fn test_entropy_all_256_values_equal_is_maximal() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Wszystkie 256 wartości bajtu w równej liczbie => maksymalna entropia = 8.0
         let mut content = Vec::with_capacity(256 * 10);
         for _ in 0..10 {
-            for b in 0..=255u8 { content.push(b); }
+            for b in 0..=255u8 {
+                content.push(b);
+            }
         }
         let f = make_temp_file(&content);
-        let h = calculate_entropy(f.path()).unwrap();
-        assert!((h - 8.0).abs() < EPS, "Oczekiwano H=8.0 (maksimum), otrzymano {}", h);
+        let h = calculate_entropy(f.path()).expect("Operacja nie powiodła się");
+        assert!(
+            (h - 8.0).abs() < EPS,
+            "Oczekiwano H=8.0 (maksimum), otrzymano {}",
+            h
+        );
     }
 
     #[test]
     fn test_entropy_empty_file_is_zero_not_error() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let f = make_temp_file(b"");
-        let h = calculate_entropy(f.path()).unwrap();
+        let h = calculate_entropy(f.path()).expect("Operacja nie powiodła się");
         assert_eq!(h, 0.0);
     }
 
@@ -1121,7 +1438,10 @@ mod tests {
 
     #[test]
     fn test_klasyfikuj_entropie_zero_jest_wydmuszka_nie_brakiem_kategorii() {
-        assert_eq!(klasyfikuj_entropie(0.0, false), Some(KategoriaEntropii::Wydmuszka));
+        assert_eq!(
+            klasyfikuj_entropie(0.0, false),
+            Some(KategoriaEntropii::Wydmuszka)
+        );
     }
 
     #[test]
@@ -1129,15 +1449,31 @@ mod tests {
         // `is_compressed=true` i `ent<6.0` wygrywa PRZED gałęzią wydmuszki
         // (kolejność if/else) - zamierzone, zip wypełniony zerami to realnie
         // zepsuta kompresja, nie zwykła wydmuszka.
-        assert_eq!(klasyfikuj_entropie(0.0, true), Some(KategoriaEntropii::ZepsutaKompresja));
+        assert_eq!(
+            klasyfikuj_entropie(0.0, true),
+            Some(KategoriaEntropii::ZepsutaKompresja)
+        );
     }
 
     #[test]
     fn test_klasyfikuj_entropie_granice_pozostalych_kategorii_niezmienione() {
-        assert_eq!(klasyfikuj_entropie(8.0, false), Some(KategoriaEntropii::Szum));
-        assert_eq!(klasyfikuj_entropie(7.8, false), Some(KategoriaEntropii::Zaszyfrowany));
-        assert_eq!(klasyfikuj_entropie(0.5, false), Some(KategoriaEntropii::Wydmuszka));
-        assert_eq!(klasyfikuj_entropie(4.0, false), None, "entropia środkowego zakresu bez kompresji nie jest anomalią");
+        assert_eq!(
+            klasyfikuj_entropie(8.0, false),
+            Some(KategoriaEntropii::Szum)
+        );
+        assert_eq!(
+            klasyfikuj_entropie(7.8, false),
+            Some(KategoriaEntropii::Zaszyfrowany)
+        );
+        assert_eq!(
+            klasyfikuj_entropie(0.5, false),
+            Some(KategoriaEntropii::Wydmuszka)
+        );
+        assert_eq!(
+            klasyfikuj_entropie(4.0, false),
+            None,
+            "entropia środkowego zakresu bez kompresji nie jest anomalią"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1149,8 +1485,14 @@ mod tests {
         // Dokładnie formaty wymienione w regresji dokumentacji stałej
         // FORMATY_SKOMPRESOWANE - dawniej nieobecne, fałszywie trafiały do
         // kategorii "Zaszyfrowany" mimo wysokiej entropii z natury.
-        for ext in ["mp3", "ogg", "avi", "mov", "webm", "webp", "heic", "flac", "pptx"] {
-            assert!(jest_formatem_skompresowanym(ext), ".{} powinno być rozpoznane jako skompresowane", ext);
+        for ext in [
+            "mp3", "ogg", "avi", "mov", "webm", "webp", "heic", "flac", "pptx",
+        ] {
+            assert!(
+                jest_formatem_skompresowanym(ext),
+                ".{} powinno być rozpoznane jako skompresowane",
+                ext
+            );
         }
     }
 
@@ -1159,7 +1501,11 @@ mod tests {
         // RAW/surowe formaty (dng, cr2, nef, bmp, txt, csv) NIE są z założenia
         // skompresowane - wysoka entropia w nich POWINNA dalej wyglądać podejrzanie.
         for ext in ["dng", "cr2", "nef", "bmp", "txt", "csv", "raw"] {
-            assert!(!jest_formatem_skompresowanym(ext), ".{} nie powinno być na liście skompresowanych", ext);
+            assert!(
+                !jest_formatem_skompresowanym(ext),
+                ".{} nie powinno być na liście skompresowanych",
+                ext
+            );
         }
     }
 
@@ -1169,7 +1515,11 @@ mod tests {
     #[test]
     fn test_mp3_o_wysokiej_entropii_nie_jest_juz_falszywie_zaszyfrowany() {
         let is_compressed = jest_formatem_skompresowanym("mp3");
-        assert_eq!(klasyfikuj_entropie(7.7, is_compressed), None, "mp3 o typowo wysokiej entropii nie jest anomalią");
+        assert_eq!(
+            klasyfikuj_entropie(7.7, is_compressed),
+            None,
+            "mp3 o typowo wysokiej entropii nie jest anomalią"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1181,6 +1531,7 @@ mod tests {
 
     #[test]
     fn test_calculate_entropy_zwraca_interrupted_gdy_cancel_signal_ustawiony() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Plik dostatecznie duży, żeby CANCEL_SIGNAL zdążył zostać sprawdzony
         // w pętli odczytu (co 128 KB) przed wyczerpaniem pliku.
         let content = vec![0u8; 500_000];
@@ -1198,9 +1549,13 @@ mod tests {
 
     #[test]
     fn test_entropy_nonexistent_path_is_io_error() {
+        let _guard = CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let result = calculate_entropy(Path::new("/nieistniejaca/sciezka/do/pliku.dat"));
         assert!(result.is_err());
-        assert_ne!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_ne!(
+            result.expect_err("Operacja powinna zwrócić błąd").kind(),
+            std::io::ErrorKind::Interrupted
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1234,13 +1589,17 @@ mod tests {
     #[test]
     fn test_build_source_block_average_entropy() {
         let stats = LiveStats::new(4);
-        *stats.entropy_sum.lock().unwrap() = 15.0;
+        *stats.entropy_sum.lock().unwrap_or_else(|e| e.into_inner()) = 15.0;
         stats.analyzed_ok.store(3, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        assert!(block.contains("Średnia entropia w próbce: 5.000 bit/B"), "15/3 = 5.0: {}", block);
+        assert!(
+            block.contains("Średnia entropia w próbce: 5.000 bit/B"),
+            "15/3 = 5.0: {}",
+            block
+        );
     }
 
     #[test]
@@ -1248,19 +1607,27 @@ mod tests {
         let stats = LiveStats::new(4);
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
-        assert!(block.contains("Średnia entropia w próbce: 0.000 bit/B"), "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}", block);
+        assert!(
+            block.contains("Średnia entropia w próbce: 0.000 bit/B"),
+            "dzielenie przez zero musi dać 0.0, nie NaN/panikę: {}",
+            block
+        );
     }
 
     #[test]
     fn test_build_source_block_entropy_range() {
         let stats = LiveStats::new(4);
-        *stats.entropy_min.lock().unwrap() = Some(0.42);
-        *stats.entropy_max.lock().unwrap() = Some(7.998);
+        *stats.entropy_min.lock().unwrap_or_else(|e| e.into_inner()) = Some(0.42);
+        *stats.entropy_max.lock().unwrap_or_else(|e| e.into_inner()) = Some(7.998);
 
         let start_time = Instant::now() - Duration::from_secs(1);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        assert!(block.contains("Zakres entropii w próbce: 0.420 - 7.998 bit/B"), "{}", block);
+        assert!(
+            block.contains("Zakres entropii w próbce: 0.420 - 7.998 bit/B"),
+            "{}",
+            block
+        );
     }
 
     #[test]
@@ -1272,7 +1639,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki entropii")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki entropii"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki entropii (Wariant A): {G:1} {R:2} {R:3} {G:4}");
     }
 
@@ -1289,13 +1659,24 @@ mod tests {
     #[test]
     fn test_build_source_block_top_one_picks_highest_count_extension() {
         let stats = LiveStats::new(4);
-        stats.crypto_ext.lock().unwrap().insert("zip".to_string(), 2);
-        stats.crypto_ext.lock().unwrap().insert("jpg".to_string(), 9); // powinien wygrać
+        stats
+            .crypto_ext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("zip".to_string(), 2);
+        stats
+            .crypto_ext
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("jpg".to_string(), 9); // powinien wygrać
 
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time);
 
-        let crypto_line = block.lines().find(|l| l.starts_with("Szyfrowanie")).unwrap();
+        let crypto_line = block
+            .lines()
+            .find(|l| l.starts_with("Szyfrowanie"))
+            .expect("Szukany element powinien znajdować się w kolekcji");
         assert!(crypto_line.contains(".jpg (9)"), "Linia: {}", crypto_line);
     }
 
@@ -1314,7 +1695,12 @@ mod tests {
     /// sam wzorzec co w Fazach 5/6.
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki entropii (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki entropii (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(1);
         let start_time = Instant::now() - Duration::from_millis(500);
@@ -1322,16 +1708,26 @@ mod tests {
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta '{}' z panelu Fazy 7 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych", etykieta
+                "etykieta '{}' z panelu Fazy 7 nie ma zarejestrowanego wyjaśnienia ani nie jest na liście generycznych",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 6, "panel powinien mieć dokładnie 6 etykiet wymagających wyjaśnienia");
+        assert_eq!(
+            sprawdzonych, 6,
+            "panel powinien mieć dokładnie 6 etykiet wymagających wyjaśnienia"
+        );
     }
 }

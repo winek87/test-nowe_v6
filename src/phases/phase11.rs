@@ -1,7 +1,7 @@
 // src/phases/phase11.rs
 
 //! # Faza 11: Głęboka Walidacja Archiwów i Dokumentów (ZIP, DOCX, APK, RAR, 7Z, TAR, etc.)
-//! 
+//!
 //! Weryfikuje integralność strukturalną oraz semantyczną plików pakowanych.
 //! Skanuje EOCD, weryfikuje DNA dokumentów (np. folder word/ w docx), wykrywa
 //! Zip Bomby (po rozmiarze i po liczbie wpisów), szyfrowanie oraz podejrzanie
@@ -32,16 +32,16 @@
 
 use crate::settings::Ustawienia;
 use crate::tui::state::PhaseEvent;
-use crate::utils::{format_bytes, format_display_path, CANCEL_SIGNAL};
+use crate::utils::{CANCEL_SIGNAL, format_bytes, format_display_path};
 use ratatui::style::Color;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 use zip::ZipArchive;
@@ -100,15 +100,14 @@ const SUSPICIOUS_ABSOLUTE_THRESHOLD: u64 = 50_000_000; // 50 MB
 // danymi ZIP, więc `ZipArchive::new` zawodzi na nim wprost i wymagałby
 // osobnej ścieżki parsowania nagłówka — poza zakresem tej zmiany.
 const ARCHIVE_EXTS: &[&str] = &[
-    ".zip", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub", ".apk", ".jar",
-    ".docm", ".xlsm", ".pptm", ".war", ".xpi", ".cbz", ".cbr", ".zst",
-    ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".tgz", ".taz", ".tbz", ".tbz2", ".txz"
+    ".zip", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub", ".apk", ".jar", ".docm",
+    ".xlsm", ".pptm", ".war", ".xpi", ".cbz", ".cbr", ".zst", ".rar", ".7z", ".tar", ".gz", ".bz2",
+    ".xz", ".tgz", ".taz", ".tbz", ".tbz2", ".txz",
 ];
 
 const ZIP_DERIVATIVES: &[&str] = &[
-    "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk", "jar",
-    "docm", "xlsm", "pptm", "war", "xpi", "cbz",
+    "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "apk", "jar", "docm", "xlsm",
+    "pptm", "war", "xpi", "cbz",
 ];
 
 // ============================================================================
@@ -142,11 +141,17 @@ enum CompressionVerdict {
 /// znaczenia forensycznego). Przy `file_size == 0` zawsze zwraca `Normal`
 /// (unika dzielenia przez zero / bezsensownego mnożenia).
 fn classify_compression_ratio(file_size: u64, uncompressed_total: u64) -> CompressionVerdict {
-    if file_size == 0 { return CompressionVerdict::Normal; }
+    if file_size == 0 {
+        return CompressionVerdict::Normal;
+    }
 
-    if uncompressed_total > file_size.saturating_mul(BOMB_RATIO_THRESHOLD) && uncompressed_total > BOMB_ABSOLUTE_THRESHOLD {
+    if uncompressed_total > file_size.saturating_mul(BOMB_RATIO_THRESHOLD)
+        && uncompressed_total > BOMB_ABSOLUTE_THRESHOLD
+    {
         CompressionVerdict::Bomb
-    } else if uncompressed_total > file_size.saturating_mul(SUSPICIOUS_RATIO_THRESHOLD) && uncompressed_total > SUSPICIOUS_ABSOLUTE_THRESHOLD {
+    } else if uncompressed_total > file_size.saturating_mul(SUSPICIOUS_RATIO_THRESHOLD)
+        && uncompressed_total > SUSPICIOUS_ABSOLUTE_THRESHOLD
+    {
         CompressionVerdict::Suspicious
     } else {
         CompressionVerdict::Normal
@@ -210,8 +215,9 @@ pub(crate) struct LiveStats {
     processed_bytes: AtomicU64,
     errors: AtomicUsize,
     ext_weights: Mutex<HashMap<String, u64>>,
-    
-    ok_common: AtomicUsize, ok_unique: AtomicUsize,
+
+    ok_common: AtomicUsize,
+    ok_unique: AtomicUsize,
     /// Suma `uncompressed_size` WYŁĄCZNIE zdrowych archiwów (`is_valid`) —
     /// razem z `ok_bytes_sum` daje średni współczynnik kompresji próbki.
     uncompressed_size_sum: AtomicU64,
@@ -220,20 +226,28 @@ pub(crate) struct LiveStats {
     /// bo ten obejmuje też uszkodzone/odrzucone pliki, dla których
     /// `uncompressed_size` bywa 0 albo niemiarodajne).
     ok_bytes_sum: AtomicU64,
-    err_header_common: AtomicUsize,  err_header_unique: AtomicUsize,
-    err_empty_common: AtomicUsize,   err_empty_unique: AtomicUsize,
-    err_fake_common: AtomicUsize,    err_fake_unique: AtomicUsize,
-    err_bomb_common: AtomicUsize,    err_bomb_unique: AtomicUsize,
+    err_header_common: AtomicUsize,
+    err_header_unique: AtomicUsize,
+    err_empty_common: AtomicUsize,
+    err_empty_unique: AtomicUsize,
+    err_fake_common: AtomicUsize,
+    err_fake_unique: AtomicUsize,
+    err_bomb_common: AtomicUsize,
+    err_bomb_unique: AtomicUsize,
     /// Bomba PLIKOWA (>50 000 wpisów) — osobna kategoria od bomby rozmiarowej,
     /// bo to inny wektor ataku/uszkodzenia (liczba plików, nie ich waga).
-    err_massfiles_common: AtomicUsize, err_massfiles_unique: AtomicUsize,
+    err_massfiles_common: AtomicUsize,
+    err_massfiles_unique: AtomicUsize,
     /// Błąd CRC32 przy próbkowej weryfikacji (tylko gdy `deep_archive_scan = true`).
-    err_crc_common: AtomicUsize, err_crc_unique: AtomicUsize,
+    err_crc_common: AtomicUsize,
+    err_crc_unique: AtomicUsize,
 
     /// INFORMACYJNE (nie wpływają na `is_valid`): archiwa z zaszyfrowaną zawartością.
-    encrypted_common: AtomicUsize, encrypted_unique: AtomicUsize,
+    encrypted_common: AtomicUsize,
+    encrypted_unique: AtomicUsize,
     /// INFORMACYJNE: podejrzanie wysoki współczynnik kompresji (poniżej progu bomby).
-    suspicious_compression_common: AtomicUsize, suspicious_compression_unique: AtomicUsize,
+    suspicious_compression_common: AtomicUsize,
+    suspicious_compression_unique: AtomicUsize,
 
     /// EKSPERYMENTALNE (Wariant A): śledzi zajętość logicznych slotów Rayon
     /// TEJ strony podczas analizy archiwum — patrz moduł `thread_activity`.
@@ -243,18 +257,30 @@ pub(crate) struct LiveStats {
 impl LiveStats {
     fn new(slot_count: usize) -> Self {
         Self {
-            processed_files: AtomicUsize::new(0), processed_bytes: AtomicU64::new(0), errors: AtomicUsize::new(0),
+            processed_files: AtomicUsize::new(0),
+            processed_bytes: AtomicU64::new(0),
+            errors: AtomicUsize::new(0),
             ext_weights: Mutex::new(HashMap::new()),
-            ok_common: AtomicUsize::new(0), ok_unique: AtomicUsize::new(0),
-            uncompressed_size_sum: AtomicU64::new(0), ok_bytes_sum: AtomicU64::new(0),
-            err_header_common: AtomicUsize::new(0), err_header_unique: AtomicUsize::new(0),
-            err_empty_common: AtomicUsize::new(0),  err_empty_unique: AtomicUsize::new(0),
-            err_fake_common: AtomicUsize::new(0),   err_fake_unique: AtomicUsize::new(0),
-            err_bomb_common: AtomicUsize::new(0),   err_bomb_unique: AtomicUsize::new(0),
-            err_massfiles_common: AtomicUsize::new(0), err_massfiles_unique: AtomicUsize::new(0),
-            err_crc_common: AtomicUsize::new(0), err_crc_unique: AtomicUsize::new(0),
-            encrypted_common: AtomicUsize::new(0), encrypted_unique: AtomicUsize::new(0),
-            suspicious_compression_common: AtomicUsize::new(0), suspicious_compression_unique: AtomicUsize::new(0),
+            ok_common: AtomicUsize::new(0),
+            ok_unique: AtomicUsize::new(0),
+            uncompressed_size_sum: AtomicU64::new(0),
+            ok_bytes_sum: AtomicU64::new(0),
+            err_header_common: AtomicUsize::new(0),
+            err_header_unique: AtomicUsize::new(0),
+            err_empty_common: AtomicUsize::new(0),
+            err_empty_unique: AtomicUsize::new(0),
+            err_fake_common: AtomicUsize::new(0),
+            err_fake_unique: AtomicUsize::new(0),
+            err_bomb_common: AtomicUsize::new(0),
+            err_bomb_unique: AtomicUsize::new(0),
+            err_massfiles_common: AtomicUsize::new(0),
+            err_massfiles_unique: AtomicUsize::new(0),
+            err_crc_common: AtomicUsize::new(0),
+            err_crc_unique: AtomicUsize::new(0),
+            encrypted_common: AtomicUsize::new(0),
+            encrypted_unique: AtomicUsize::new(0),
+            suspicious_compression_common: AtomicUsize::new(0),
+            suspicious_compression_unique: AtomicUsize::new(0),
             thread_activity: crate::thread_activity::ThreadActivityTracker::new(slot_count),
         }
     }
@@ -263,7 +289,11 @@ impl LiveStats {
 /// Wylicza liczbę slotów trackera zajętości (Wariant A) odpowiednią dla
 /// trybu I/O — patrz identyczna logika w `phase3::compute_activity_slots`.
 fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: usize) -> usize {
-    if io_mode == "CONCURRENT" { half_threads } else { actual_threads }
+    if io_mode == "CONCURRENT" {
+        half_threads
+    } else {
+        actual_threads
+    }
 }
 
 /// Buduje pełny, samodzielny blok live DLA JEDNEGO ŹRÓDŁA — prędkość MB/s,
@@ -271,54 +301,92 @@ fn compute_activity_slots(io_mode: &str, actual_threads: usize, half_threads: us
 /// (Nagłówek/Wydmuszka/Fałszywe/Bomba-rozmiar/Bomba-plikowa) każda wspólne/
 /// unikalne, dwie kategorie informacyjne (szyfrowane, podejrzana kompresja),
 /// opcjonalnie błędy CRC (deep scan), błędy I/O.
-fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant, deep_scan_enabled: bool) -> String {
+fn build_source_block(
+    label: &str,
+    stats: &LiveStats,
+    start_time: Instant,
+    deep_scan_enabled: bool,
+) -> String {
     let bytes = stats.processed_bytes.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed_mb = (bytes as f64 / 1_048_576.0) / elapsed;
 
     let top_ext = {
-        let map = stats.ext_weights.lock().unwrap();
+        let map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
-        sorted.into_iter().take(3).map(|(ext, w)| {
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
-            format!("{} ({})", e, format_bytes(*w))
-        }).collect::<Vec<_>>().join(", ")
+        sorted
+            .into_iter()
+            .take(3)
+            .map(|(ext, w)| {
+                let e = if ext == "brak" {
+                    "brak".to_string()
+                } else {
+                    format!(".{}", ext)
+                };
+                format!("{} ({})", e, format_bytes(*w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let display_ext = if top_ext.is_empty() { "Analiza danych...".to_string() } else { top_ext };
+    let display_ext = if top_ext.is_empty() {
+        "Analiza danych...".to_string()
+    } else {
+        top_ext
+    };
 
     let mut out = format!(
         "[{}]\nPrędkość: {:.2} MB/s\nTop format: {}\nZdrowe: {} wspólne / {} unikalne\nUszkodzony nagłówek: {} wspólne / {} unikalne\nWydmuszki: {} wspólne / {} unikalne\nFałszywe DNA: {} wspólne / {} unikalne\nBomba (rozmiar): {} wspólne / {} unikalne\nBomba (liczba plików): {} wspólne / {} unikalne\nZaszyfrowane: {} wspólne / {} unikalne\nPodejrzana kompresja: {} wspólne / {} unikalne",
-        label, speed_mb, display_ext,
-        stats.ok_common.load(Ordering::Relaxed), stats.ok_unique.load(Ordering::Relaxed),
-        stats.err_header_common.load(Ordering::Relaxed), stats.err_header_unique.load(Ordering::Relaxed),
-        stats.err_empty_common.load(Ordering::Relaxed), stats.err_empty_unique.load(Ordering::Relaxed),
-        stats.err_fake_common.load(Ordering::Relaxed), stats.err_fake_unique.load(Ordering::Relaxed),
-        stats.err_bomb_common.load(Ordering::Relaxed), stats.err_bomb_unique.load(Ordering::Relaxed),
-        stats.err_massfiles_common.load(Ordering::Relaxed), stats.err_massfiles_unique.load(Ordering::Relaxed),
-        stats.encrypted_common.load(Ordering::Relaxed), stats.encrypted_unique.load(Ordering::Relaxed),
-        stats.suspicious_compression_common.load(Ordering::Relaxed), stats.suspicious_compression_unique.load(Ordering::Relaxed),
+        label,
+        speed_mb,
+        display_ext,
+        stats.ok_common.load(Ordering::Relaxed),
+        stats.ok_unique.load(Ordering::Relaxed),
+        stats.err_header_common.load(Ordering::Relaxed),
+        stats.err_header_unique.load(Ordering::Relaxed),
+        stats.err_empty_common.load(Ordering::Relaxed),
+        stats.err_empty_unique.load(Ordering::Relaxed),
+        stats.err_fake_common.load(Ordering::Relaxed),
+        stats.err_fake_unique.load(Ordering::Relaxed),
+        stats.err_bomb_common.load(Ordering::Relaxed),
+        stats.err_bomb_unique.load(Ordering::Relaxed),
+        stats.err_massfiles_common.load(Ordering::Relaxed),
+        stats.err_massfiles_unique.load(Ordering::Relaxed),
+        stats.encrypted_common.load(Ordering::Relaxed),
+        stats.encrypted_unique.load(Ordering::Relaxed),
+        stats.suspicious_compression_common.load(Ordering::Relaxed),
+        stats.suspicious_compression_unique.load(Ordering::Relaxed),
     );
 
     if deep_scan_enabled {
         out.push_str(&format!(
             "\nBłędy CRC32 (próbka): {} wspólne / {} unikalne",
-            stats.err_crc_common.load(Ordering::Relaxed), stats.err_crc_unique.load(Ordering::Relaxed)
+            stats.err_crc_common.load(Ordering::Relaxed),
+            stats.err_crc_unique.load(Ordering::Relaxed)
         ));
     }
 
     let uncompressed_sum = stats.uncompressed_size_sum.load(Ordering::Relaxed);
     let ok_bytes_sum = stats.ok_bytes_sum.load(Ordering::Relaxed);
-    let avg_ratio = if ok_bytes_sum > 0 { uncompressed_sum as f64 / ok_bytes_sum as f64 } else { 0.0 };
+    let avg_ratio = if ok_bytes_sum > 0 {
+        uncompressed_sum as f64 / ok_bytes_sum as f64
+    } else {
+        0.0
+    };
     out.push_str(&format!(
         "\nRozmiar po rozpakowaniu (zdrowe): {}\nŚr. współczynnik kompresji (zdrowe): {:.1}x",
-        format_bytes(uncompressed_sum), avg_ratio
+        format_bytes(uncompressed_sum),
+        avg_ratio
     ));
 
-    let activity_markup = crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
+    let activity_markup =
+        crate::thread_activity::format_activity_markup(&stats.thread_activity.snapshot());
     out.push_str(&format!("\nWątki analizy (Wariant A): {}", activity_markup));
 
-    out.push_str(&format!("\nBłędy I/O: {}", stats.errors.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "\nBłędy I/O: {}",
+        stats.errors.load(Ordering::Relaxed)
+    ));
     out
 }
 
@@ -327,18 +395,33 @@ fn build_source_block(label: &str, stats: &LiveStats, start_time: Instant, deep_
 /// Budowana WYŁĄCZNIE po zakończeniu skanowania z zapytania SQL do całej tabeli.
 type ExtMap = HashMap<String, Vec<String>>;
 
-struct SourceAnomalies { ufs: ExtMap, script: ExtMap }
-impl SourceAnomalies { fn new() -> Self { Self { ufs: HashMap::new(), script: HashMap::new() } } }
+struct SourceAnomalies {
+    ufs: ExtMap,
+    script: ExtMap,
+}
+impl SourceAnomalies {
+    fn new() -> Self {
+        Self {
+            ufs: HashMap::new(),
+            script: HashMap::new(),
+        }
+    }
+}
 
 struct AnomalyCategory {
     name: &'static str,
     icon: &'static str,
-    common: SourceAnomalies, 
+    common: SourceAnomalies,
     unique: SourceAnomalies,
 }
 impl AnomalyCategory {
     fn new(name: &'static str, icon: &'static str) -> Self {
-        Self { name, icon, common: SourceAnomalies::new(), unique: SourceAnomalies::new() }
+        Self {
+            name,
+            icon,
+            common: SourceAnomalies::new(),
+            unique: SourceAnomalies::new(),
+        }
     }
 }
 
@@ -380,35 +463,53 @@ impl AnomalyCategory {
 /// dało się ją osłonić `catch_unwind` w miejscu wywołania (patrz N1 z
 /// `todo.faza11.md`). Nie zwraca `Result` — jedyny błąd tej gałęzi
 /// (`File::open`) jest obsługiwany wcześniej, w `analyze_archive`.
-fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bool) -> ArchiveAnalysis {
+fn analyze_zip_entries(
+    file: &mut File,
+    ext: &str,
+    file_size: u64,
+    deep_scan: bool,
+) -> ArchiveAnalysis {
     let mut archive = match ZipArchive::new(file) {
         Ok(a) => a,
-        Err(_) => return ArchiveAnalysis {
-            is_valid: false, reason: Some("Brak EOCD / Ucięta Struktura".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
-        },
+        Err(_) => {
+            return ArchiveAnalysis {
+                is_valid: false,
+                reason: Some("Brak EOCD / Ucięta Struktura".into()),
+                internal_files_count: 0,
+                uncompressed_size: 0,
+                has_encrypted_entries: false,
+                has_suspicious_compression: false,
+            };
+        }
     };
 
     if archive.is_empty() {
         return ArchiveAnalysis {
-            is_valid: false, reason: Some("Wydmuszka (0 plików wewnątrz)".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some("Wydmuszka (0 plików wewnątrz)".into()),
+            internal_files_count: 0,
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         };
     }
 
     if archive.len() > MASS_FILES_THRESHOLD {
         return ArchiveAnalysis {
-            is_valid: false, reason: Some(format!("Bomba plikowa (>{} wpisów)", MASS_FILES_THRESHOLD)),
-            internal_files_count: archive.len(), uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some(format!("Bomba plikowa (>{} wpisów)", MASS_FILES_THRESHOLD)),
+            internal_files_count: archive.len(),
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         };
     }
 
     let mut uncompressed_total: u64 = 0;
-    let mut has_word = false; let mut has_xl = false;
-    let mut has_manifest = false; let mut has_meta = false;
+    let mut has_word = false;
+    let mut has_xl = false;
+    let mut has_manifest = false;
+    let mut has_meta = false;
     let mut has_encrypted = false;
 
     // UWAGA BEZPIECZEŃSTWA (naprawiony bug zip-bomby): poprzednio suma
@@ -424,14 +525,24 @@ fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bo
     for i in 0..archive.len() {
         if let Ok(inner_file) = archive.by_index(i) {
             uncompressed_total = uncompressed_total.saturating_add(inner_file.size());
-            if inner_file.encrypted() { has_encrypted = true; }
+            if inner_file.encrypted() {
+                has_encrypted = true;
+            }
 
             if let Some(name) = inner_file.enclosed_name() {
                 let name_str = name.to_string_lossy().to_lowercase();
-                if name_str.starts_with("word/") { has_word = true; }
-                if name_str.starts_with("xl/") { has_xl = true; }
-                if name_str.contains("androidmanifest.xml") || name_str.contains("classes.dex") { has_manifest = true; }
-                if name_str.contains("meta-inf/") || name_str.contains("mimetype") { has_meta = true; }
+                if name_str.starts_with("word/") {
+                    has_word = true;
+                }
+                if name_str.starts_with("xl/") {
+                    has_xl = true;
+                }
+                if name_str.contains("androidmanifest.xml") || name_str.contains("classes.dex") {
+                    has_manifest = true;
+                }
+                if name_str.contains("meta-inf/") || name_str.contains("mimetype") {
+                    has_meta = true;
+                }
             }
         }
     }
@@ -440,25 +551,39 @@ fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bo
     // `.docm`/`.xlsm` dzielą DNA (folder word/xl) ze swoimi odpowiednikami
     // bez makr — to ten sam kontener OOXML, jedyna różnica to obecność
     // dodatkowego strumienia VBA.
-    if (ext == "docx" || ext == "docm") && !has_word { is_fake = true; }
-    if (ext == "xlsx" || ext == "xlsm") && !has_xl { is_fake = true; }
-    if ext == "apk" && !has_manifest { is_fake = true; }
-    if ext == "epub" && !has_meta { is_fake = true; }
+    if (ext == "docx" || ext == "docm") && !has_word {
+        is_fake = true;
+    }
+    if (ext == "xlsx" || ext == "xlsm") && !has_xl {
+        is_fake = true;
+    }
+    if ext == "apk" && !has_manifest {
+        is_fake = true;
+    }
+    if ext == "epub" && !has_meta {
+        is_fake = true;
+    }
 
     if is_fake {
         return ArchiveAnalysis {
-            is_valid: false, reason: Some(format!("Fałszywe rozszerzenie (Brak DNA .{})", ext)),
-            internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
-            has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some(format!("Fałszywe rozszerzenie (Brak DNA .{})", ext)),
+            internal_files_count: archive.len(),
+            uncompressed_size: uncompressed_total,
+            has_encrypted_entries: has_encrypted,
+            has_suspicious_compression: false,
         };
     }
 
     let verdict = classify_compression_ratio(file_size, uncompressed_total);
     if verdict == CompressionVerdict::Bomb {
         return ArchiveAnalysis {
-            is_valid: false, reason: Some("Zip Bomb (Anomalia Kompresji)".into()),
-            internal_files_count: archive.len(), uncompressed_size: uncompressed_total,
-            has_encrypted_entries: has_encrypted, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some("Zip Bomb (Anomalia Kompresji)".into()),
+            internal_files_count: archive.len(),
+            uncompressed_size: uncompressed_total,
+            has_encrypted_entries: has_encrypted,
+            has_suspicious_compression: false,
         };
     }
     let has_suspicious_compression = verdict == CompressionVerdict::Suspicious;
@@ -482,9 +607,12 @@ fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bo
                 let mut sink = Vec::new();
                 if inner_file.read_to_end(&mut sink).is_err() {
                     return ArchiveAnalysis {
-                        is_valid: false, reason: Some("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)".into()),
-                        internal_files_count: total_entries, uncompressed_size: uncompressed_total,
-                        has_encrypted_entries: has_encrypted, has_suspicious_compression,
+                        is_valid: false,
+                        reason: Some("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)".into()),
+                        internal_files_count: total_entries,
+                        uncompressed_size: uncompressed_total,
+                        has_encrypted_entries: has_encrypted,
+                        has_suspicious_compression,
                     };
                 }
             }
@@ -492,15 +620,26 @@ fn analyze_zip_entries(file: &mut File, ext: &str, file_size: u64, deep_scan: bo
     }
 
     ArchiveAnalysis {
-        is_valid: true, reason: None,
-        internal_files_count: total_entries, uncompressed_size: uncompressed_total,
-        has_encrypted_entries: has_encrypted, has_suspicious_compression,
+        is_valid: true,
+        reason: None,
+        internal_files_count: total_entries,
+        uncompressed_size: uncompressed_total,
+        has_encrypted_entries: has_encrypted,
+        has_suspicious_compression,
     }
 }
 
-fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result::Result<ArchiveAnalysis, std::io::Error> {
+fn analyze_archive(
+    path: &Path,
+    file_size: u64,
+    deep_scan: bool,
+) -> std::result::Result<ArchiveAnalysis, std::io::Error> {
     let mut file = File::open(path)?;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     if ZIP_DERIVATIVES.contains(&ext.as_str()) {
         // REGRESJA (measure twice — druga weryfikacja Gemini, N1): crate `zip`
@@ -519,9 +658,15 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
             analyze_zip_entries(&mut file, &ext_ref, file_size, deep_scan)
         }));
         return Ok(wynik.unwrap_or_else(|_| ArchiveAnalysis {
-            is_valid: false, reason: Some("Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some(
+                "Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)"
+                    .into(),
+            ),
+            internal_files_count: 0,
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         }));
     }
 
@@ -547,21 +692,28 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
                 // Tar nie kompresuje, więc suma rozmiarów wpisów to realny
                 // rozmiar treści — sensowniejszy niż rozmiar pliku, bo pomija
                 // narzut nagłówków i wyrównania do bloków.
-                let rozmiar_tresci = analiza.entries.iter()
+                let rozmiar_tresci = analiza
+                    .entries
+                    .iter()
                     .fold(0u64, |acc, e| acc.saturating_add(e.size));
 
                 if wpisy > MASS_FILES_THRESHOLD {
                     ArchiveAnalysis {
                         is_valid: false,
                         reason: Some(format!("Bomba plikowa (>{} wpisów)", MASS_FILES_THRESHOLD)),
-                        internal_files_count: wpisy, uncompressed_size: rozmiar_tresci,
-                        has_encrypted_entries: false, has_suspicious_compression: false,
+                        internal_files_count: wpisy,
+                        uncompressed_size: rozmiar_tresci,
+                        has_encrypted_entries: false,
+                        has_suspicious_compression: false,
                     }
                 } else if analiza.is_healthy() {
                     ArchiveAnalysis {
-                        is_valid: true, reason: None,
-                        internal_files_count: wpisy, uncompressed_size: rozmiar_tresci,
-                        has_encrypted_entries: false, has_suspicious_compression: false,
+                        is_valid: true,
+                        reason: None,
+                        internal_files_count: wpisy,
+                        uncompressed_size: rozmiar_tresci,
+                        has_encrypted_entries: false,
+                        has_suspicious_compression: false,
                     }
                 } else {
                     // `describe()` wylicza KONKRETNE objawy (ile nagłówków ze
@@ -575,7 +727,9 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
                     let opis = if wpisy > 0 {
                         format!(
                             "{} (poprawnych nagłówków: {} z {})",
-                            analiza.describe(), analiza.valid_headers(), wpisy
+                            analiza.describe(),
+                            analiza.valid_headers(),
+                            wpisy
                         )
                     } else {
                         // Zero wpisów — sufiks "0 z 0" nic nie wnosi.
@@ -583,17 +737,23 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
                     };
 
                     ArchiveAnalysis {
-                        is_valid: false, reason: Some(opis),
-                        internal_files_count: wpisy, uncompressed_size: rozmiar_tresci,
-                        has_encrypted_entries: false, has_suspicious_compression: false,
+                        is_valid: false,
+                        reason: Some(opis),
+                        internal_files_count: wpisy,
+                        uncompressed_size: rozmiar_tresci,
+                        has_encrypted_entries: false,
+                        has_suspicious_compression: false,
                     }
                 }
             }
             // `None` = plik krótszy niż jeden blok 512 B.
             None => ArchiveAnalysis {
-                is_valid: false, reason: Some("Zbyt mały plik (Brak nagłówka)".into()),
-                internal_files_count: 0, uncompressed_size: 0,
-                has_encrypted_entries: false, has_suspicious_compression: false,
+                is_valid: false,
+                reason: Some("Zbyt mały plik (Brak nagłówka)".into()),
+                internal_files_count: 0,
+                uncompressed_size: 0,
+                has_encrypted_entries: false,
+                has_suspicious_compression: false,
             },
         });
     }
@@ -603,9 +763,12 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
     let n = file.read(&mut header)?;
     if n < 4 {
         return Ok(ArchiveAnalysis {
-            is_valid: false, reason: Some("Zbyt mały plik (Brak nagłówka)".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some("Zbyt mały plik (Brak nagłówka)".into()),
+            internal_files_count: 0,
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         });
     }
 
@@ -625,27 +788,40 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
 
     let is_valid_magic = match effective_ext {
         "rar" => header.starts_with(&[0x52, 0x61, 0x72, 0x21]),
-        "7z"  => header.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]),
-        "gz"  => header.starts_with(&[0x1F, 0x8B]),
+        "7z" => header.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]),
+        "gz" => header.starts_with(&[0x1F, 0x8B]),
         "bz2" => header.starts_with(&[0x42, 0x5A, 0x68]),
-        "xz"  => header.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
+        "xz" => header.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
         // Zstandard: magic number standardowy dla formatu ramki (RFC 8478).
         "zst" => header.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
-        "tar" => { if n >= 262 { &header[257..262] == b"ustar" } else { false } },
+        "tar" => {
+            if n >= 262 {
+                &header[257..262] == b"ustar"
+            } else {
+                false
+            }
+        }
         _ => true,
     };
 
     if !is_valid_magic {
         return Ok(ArchiveAnalysis {
-            is_valid: false, reason: Some("Złe Magic Bytes (Uszkodzony nagłówek)".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some("Złe Magic Bytes (Uszkodzony nagłówek)".into()),
+            internal_files_count: 0,
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         });
     }
 
     Ok(ArchiveAnalysis {
-        is_valid: true, reason: None, internal_files_count: 1, uncompressed_size: file_size,
-        has_encrypted_entries: false, has_suspicious_compression: false,
+        is_valid: true,
+        reason: None,
+        internal_files_count: 1,
+        uncompressed_size: file_size,
+        has_encrypted_entries: false,
+        has_suspicious_compression: false,
     })
 }
 
@@ -656,17 +832,26 @@ fn analyze_archive(path: &Path, file_size: u64, deep_scan: bool) -> std::result:
 /// jaką od początku miał raport końcowy w [`run`], teraz ujednolicona z
 /// panelem live (patrz naprawiona luka w dokumentacji modułu).
 fn classify_hard_reason(reason: &str) -> &'static str {
-    if reason.contains("Brak EOCD") || reason.contains("Złe Magic") { "header" }
+    if reason.contains("Brak EOCD") || reason.contains("Złe Magic") {
+        "header"
+    }
     // "Nie znaleziono żadnych wpisów tar" (z `tar_archive::describe`) to ten
     // sam objaw co "Wydmuszka" przy ZIP-ie: plik jest archiwum tylko z nazwy,
     // nie ma w nim ani jednego czytelnego wpisu. Bez tego wpadałby w gałąź
     // domyślną jako "Nagłówek" i mieszał się z realnym uszkodzeniem nagłówków.
-    else if reason.contains("Wydmuszka") || reason.contains("Nie znaleziono żadnych wpisów") { "empty" }
-    else if reason.contains("Fałszywe") { "fake" }
-    else if reason.contains("Bomba plikowa") { "massfiles" }
-    else if reason.contains("Zip Bomb") { "bomb" }
-    else if reason.contains("CRC32") { "crc" }
-    else { "header" }
+    else if reason.contains("Wydmuszka") || reason.contains("Nie znaleziono żadnych wpisów") {
+        "empty"
+    } else if reason.contains("Fałszywe") {
+        "fake"
+    } else if reason.contains("Bomba plikowa") {
+        "massfiles"
+    } else if reason.contains("Zip Bomb") {
+        "bomb"
+    } else if reason.contains("CRC32") {
+        "crc"
+    } else {
+        "header"
+    }
 }
 
 /// Skanuje wszystkie zadania (`tasks`) dla JEDNEJ strony: dla każdego archiwum
@@ -693,7 +878,20 @@ pub struct StreamCtx<'a> {
 #[instrument(skip(ctx), fields(base_path = %ctx.base_path.display()))]
 
 fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
-    let StreamCtx { base_path, tasks, side_label, stats, tx_db, is_ufs, start_time, deep_scan, tx_ui, bar_idx, opr_log, info_log } = ctx;
+    let StreamCtx {
+        base_path,
+        tasks,
+        side_label,
+        stats,
+        tx_db,
+        is_ufs,
+        start_time,
+        deep_scan,
+        tx_ui,
+        bar_idx,
+        opr_log,
+        info_log,
+    } = ctx;
 
     tasks.par_chunks(CHUNK_SIZE).for_each_with(tx_db, |tx_db, chunk| {
         if CANCEL_SIGNAL.load(Ordering::Relaxed) { return; }
@@ -777,7 +975,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
                 last_ui_update = now; 
 
                 if !local_ext_weights.is_empty() {
-                    let mut global_map = stats.ext_weights.lock().unwrap();
+                    let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
                 }
 
@@ -802,7 +1000,7 @@ fn process_side_stream<'a>(ctx: StreamCtx<'a>) {
         }
 
         if !local_ext_weights.is_empty() {
-            let mut global_map = stats.ext_weights.lock().unwrap();
+            let mut global_map = stats.ext_weights.lock().unwrap_or_else(|e| e.into_inner());
             for (k, v) in local_ext_weights.drain() { *global_map.entry(k).or_insert(0) += v; }
         }
 
@@ -838,16 +1036,36 @@ fn compute_half_threads(total_threads: usize) -> usize {
 /// weryfikacji CRC32; (3) koreluje wyniki w SQLite; (4) buduje hierarchiczny
 /// Dziennik Końcowy z pięciu kategorii "twardych" błędów, każda rozbita
 /// wspólne/unikalne i UFS/Skrypt, z przykładowymi ścieżkami per rozszerzenie.
-pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<PhaseEvent>) -> Result<()> {
+pub fn run(
+    conn: &mut Connection,
+    config: &Ustawienia,
+    tx_ui: mpsc::Sender<PhaseEvent>,
+) -> Result<()> {
     CANCEL_SIGNAL.store(false, Ordering::SeqCst);
 
-    let actual_threads = if config.max_threads > 0 { config.max_threads } else { rayon::current_num_threads() };
-    let io_text = if config.io_mode == "CONCURRENT" { "RÓWNOLEGŁE (SSD/NVMe)" } else { "SEKWENCYJNIE (HDD)" };
-    
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Uruchomiono Fazę 11. Metodyka szyny dyskowej: {}", io_text)));
-    let _ = tx_ui.send(PhaseEvent::Log(format!("Aktywne wątki procesora (Rayon): {}", actual_threads)));
+    let actual_threads = if config.max_threads > 0 {
+        config.max_threads
+    } else {
+        rayon::current_num_threads()
+    };
+    let io_text = if config.io_mode == "CONCURRENT" {
+        "RÓWNOLEGŁE (SSD/NVMe)"
+    } else {
+        "SEKWENCYJNIE (HDD)"
+    };
+
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Uruchomiono Fazę 11. Metodyka szyny dyskowej: {}",
+        io_text
+    )));
+    let _ = tx_ui.send(PhaseEvent::Log(format!(
+        "Aktywne wątki procesora (Rayon): {}",
+        actual_threads
+    )));
     if config.deep_archive_scan {
-        let _ = tx_ui.send(PhaseEvent::Log("Głęboka weryfikacja CRC32 (próbka 3 wpisów/archiwum): WŁĄCZONA".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "Głęboka weryfikacja CRC32 (próbka 3 wpisów/archiwum): WŁĄCZONA".to_string(),
+        ));
     }
 
     let start_time = Instant::now();
@@ -855,28 +1073,54 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // ZAPIS WYNIKÓW ANALIZY KONTENERÓW DO BAZY DANYCH
     let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_reason_ufs TEXT", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_reason_script TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_reason_script TEXT",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_files_ufs INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_size_ufs INTEGER", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_files_script INTEGER", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_size_script INTEGER", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_encrypted_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_encrypted_script BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_suspicious_compression_ufs BOOLEAN", []);
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN archive_suspicious_compression_script BOOLEAN", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_files_script INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_size_script INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_encrypted_ufs BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_encrypted_script BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_suspicious_compression_ufs BOOLEAN",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN archive_suspicious_compression_script BOOLEAN",
+        [],
+    );
 
     // INICJALIZACJA DUAL-LOGGING (Pobieranie ścieżek z Ustawień)
-    let raport_cfg = config.raporty_faz.get("Faza 11").cloned().unwrap_or_else(|| crate::settings::RaportFazy {
-        katalog: config.log_path.clone(),
-        plik_operacyjny: "raport_operacyjny_faza11.txt".to_string(),
-        plik_dziennika: "dziennik_koncowy_faza11.txt".to_string(),
-    });
-    
+    let raport_cfg = config
+        .raporty_faz
+        .get("Faza 11")
+        .cloned()
+        .unwrap_or_else(|| crate::settings::RaportFazy {
+            katalog: config.log_path.clone(),
+            plik_operacyjny: "raport_operacyjny_faza11.txt".to_string(),
+            plik_dziennika: "dziennik_koncowy_faza11.txt".to_string(),
+        });
+
     fs::create_dir_all(&raport_cfg.katalog).unwrap_or_default();
     let opr_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_operacyjny);
     let dz_path = Path::new(&raport_cfg.katalog).join(&raport_cfg.plik_dziennika);
-    
-    let info_path = Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza11_zdrowe_archiwa.txt");
+
+    let info_path =
+        Path::new(&raport_cfg.katalog).join("raport_operacyjny_faza11_zdrowe_archiwa.txt");
 
     // REGRESJA (todo.faza02.md, ta sama klasa błędu we wszystkich fazach):
     // `.unwrap()` panikował, gdyby katalog logów stał się niezapisywalny
@@ -885,22 +1129,50 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let log_anom_file = match File::create(&opr_path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx_ui.send(PhaseEvent::Log(format!("BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.", e)));
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku logu operacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
             return Ok(());
         }
     };
     let log_anom = Arc::new(Mutex::new(log_anom_file));
-    let log_info = Arc::new(Mutex::new(File::create(&info_path).unwrap()));
-    
+    let log_info = match File::create(&info_path) {
+        Ok(f) => Arc::new(Mutex::new(f)),
+        Err(e) => {
+            let _ = tx_ui.send(PhaseEvent::Log(format!(
+                "BŁĄD I/O: Nie można utworzyć pliku informacyjnego: {}. Sprawdź uprawnienia.",
+                e
+            )));
+            return Ok(());
+        }
+    };
+
     {
-        let mut f_anom = log_anom.lock().unwrap();
-        let _ = writeln!(f_anom, "=== RAPORT OPERACYJNY - FAZA 11 (ZEPSUTE ARCHIWA) ===");
-        let _ = writeln!(f_anom, "Zestawienie plików pakowanych ze zniszczoną strukturą EOCD/Magic Bytes, fałszywym DNA, bombą (rozmiarową lub plikową){}.\n",
-            if config.deep_archive_scan { " lub błędem CRC32 w próbce" } else { "" });
-        
-        let mut f_info = log_info.lock().unwrap();
-        let _ = writeln!(f_info, "=== RAPORT OPERACYJNY - FAZA 11 (ZDROWE ARCHIWA) ===");
-        let _ = writeln!(f_info, "Statystyki poprawnych plików pakowanych (Ilość wewnętrznych rekordów, Deklarowana waga po wypakowaniu).\n");
+        let mut f_anom = log_anom.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_anom,
+            "=== RAPORT OPERACYJNY - FAZA 11 (ZEPSUTE ARCHIWA) ==="
+        );
+        let _ = writeln!(
+            f_anom,
+            "Zestawienie plików pakowanych ze zniszczoną strukturą EOCD/Magic Bytes, fałszywym DNA, bombą (rozmiarową lub plikową){}.\n",
+            if config.deep_archive_scan {
+                " lub błędem CRC32 w próbce"
+            } else {
+                ""
+            }
+        );
+
+        let mut f_info = log_info.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            f_info,
+            "=== RAPORT OPERACYJNY - FAZA 11 (ZDROWE ARCHIWA) ==="
+        );
+        let _ = writeln!(
+            f_info,
+            "Statystyki poprawnych plików pakowanych (Ilość wewnętrznych rekordów, Deklarowana waga po wypakowaniu).\n"
+        );
     }
 
     // --- ETAP 1: POBIERANIE ZADAŃ Z BAZY ---
@@ -908,51 +1180,114 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         "SELECT id, relative_path, found_in_ufs, found_in_script, structure_ok_ufs, structure_ok_script, io_error_ufs, io_error_script 
          FROM files WHERE phase11_done = 0 OR phase11_done IS NULL"
     )?;
-    
+
     let mut ufs_tasks = Vec::new();
     let mut script_tasks = Vec::new();
+    let mut non_archive_ids = Vec::new(); // 🟢 NOWOŚĆ: Kolejka plików zignorowanych (np. MP4, JPG)
     let mut skipped_ufs = 0;
     let mut skipped_script = 0;
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?,
-            row.get::<_, Option<bool>>(4)?, row.get::<_, Option<bool>>(5)?,
-            row.get::<_, Option<bool>>(6)?, row.get::<_, Option<bool>>(7)?
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<bool>>(5)?,
+            row.get::<_, Option<bool>>(6)?,
+            row.get::<_, Option<bool>>(7)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (id, rel, in_ufs, in_script, ok_ufs, ok_scr, err_ufs, err_scr) = r;
-        
+
         if is_archive_extension(&rel) {
             let is_common = in_ufs && in_script;
             if in_ufs {
-                if ok_ufs.is_none() && err_ufs != Some(true) { ufs_tasks.push(Task { id, rel_path: rel.clone(), is_common }); } 
-                else { skipped_ufs += 1; }
+                if ok_ufs.is_none() && err_ufs != Some(true) {
+                    ufs_tasks.push(Task {
+                        id,
+                        rel_path: rel.clone(),
+                        is_common,
+                    });
+                } else {
+                    skipped_ufs += 1;
+                }
             }
             if in_script {
-                if ok_scr.is_none() && err_scr != Some(true) { script_tasks.push(Task { id, rel_path: rel, is_common }); } 
-                else { skipped_script += 1; }
+                if ok_scr.is_none() && err_scr != Some(true) {
+                    script_tasks.push(Task {
+                        id,
+                        rel_path: rel,
+                        is_common,
+                    });
+                } else {
+                    skipped_script += 1;
+                }
             }
+        } else {
+            // 🟢 Plik nie jest archiwum - oznaczamy do natychmiastowego zwolnienia z kolejki
+            non_archive_ids.push(id);
         }
     }
     drop(stmt);
 
+    // 🟢 Natychmiastowe zwalnianie plików nie-archiwalnych z radaru bazy danych
+    if !non_archive_ids.is_empty() {
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Zwalnianie {} plików innych typów z radaru kolejki...",
+            non_archive_ids.len()
+        )));
+        let tx_trans = conn.transaction()?;
+        // SQLite pozwala na max 999 parametrów w klauzuli IN (?), więc dzielimy na małe paczki
+        for chunk in non_archive_ids.chunks(900) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let query = format!(
+                "UPDATE files SET phase11_done = 1 WHERE id IN ({})",
+                placeholders
+            );
+            tx_trans.execute(&query, rusqlite::params_from_iter(chunk))?;
+        }
+        tx_trans.commit()?;
+    }
+
     if skipped_ufs > 0 || skipped_script > 0 {
-        let _ = tx_ui.send(PhaseEvent::Log(format!("Pominięto archiwa z wyliczoną już strukturą. UFS: {}, Skrypt: {}", skipped_ufs, skipped_script)));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "Pominięto archiwa z wyliczoną już strukturą. UFS: {}, Skrypt: {}",
+            skipped_ufs, skipped_script
+        )));
     }
 
     let total_db_rows = ufs_tasks.len() + script_tasks.len();
     if total_db_rows == 0 {
-        let _ = tx_ui.send(PhaseEvent::Log("✔ Brak archiwów do walidacji. Baza aktualna.".to_string()));
-        return Ok(());
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "✔ Walidacja archiwów jest kompletna. Zamykam status fazy...".to_string(),
+        ));
+        // 🟢 UWAGA: Usunięto `return Ok(());`. Skrypt przejdzie do Etapu 4
+        // i odznaczy osierocone archiwa w bazie, uwalniając radary!
     }
 
     // Inicjalizacja pasków postępu Ratatui
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 0, label: "UFS Explorer (Archiwa)".to_string(), total: ufs_tasks.len() as u64, color: Color::Cyan });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 1, label: "Skrypt Autorski (Archiwa)".to_string(), total: script_tasks.len() as u64, color: Color::Magenta });
-    let _ = tx_ui.send(PhaseEvent::SetBar { idx: 2, label: "Zapis SQLite".to_string(), total: total_db_rows as u64, color: Color::Green });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 0,
+        label: "UFS Explorer (Archiwa)".to_string(),
+        total: ufs_tasks.len() as u64,
+        color: Color::Cyan,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 1,
+        label: "Skrypt Autorski (Archiwa)".to_string(),
+        total: script_tasks.len() as u64,
+        color: Color::Magenta,
+    });
+    let _ = tx_ui.send(PhaseEvent::SetBar {
+        idx: 2,
+        label: "Zapis SQLite".to_string(),
+        total: total_db_rows as u64,
+        color: Color::Green,
+    });
 
     let half_threads = compute_half_threads(actual_threads);
     let activity_slots = compute_activity_slots(&config.io_mode, actual_threads, half_threads);
@@ -1030,9 +1365,12 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
         });
 
         if config.io_mode == "CONCURRENT" {
-            let tx1 = tx_db.clone(); let tx2 = tx_db.clone();
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
+            let tx1 = tx_db.clone();
+            let tx2 = tx_db.clone();
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
 
             let stat_u = &ufs_stats;
             let stat_s = &script_stats;
@@ -1041,42 +1379,136 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             // strona, minimum 1 wątek. Wyliczone wcześniej, tu tylko używane.
 
             s.spawn(move || {
-                if !ufs_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !ufs_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, });
+                            process_side_stream(StreamCtx {
+                                base_path: &ufs_base,
+                                tasks: &ufs_tasks,
+                                side_label: "UFS Explorer",
+                                stats: stat_u,
+                                tx_db: tx1,
+                                is_ufs: true,
+                                start_time,
+                                deep_scan,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 0,
+                                opr_log: anom_u,
+                                info_log: info_u,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: stat_u, tx_db: tx1, is_ufs: true, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, });
+                        process_side_stream(StreamCtx {
+                            base_path: &ufs_base,
+                            tasks: &ufs_tasks,
+                            side_label: "UFS Explorer",
+                            stats: stat_u,
+                            tx_db: tx1,
+                            is_ufs: true,
+                            start_time,
+                            deep_scan,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 0,
+                            opr_log: anom_u,
+                            info_log: info_u,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja struktury (UFS) zakończona.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Walidacja struktury (UFS) zakończona.".to_string(),
+                    ));
                 }
             });
 
             s.spawn(move || {
-                if !script_tasks.is_empty() { 
-                    if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(half_threads).build() {
+                if !script_tasks.is_empty() {
+                    if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                        .num_threads(half_threads)
+                        .build()
+                    {
                         pool.install(|| {
-                            process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, });
+                            process_side_stream(StreamCtx {
+                                base_path: &script_base,
+                                tasks: &script_tasks,
+                                side_label: "Skrypt Autorski",
+                                stats: stat_s,
+                                tx_db: tx2,
+                                is_ufs: false,
+                                start_time,
+                                deep_scan,
+                                tx_ui: tx_ui_ref,
+                                bar_idx: 1,
+                                opr_log: anom_s,
+                                info_log: info_s,
+                            });
                         });
                     } else {
-                        process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: stat_s, tx_db: tx2, is_ufs: false, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, });
+                        process_side_stream(StreamCtx {
+                            base_path: &script_base,
+                            tasks: &script_tasks,
+                            side_label: "Skrypt Autorski",
+                            stats: stat_s,
+                            tx_db: tx2,
+                            is_ufs: false,
+                            start_time,
+                            deep_scan,
+                            tx_ui: tx_ui_ref,
+                            bar_idx: 1,
+                            opr_log: anom_s,
+                            info_log: info_s,
+                        });
                     }
-                    let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja struktury (Skrypt) zakończona.".to_string())); 
+                    let _ = tx_ui_ref.send(PhaseEvent::Log(
+                        "✔ Walidacja struktury (Skrypt) zakończona.".to_string(),
+                    ));
                 }
             });
             drop(tx_db);
-        } 
-            else
-        {
-            let anom_u = log_anom.clone(); let anom_s = log_anom.clone();
-            let info_u = log_info.clone(); let info_s = log_info.clone();
-            
+        } else {
+            let anom_u = log_anom.clone();
+            let anom_s = log_anom.clone();
+            let info_u = log_info.clone();
+            let info_s = log_info.clone();
+
             if !ufs_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &ufs_base, tasks: &ufs_tasks, side_label: "UFS Explorer", stats: &ufs_stats, tx_db: tx_db.clone(), is_ufs: true, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 0, opr_log: anom_u, info_log: info_u, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja struktury (UFS) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &ufs_base,
+                    tasks: &ufs_tasks,
+                    side_label: "UFS Explorer",
+                    stats: &ufs_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: true,
+                    start_time,
+                    deep_scan,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 0,
+                    opr_log: anom_u,
+                    info_log: info_u,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Walidacja struktury (UFS) zakończona.".to_string(),
+                ));
             }
             if !script_tasks.is_empty() {
-                process_side_stream(StreamCtx { base_path: &script_base, tasks: &script_tasks, side_label: "Skrypt Autorski", stats: &script_stats, tx_db: tx_db.clone(), is_ufs: false, start_time, deep_scan, tx_ui: tx_ui_ref, bar_idx: 1, opr_log: anom_s, info_log: info_s, }); let _ = tx_ui_ref.send(PhaseEvent::Log("✔ Walidacja struktury (Skrypt) zakończona.".to_string()));
+                process_side_stream(StreamCtx {
+                    base_path: &script_base,
+                    tasks: &script_tasks,
+                    side_label: "Skrypt Autorski",
+                    stats: &script_stats,
+                    tx_db: tx_db.clone(),
+                    is_ufs: false,
+                    start_time,
+                    deep_scan,
+                    tx_ui: tx_ui_ref,
+                    bar_idx: 1,
+                    opr_log: anom_s,
+                    info_log: info_s,
+                });
+                let _ = tx_ui_ref.send(PhaseEvent::Log(
+                    "✔ Walidacja struktury (Skrypt) zakończona.".to_string(),
+                ));
             }
             drop(tx_db);
         }
@@ -1099,12 +1531,16 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     // --- ETAP 4: SYNCHRONIZACJA Z BAZĄ DANYCH ---
     if CANCEL_SIGNAL.load(Ordering::SeqCst) {
-        let _ = tx_ui.send(PhaseEvent::Log("🛑 Skanowanie przerwane przez użytkownika.".to_string()));
+        let _ = tx_ui.send(PhaseEvent::Log(
+            "🛑 Skanowanie przerwane przez użytkownika.".to_string(),
+        ));
         return Ok(());
     }
 
-    let _ = tx_ui.send(PhaseEvent::Log("Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string()));
-    
+    let _ = tx_ui.send(PhaseEvent::Log(
+        "Trwa generowanie hierarchicznego raportu kryminalistycznego...".to_string(),
+    ));
+
     conn.execute(
         "UPDATE files SET phase11_done = CASE 
             WHEN (found_in_ufs = 0 OR structure_ok_ufs IS NOT NULL OR io_error_ufs = 1) 
@@ -1117,10 +1553,11 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     let mut stmt = conn.prepare(
         "SELECT relative_path, found_in_ufs, found_in_script, 
                 structure_ok_ufs, structure_ok_script, archive_reason_ufs, archive_reason_script
-         FROM files WHERE phase11_done = 1"
+         FROM files WHERE phase11_done = 1",
     )?;
 
-    let mut cat_header = AnomalyCategory::new("Uszkodzony Nagłówek / Brak EOCD / Złe Magic Bytes", "✂️");
+    let mut cat_header =
+        AnomalyCategory::new("Uszkodzony Nagłówek / Brak EOCD / Złe Magic Bytes", "✂️");
     let mut cat_empty = AnomalyCategory::new("Wydmuszki (Puste archiwa 0 plików)", "🪹");
     let mut cat_fake = AnomalyCategory::new("Fałszywe Rozszerzenia (Brak spójności DNA)", "🧬");
     let mut cat_bomb = AnomalyCategory::new("Anomalia Kompresji (Zip Bomb / Zły Rozmiar)", "💣");
@@ -1129,20 +1566,36 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?,
-            row.get::<_, Option<bool>>(3)?, row.get::<_, Option<bool>>(4)?,
-            row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
     for r in rows.filter_map(|r| r.ok()) {
         let (rel_path, in_ufs, in_scr, u_ufs, u_scr, reason_ufs, reason_scr) = r;
         let is_common = in_ufs && in_scr;
-        let ext = Path::new(&rel_path).extension().and_then(|e| e.to_str()).unwrap_or("brak").to_lowercase();
+        let ext = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("brak")
+            .to_lowercase();
 
         let add_to_cat = |cat: &mut AnomalyCategory, is_ufs_source: bool| {
-            let target = if is_common { &mut cat.common } else { &mut cat.unique };
-            let map = if is_ufs_source { &mut target.ufs } else { &mut target.script };
+            let target = if is_common {
+                &mut cat.common
+            } else {
+                &mut cat.unique
+            };
+            let map = if is_ufs_source {
+                &mut target.ufs
+            } else {
+                &mut target.script
+            };
             map.entry(ext.clone()).or_default().push(rel_path.clone());
         };
 
@@ -1163,76 +1616,154 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
             }
         };
 
-        if in_ufs { process_reason(u_ufs, reason_ufs, true); }
-        if in_scr { process_reason(u_scr, reason_scr, false); }
+        if in_ufs {
+            process_reason(u_ufs, reason_ufs, true);
+        }
+        if in_scr {
+            process_reason(u_scr, reason_scr, false);
+        }
     }
     drop(stmt);
 
     let elapsed = start_time.elapsed();
-    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst) + script_stats.processed_bytes.load(Ordering::SeqCst);
+    let total_bytes = ufs_stats.processed_bytes.load(Ordering::SeqCst)
+        + script_stats.processed_bytes.load(Ordering::SeqCst);
     let avg_speed_mb = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64().max(1.0);
-    let total_io_errors = ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
-    let total_encrypted = ufs_stats.encrypted_common.load(Ordering::SeqCst) + ufs_stats.encrypted_unique.load(Ordering::SeqCst)
-        + script_stats.encrypted_common.load(Ordering::SeqCst) + script_stats.encrypted_unique.load(Ordering::SeqCst);
-    let total_suspicious = ufs_stats.suspicious_compression_common.load(Ordering::SeqCst) + ufs_stats.suspicious_compression_unique.load(Ordering::SeqCst)
-        + script_stats.suspicious_compression_common.load(Ordering::SeqCst) + script_stats.suspicious_compression_unique.load(Ordering::SeqCst);
+    let total_io_errors =
+        ufs_stats.errors.load(Ordering::SeqCst) + script_stats.errors.load(Ordering::SeqCst);
+    let total_encrypted = ufs_stats.encrypted_common.load(Ordering::SeqCst)
+        + ufs_stats.encrypted_unique.load(Ordering::SeqCst)
+        + script_stats.encrypted_common.load(Ordering::SeqCst)
+        + script_stats.encrypted_unique.load(Ordering::SeqCst);
+    let total_suspicious = ufs_stats
+        .suspicious_compression_common
+        .load(Ordering::SeqCst)
+        + ufs_stats
+            .suspicious_compression_unique
+            .load(Ordering::SeqCst)
+        + script_stats
+            .suspicious_compression_common
+            .load(Ordering::SeqCst)
+        + script_stats
+            .suspicious_compression_unique
+            .load(Ordering::SeqCst);
 
     // -- GENEROWANIE RAPORTU TEKSTOWEGO --
     let mut log_out = String::new();
     use std::fmt::Write as FmtWrite;
 
-    let _ = writeln!(&mut log_out, "==========================================================================");
-    let _ = writeln!(&mut log_out, "DZIENNIK KOŃCOWY - FAZA 11 (WALIDACJA STRUKTURY ARCHIWÓW)");
+    let _ = writeln!(
+        &mut log_out,
+        "=========================================================================="
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "DZIENNIK KOŃCOWY - FAZA 11 (WALIDACJA STRUKTURY ARCHIWÓW)"
+    );
     let _ = writeln!(&mut log_out, "Czas trwania: {:.2?}", elapsed);
-    let _ = writeln!(&mut log_out, "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)", format_bytes(total_bytes), avg_speed_mb);
-    let _ = writeln!(&mut log_out, "==========================================================================\n");
+    let _ = writeln!(
+        &mut log_out,
+        "Sumaryczny transfer I/O: {} (Średnia prędkość: {:.2} MB/s)",
+        format_bytes(total_bytes),
+        avg_speed_mb
+    );
+    let _ = writeln!(
+        &mut log_out,
+        "==========================================================================\n"
+    );
 
     if total_encrypted > 0 || total_suspicious > 0 {
         let _ = writeln!(&mut log_out, "[ INFORMACYJNE - NIE BŁĘDY ]");
         if total_encrypted > 0 {
-            let _ = writeln!(&mut log_out, "   🔐 Archiwa z zaszyfrowaną zawartością: {}", total_encrypted);
-            let _ = writeln!(&mut log_out, "      [ ZNACZENIE ]: Zaszyfrowane hasłem archiwum jest często całkowicie legalne - to nie jest uszkodzenie, tylko brak możliwości weryfikacji zawartości bez hasła.");
+            let _ = writeln!(
+                &mut log_out,
+                "   🔐 Archiwa z zaszyfrowaną zawartością: {}",
+                total_encrypted
+            );
+            let _ = writeln!(
+                &mut log_out,
+                "      [ ZNACZENIE ]: Zaszyfrowane hasłem archiwum jest często całkowicie legalne - to nie jest uszkodzenie, tylko brak możliwości weryfikacji zawartości bez hasła."
+            );
         }
         if total_suspicious > 0 {
-            let _ = writeln!(&mut log_out, "   ⚠️  Podejrzanie wysoka kompresja (poniżej progu Zip Bomb): {}", total_suspicious);
+            let _ = writeln!(
+                &mut log_out,
+                "   ⚠️  Podejrzanie wysoka kompresja (poniżej progu Zip Bomb): {}",
+                total_suspicious
+            );
         }
         let _ = writeln!(&mut log_out);
     }
 
     let write_section_txt = |out: &mut String, title: &str, is_common: bool| {
         let _ = writeln!(out, "[ KATEGORIA BŁĘDÓW: {} ]", title);
-        let categories = [&cat_header, &cat_empty, &cat_fake, &cat_bomb, &cat_massfiles, &cat_crc];
+        let categories = [
+            &cat_header,
+            &cat_empty,
+            &cat_fake,
+            &cat_bomb,
+            &cat_massfiles,
+            &cat_crc,
+        ];
         let mut has_any = false;
-        
+
         for cat in &categories {
             let src_anom = if is_common { &cat.common } else { &cat.unique };
             let ufs_total: usize = src_anom.ufs.values().map(|v| v.len()).sum();
             let scr_total: usize = src_anom.script.values().map(|v| v.len()).sum();
-            
+
             if ufs_total > 0 || scr_total > 0 {
                 has_any = true;
-                let _ = writeln!(out, "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})", cat.icon, cat.name, ufs_total, scr_total);
+                let _ = writeln!(
+                    out,
+                    "   {} Typ anomalii: {} (UFS: {}, Skrypt: {})",
+                    cat.icon, cat.name, ufs_total, scr_total
+                );
                 if cat.name.contains("Nagłówek") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Plik kompresji uległ ucięciu na poziomie struktury. W ZIP brakuje Centralnego Katalogu (EOCD). Odzyskanie plików z jego wnętrza jest niemożliwe.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Plik kompresji uległ ucięciu na poziomie struktury. W ZIP brakuje Centralnego Katalogu (EOCD). Odzyskanie plików z jego wnętrza jest niemożliwe."
+                    );
                 } else if cat.name.contains("DNA") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Wykryto fałszywe rozszerzenie (File Spoofing). Np. Carver rozpoznał dokument .docx, ale wewnątrz nie ma obowiązkowego folderu 'word/'.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Wykryto fałszywe rozszerzenie (File Spoofing). Np. Carver rozpoznał dokument .docx, ale wewnątrz nie ma obowiązkowego folderu 'word/'."
+                    );
                 } else if cat.name.contains("Wydmuszki") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Archiwum otwiera się poprawnie, ale w środku nie znajduje się ani jeden plik.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Archiwum otwiera się poprawnie, ale w środku nie znajduje się ani jeden plik."
+                    );
                 } else if cat.name.contains("Kompresji") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Anomalia matematyczna. Plik na dysku waży kilka KB, ale dekompresuje się do kilku Gigabajtów. Prawdopodobnie uszkodzony nagłówek kompresji Deflate.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Anomalia matematyczna. Plik na dysku waży kilka KB, ale dekompresuje się do kilku Gigabajtów. Prawdopodobnie uszkodzony nagłówek kompresji Deflate."
+                    );
                 } else if cat.name.contains("Bomba Plikowa") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Archiwum zawiera dziesiątki tysięcy wpisów niezależnie od rozmiaru - technika DoS znana jako '42.zip', kosztowna do przetworzenia po rozpakowaniu.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Archiwum zawiera dziesiątki tysięcy wpisów niezależnie od rozmiaru - technika DoS znana jako '42.zip', kosztowna do przetworzenia po rozpakowaniu."
+                    );
                 } else if cat.name.contains("CRC32") {
-                    let _ = writeln!(out, "      [ ZNACZENIE ]: Struktura ramy (EOCD, DNA) jest OK, ale próbka pierwszych wpisów nie przeszła weryfikacji sumy kontrolnej - realne uszkodzenie strumienia skompresowanego. Weryfikacja jest PRÓBKĄ (pierwsze do 3 wpisów), nie gwarancją integralności całego archiwum.");
+                    let _ = writeln!(
+                        out,
+                        "      [ ZNACZENIE ]: Struktura ramy (EOCD, DNA) jest OK, ale próbka pierwszych wpisów nie przeszła weryfikacji sumy kontrolnej - realne uszkodzenie strumienia skompresowanego. Weryfikacja jest PRÓBKĄ (pierwsze do 3 wpisów), nie gwarancją integralności całego archiwum."
+                    );
                 }
-                
+
                 let mut print_exts = |map: &ExtMap, label: &str| {
                     if !map.is_empty() {
                         let _ = writeln!(out, "      {} - Rozkład formatów:", label);
                         let mut sorted: Vec<_> = map.iter().collect();
                         sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
                         for (ext, paths) in sorted.into_iter().take(3) {
-                            let _ = writeln!(out, "         .{:<5} : {} plików (Przykł: {})", ext, paths.len(), paths[0]);
+                            let _ = writeln!(
+                                out,
+                                "         .{:<5} : {} plików (Przykł: {})",
+                                ext,
+                                paths.len(),
+                                paths[0]
+                            );
                         }
                     }
                 };
@@ -1247,32 +1778,67 @@ pub fn run(conn: &mut Connection, config: &Ustawienia, tx_ui: mpsc::Sender<Phase
     };
 
     write_section_txt(&mut log_out, "Część Wspólna (Oba źródła)", true);
-    write_section_txt(&mut log_out, "Osobne ścieżki (Unikalne dla jednego źródła)", false);
+    write_section_txt(
+        &mut log_out,
+        "Osobne ścieżki (Unikalne dla jednego źródła)",
+        false,
+    );
 
     let _ = writeln!(&mut log_out, "[ PODSUMOWANIE WAGOWE ARCHIWÓW ]");
     let print_all_exts = |out_str: &mut String, map: &HashMap<String, u64>, label: &str| {
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         let _ = writeln!(out_str, "   {}", label);
-        if sorted.is_empty() { let _ = writeln!(out_str, "      Brak plików."); }
-        for (ext, weight) in sorted.into_iter().take(5) { 
-            let e = if ext == "brak" { "brak".to_string() } else { format!(".{}", ext) };
+        if sorted.is_empty() {
+            let _ = writeln!(out_str, "      Brak plików.");
+        }
+        for (ext, weight) in sorted.into_iter().take(5) {
+            let e = if ext == "brak" {
+                "brak".to_string()
+            } else {
+                format!(".{}", ext)
+            };
             let _ = writeln!(out_str, "      - {:<8} : {}", e, format_bytes(*weight));
         }
     };
-    print_all_exts(&mut log_out, &ufs_stats.ext_weights.lock().unwrap(), "UFS Explorer");
-    print_all_exts(&mut log_out, &script_stats.ext_weights.lock().unwrap(), "Skrypt Autorski");
+    print_all_exts(
+        &mut log_out,
+        &ufs_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "UFS Explorer",
+    );
+    print_all_exts(
+        &mut log_out,
+        &script_stats
+            .ext_weights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        "Skrypt Autorski",
+    );
     let _ = writeln!(&mut log_out);
 
     if total_io_errors > 0 {
         let _ = writeln!(&mut log_out, "[ 🚨 BŁĘDY FIZYCZNE I/O ]");
-        let _ = writeln!(&mut log_out, "   -> Błędy odczytu (I/O): {}", total_io_errors);
+        let _ = writeln!(
+            &mut log_out,
+            "   -> Błędy odczytu (I/O): {}",
+            total_io_errors
+        );
     }
 
     if let Ok(mut f) = fs::File::create(&dz_path) {
         let _ = f.write_all(log_out.as_bytes());
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano fizyczny Dziennik Końcowy w: {}", dz_path.display())));
-        let _ = tx_ui.send(PhaseEvent::Log(format!("✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}", opr_path.display(), info_path.display())));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano fizyczny Dziennik Końcowy w: {}",
+            dz_path.display()
+        )));
+        let _ = tx_ui.send(PhaseEvent::Log(format!(
+            "✔ Zapisano Raporty Operacyjne (Live) w: {} oraz {}",
+            opr_path.display(),
+            info_path.display()
+        )));
     }
 
     for line in log_out.lines() {
@@ -1373,13 +1939,19 @@ mod tests {
 
     #[test]
     fn test_compression_normal_ratio() {
-        assert_eq!(classify_compression_ratio(1000, 2000), CompressionVerdict::Normal);
+        assert_eq!(
+            classify_compression_ratio(1000, 2000),
+            CompressionVerdict::Normal
+        );
     }
 
     #[test]
     fn test_compression_high_ratio_but_small_absolute_is_normal() {
         // Stosunek 100x, ale bezwzględny rozmiar (1KB) nie przekracza progu ostrzegawczego
-        assert_eq!(classify_compression_ratio(10, 1000), CompressionVerdict::Normal);
+        assert_eq!(
+            classify_compression_ratio(10, 1000),
+            CompressionVerdict::Normal
+        );
     }
 
     #[test]
@@ -1387,19 +1959,28 @@ mod tests {
         // Stosunek >50x I bezwzględny rozmiar >50MB, ale poniżej progu bomby (200x, 1GB)
         let file_size = 2_000_000; // 2MB
         let uncompressed = 150_000_000; // 150MB -> stosunek 75x
-        assert_eq!(classify_compression_ratio(file_size, uncompressed), CompressionVerdict::Suspicious);
+        assert_eq!(
+            classify_compression_ratio(file_size, uncompressed),
+            CompressionVerdict::Suspicious
+        );
     }
 
     #[test]
     fn test_compression_bomb_tier() {
         let file_size = 1_000_000; // 1MB
         let uncompressed = 2_000_000_000; // 2GB -> stosunek 2000x
-        assert_eq!(classify_compression_ratio(file_size, uncompressed), CompressionVerdict::Bomb);
+        assert_eq!(
+            classify_compression_ratio(file_size, uncompressed),
+            CompressionVerdict::Bomb
+        );
     }
 
     #[test]
     fn test_compression_zero_file_size_never_divides_by_zero() {
-        assert_eq!(classify_compression_ratio(0, 999_999_999_999), CompressionVerdict::Normal);
+        assert_eq!(
+            classify_compression_ratio(0, 999_999_999_999),
+            CompressionVerdict::Normal
+        );
     }
 
     #[test]
@@ -1407,7 +1988,10 @@ mod tests {
         // Stosunek >200x, ale bezwzględny rozmiar poniżej 1GB -> tylko Suspicious, nie Bomb
         let file_size = 1000;
         let uncompressed = 300_000; // stosunek 300x, ale tylko 300KB bezwzględnie
-        assert_eq!(classify_compression_ratio(file_size, uncompressed), CompressionVerdict::Normal);
+        assert_eq!(
+            classify_compression_ratio(file_size, uncompressed),
+            CompressionVerdict::Normal
+        );
         // (300KB nie przekracza nawet progu Suspicious 50MB, więc Normal - potwierdza że
         // sam wysoki STOSUNEK bez odpowiedniego rozmiaru bezwzględnego nic nie znaczy)
     }
@@ -1418,25 +2002,52 @@ mod tests {
 
     #[test]
     fn test_classify_reason_header_variants() {
-        assert_eq!(classify_hard_reason("Brak EOCD / Ucięta Struktura"), "header");
-        assert_eq!(classify_hard_reason("Złe Magic Bytes (Uszkodzony nagłówek)"), "header");
+        assert_eq!(
+            classify_hard_reason("Brak EOCD / Ucięta Struktura"),
+            "header"
+        );
+        assert_eq!(
+            classify_hard_reason("Złe Magic Bytes (Uszkodzony nagłówek)"),
+            "header"
+        );
     }
 
     #[test]
     fn test_classify_reason_other_categories() {
-        assert_eq!(classify_hard_reason("Wydmuszka (0 plików wewnątrz)"), "empty");
-        assert_eq!(classify_hard_reason("Fałszywe rozszerzenie (Brak DNA .docx)"), "fake");
-        assert_eq!(classify_hard_reason("Bomba plikowa (>50000 wpisów)"), "massfiles");
-        assert_eq!(classify_hard_reason("Zip Bomb (Anomalia Kompresji)"), "bomb");
-        assert_eq!(classify_hard_reason("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)"), "crc");
+        assert_eq!(
+            classify_hard_reason("Wydmuszka (0 plików wewnątrz)"),
+            "empty"
+        );
+        assert_eq!(
+            classify_hard_reason("Fałszywe rozszerzenie (Brak DNA .docx)"),
+            "fake"
+        );
+        assert_eq!(
+            classify_hard_reason("Bomba plikowa (>50000 wpisów)"),
+            "massfiles"
+        );
+        assert_eq!(
+            classify_hard_reason("Zip Bomb (Anomalia Kompresji)"),
+            "bomb"
+        );
+        assert_eq!(
+            classify_hard_reason("Błąd CRC32 (uszkodzona kompresja wpisu, próbka)"),
+            "crc"
+        );
     }
 
     #[test]
     fn test_classify_reason_unmatched_falls_back_to_header() {
         // To jest dokładnie ta luka, którą naprawiliśmy - powód nieznany nie ginie,
         // tylko trafia do kategorii domyślnej (jak w raporcie końcowym od zawsze).
-        assert_eq!(classify_hard_reason("Zbyt mały plik (Brak nagłówka)"), "header");
-        assert_eq!(classify_hard_reason("Zupełnie nowy, nieprzewidziany powód"), "header");
+        assert_eq!(
+            classify_hard_reason("Zbyt mały plik (Brak nagłówka)"),
+            "header"
+        );
+        assert_eq!(
+            classify_hard_reason("Zupełnie nowy, nieprzewidziany powód"),
+            "header"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1444,10 +2055,11 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn temp_with_ext(content: &[u8], ext: &str) -> (NamedTempFile, PathBuf) {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(content).unwrap();
+        let mut f = NamedTempFile::new().expect("Analiza archiwum nie powiodła się");
+        f.write_all(content)
+            .expect("Zapis danych do pliku nie powiódł się");
         let new_path = f.path().with_extension(ext);
-        std::fs::rename(f.path(), &new_path).unwrap();
+        std::fs::rename(f.path(), &new_path).expect("Zapis danych do pliku nie powiódł się");
         (f, new_path)
     }
 
@@ -1455,7 +2067,8 @@ mod tests {
     fn test_analyze_rar_valid_magic() {
         let content = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
         let (_g, path) = temp_with_ext(&content, "rar");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1463,16 +2076,22 @@ mod tests {
     fn test_analyze_rar_invalid_magic() {
         let content = [0x00u8; 10];
         let (_g, path) = temp_with_ext(&content, "rar");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Magic"));
+        assert!(
+            a.reason
+                .expect("Zapis danych do pliku nie powiódł się")
+                .contains("Magic")
+        );
     }
 
     #[test]
     fn test_analyze_gzip_valid_magic() {
         let content = [0x1F, 0x8B, 0x08, 0x00];
         let (_g, path) = temp_with_ext(&content, "gz");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1487,51 +2106,88 @@ mod tests {
         // bez sprawdzenia czegokolwiek.
         let good = [0x1F, 0x8B, 0x08, 0x00];
         let (_g, path) = temp_with_ext(&good, "tgz");
-        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path, good.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
 
         let bad = [0x00u8; 10];
         let (_g2, path2) = temp_with_ext(&bad, "tgz");
-        let a = analyze_archive(&path2, bad.len() as u64, false).unwrap();
-        assert!(!a.is_valid, "Uszkodzony .tgz musi zostać wykryty, nie przepuszczony");
-        assert!(a.reason.unwrap().contains("Magic"));
+        let a = analyze_archive(&path2, bad.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
+        assert!(
+            !a.is_valid,
+            "Uszkodzony .tgz musi zostać wykryty, nie przepuszczony"
+        );
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Magic")
+        );
     }
 
     #[test]
     fn test_analyze_tbz2_validates_bzip2_magic() {
         let good = [0x42, 0x5A, 0x68, 0x39];
         let (_g, path) = temp_with_ext(&good, "tbz2");
-        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path, good.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
 
         let bad = [0xFFu8; 10];
         let (_g2, path2) = temp_with_ext(&bad, "tbz2");
-        assert!(!analyze_archive(&path2, bad.len() as u64, false).unwrap().is_valid);
+        assert!(
+            !analyze_archive(&path2, bad.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
     }
 
     #[test]
     fn test_analyze_txz_validates_xz_magic() {
         let good = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00];
         let (_g, path) = temp_with_ext(&good, "txz");
-        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path, good.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
 
         let bad = [0x11u8; 10];
         let (_g2, path2) = temp_with_ext(&bad, "txz");
-        assert!(!analyze_archive(&path2, bad.len() as u64, false).unwrap().is_valid);
+        assert!(
+            !analyze_archive(&path2, bad.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
     }
 
     #[test]
     fn test_analyze_taz_validates_gzip_magic() {
         let good = [0x1F, 0x8B, 0x08, 0x00];
         let (_g, path) = temp_with_ext(&good, "taz");
-        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path, good.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
     }
 
     #[test]
     fn test_analyze_too_small_file_no_header() {
         let content = [0x01, 0x02];
         let (_g, path) = temp_with_ext(&content, "rar");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Zbyt mały"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Zbyt mały")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1547,10 +2203,16 @@ mod tests {
             let mut writer = ZipWriter::new(cursor);
             let options: FileOptions<()> = FileOptions::default();
             for (name, content) in entries {
-                writer.start_file(*name, options).unwrap();
-                writer.write_all(content).unwrap();
+                writer
+                    .start_file(*name, options)
+                    .expect("Rozpoczęcie pliku w archiwum ZIP nie powiodło się");
+                writer
+                    .write_all(content)
+                    .expect("Zapis danych do pliku nie powiódł się");
             }
-            writer.finish().unwrap();
+            writer
+                .finish()
+                .expect("Zakończenie i wygenerowanie archiwum ZIP nie powiodło się");
         }
         temp_with_ext(&buf, ext)
     }
@@ -1558,8 +2220,10 @@ mod tests {
     #[test]
     fn test_analyze_valid_plain_zip() {
         let (_g, path) = build_zip(&[("plik.txt", b"zawartosc")], "zip");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Zapis danych do pliku nie powiódł się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
         assert_eq!(a.internal_files_count, 1);
     }
@@ -1594,41 +2258,71 @@ mod tests {
 
             for i in 0..ENTRY_COUNT {
                 let name = format!("wpis_{i:05}.txt");
-                writer.start_file(&name, options).unwrap();
+                writer
+                    .start_file(&name, options)
+                    .expect("Rozpoczęcie pliku w archiwum ZIP nie powiodło się");
                 if i == BOMB_ENTRY_INDEX {
                     let mut remaining = BOMB_ENTRY_SIZE;
                     while remaining > 0 {
                         let take = std::cmp::min(remaining, zero_chunk.len() as u64) as usize;
-                        writer.write_all(&zero_chunk[..take]).unwrap();
+                        writer
+                            .write_all(&zero_chunk[..take])
+                            .expect("Zapis danych do pliku nie powiódł się");
                         remaining -= take as u64;
                     }
                 } else {
-                    writer.write_all(b"x").unwrap();
+                    writer
+                        .write_all(b"x")
+                        .expect("Zapis danych do pliku nie powiódł się");
                 }
             }
-            writer.finish().unwrap();
+            writer
+                .finish()
+                .expect("Zakończenie i wygenerowanie archiwum ZIP nie powiodło się");
         }
 
         let (_g, path) = temp_with_ext(&buf, "zip");
         // Fizyczny rozmiar na dysku jest mały dzięki kompresji - to właśnie
         // stwarza wysoki stosunek kompresji, cechę charakterystyczną zip bomby.
-        let file_size = std::fs::metadata(&path).unwrap().len();
-        assert!(file_size < 10_000_000, "Skompresowany plik powinien pozostać mały (samo zero się dobrze kompresuje)");
+        let file_size = std::fs::metadata(&path)
+            .expect("Zapis danych do pliku nie powiódł się")
+            .len();
+        assert!(
+            file_size < 10_000_000,
+            "Skompresowany plik powinien pozostać mały (samo zero się dobrze kompresuje)"
+        );
 
-        let a = analyze_archive(&path, file_size, false).unwrap();
+        let a =
+            analyze_archive(&path, file_size, false).expect("Analiza archiwum nie powiodła się");
         assert_eq!(a.internal_files_count, ENTRY_COUNT);
-        assert!(a.uncompressed_size >= BOMB_ENTRY_SIZE, "Suma nieskompresowanego rozmiaru musi uwzględniać wpis poza starym limitem 2000");
-        assert!(!a.is_valid, "Zip bomba ukryta za indeksem 2000 musi zostać wykryta");
-        assert!(a.reason.unwrap().contains("Zip Bomb"));
+        assert!(
+            a.uncompressed_size >= BOMB_ENTRY_SIZE,
+            "Suma nieskompresowanego rozmiaru musi uwzględniać wpis poza starym limitem 2000"
+        );
+        assert!(
+            !a.is_valid,
+            "Zip bomba ukryta za indeksem 2000 musi zostać wykryta"
+        );
+        assert!(
+            a.reason
+                .expect("Zapis danych do pliku nie powiódł się")
+                .contains("Zip Bomb")
+        );
     }
 
     #[test]
     fn test_analyze_empty_zip_is_wydmuszka() {
         let (_g, path) = build_zip(&[], "zip");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Wydmuszka"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Wydmuszka")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1648,19 +2342,35 @@ mod tests {
     ///   `phase13::test_analyze_image_generic_branch_is_panic_guarded`.
     #[test]
     fn test_panika_w_silniku_zip_jest_bezpiecznie_przechwycona() {
-        let wynik: std::thread::Result<ArchiveAnalysis> =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> ArchiveAnalysis {
-                panic!("celowa panika testowa - symuluje awarię silnika ZIP na zniekształconym archiwum");
-            }));
+        let wynik: std::thread::Result<ArchiveAnalysis> = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| -> ArchiveAnalysis {
+                panic!(
+                    "celowa panika testowa - symuluje awarię silnika ZIP na zniekształconym archiwum"
+                );
+            }),
+        );
 
         let a = wynik.unwrap_or_else(|_| ArchiveAnalysis {
-            is_valid: false, reason: Some("Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)".into()),
-            internal_files_count: 0, uncompressed_size: 0,
-            has_encrypted_entries: false, has_suspicious_compression: false,
+            is_valid: false,
+            reason: Some(
+                "Silnik ZIP spanikował podczas parsowania (uszkodzone lub złośliwe archiwum)"
+                    .into(),
+            ),
+            internal_files_count: 0,
+            uncompressed_size: 0,
+            has_encrypted_entries: false,
+            has_suspicious_compression: false,
         });
 
-        assert!(!a.is_valid, "Panika musi zostać zamieniona na porażkę parsowania, nie propagować się dalej");
-        assert!(a.reason.unwrap().contains("spanikował"));
+        assert!(
+            !a.is_valid,
+            "Panika musi zostać zamieniona na porażkę parsowania, nie propagować się dalej"
+        );
+        assert!(
+            a.reason
+                .expect("Analiza obrazu nie powiodła się")
+                .contains("spanikował")
+        );
     }
 
     /// Dowodzi, że `analyze_archive` (prawdziwa, produkcyjna funkcja - nie
@@ -1671,8 +2381,10 @@ mod tests {
     #[test]
     fn test_analyze_archive_dziala_normalnie_przez_warstwe_catch_unwind() {
         let (_g, path) = build_zip(&[("plik.txt", b"tresc")], "zip");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
         assert_eq!(a.internal_files_count, 1);
     }
@@ -1681,25 +2393,35 @@ mod tests {
     fn test_analyze_fake_docx_missing_word_folder() {
         // ZIP poprawny strukturalnie, ale bez folderu word/ - fałszywy .docx
         let (_g, path) = build_zip(&[("cokolwiek.xml", b"<xml/>")], "docx");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Fałszywe rozszerzenie"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Fałszywe rozszerzenie")
+        );
     }
 
     #[test]
     fn test_analyze_real_docx_with_word_folder_is_valid() {
         let (_g, path) = build_zip(&[("word/document.xml", b"<document/>")], "docx");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
     #[test]
     fn test_analyze_real_xlsx_with_xl_folder_is_valid() {
         let (_g, path) = build_zip(&[("xl/workbook.xml", b"<workbook/>")], "xlsx");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1707,35 +2429,57 @@ mod tests {
     fn test_analyze_fake_docm_missing_word_folder() {
         // .docm dzieli DNA z .docx (ten sam kontener OOXML + makra).
         let (_g, path) = build_zip(&[("cokolwiek.xml", b"<xml/>")], "docm");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Fałszywe rozszerzenie"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Fałszywe rozszerzenie")
+        );
     }
 
     #[test]
     fn test_analyze_real_docm_with_word_folder_is_valid() {
-        let (_g, path) = build_zip(&[("word/document.xml", b"<document/>"), ("word/vbaProject.bin", b"\x00")], "docm");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let (_g, path) = build_zip(
+            &[
+                ("word/document.xml", b"<document/>"),
+                ("word/vbaProject.bin", b"\x00"),
+            ],
+            "docm",
+        );
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
     #[test]
     fn test_analyze_fake_xlsm_missing_xl_folder() {
         let (_g, path) = build_zip(&[("cokolwiek.xml", b"<xml/>")], "xlsm");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Fałszywe rozszerzenie"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Fałszywe rozszerzenie")
+        );
     }
 
     #[test]
     fn test_analyze_real_war_is_valid_without_dna_check() {
         // .war (Java Web Archive) nie ma zdefiniowanej weryfikacji DNA - jak .jar.
         let (_g, path) = build_zip(&[("WEB-INF/web.xml", b"<web-app/>")], "war");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1743,7 +2487,8 @@ mod tests {
     fn test_analyze_zst_valid_magic() {
         let content = [0x28, 0xB5, 0x2F, 0xFD, 0x00];
         let (_g, path) = temp_with_ext(&content, "zst");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1751,7 +2496,8 @@ mod tests {
     fn test_analyze_zst_invalid_magic() {
         let content = [0x00u8; 10];
         let (_g, path) = temp_with_ext(&content, "zst");
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
     }
 
@@ -1760,27 +2506,41 @@ mod tests {
         // .cbr (komiks) dzieli magic bytes z .rar poprzez normalizację `effective_ext`.
         let good = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
         let (_g, path) = temp_with_ext(&good, "cbr");
-        assert!(analyze_archive(&path, good.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path, good.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
 
         let bad = [0x00u8; 10];
         let (_g2, path2) = temp_with_ext(&bad, "cbr");
-        assert!(!analyze_archive(&path2, bad.len() as u64, false).unwrap().is_valid);
+        assert!(
+            !analyze_archive(&path2, bad.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
     }
 
     #[test]
     fn test_analyze_non_zip_content_with_zip_extension_is_broken_header() {
         let (_g, path) = temp_with_ext(b"to nie jest prawdziwy zip", "zip");
-        let a = analyze_archive(&path, 25, false).unwrap();
+        let a = analyze_archive(&path, 25, false).expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("EOCD"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("EOCD")
+        );
     }
 
     #[test]
     fn test_analyze_deep_scan_disabled_does_not_check_crc_even_if_would_fail() {
         // Bez deep_scan, poprawny ZIP przechodzi normalnie niezależnie od CRC
         let (_g, path) = build_zip(&[("plik.txt", b"dane")], "zip");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, false).unwrap();
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, false).expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid);
     }
 
@@ -1788,9 +2548,14 @@ mod tests {
     fn test_analyze_deep_scan_enabled_valid_zip_still_passes() {
         // Z deep_scan=true, ale ZIP jest w pełni poprawny - próbka CRC powinna przejść
         let (_g, path) = build_zip(&[("plik.txt", b"dane bez uszkodzenia")], "zip");
-        let size = std::fs::metadata(&path).unwrap().len();
-        let a = analyze_archive(&path, size, true).unwrap();
-        assert!(a.is_valid, "Poprawny ZIP powinien przejść próbkową weryfikację CRC32");
+        let size = std::fs::metadata(&path)
+            .expect("Analiza archiwum nie powiodła się")
+            .len();
+        let a = analyze_archive(&path, size, true).expect("Analiza archiwum nie powiodła się");
+        assert!(
+            a.is_valid,
+            "Poprawny ZIP powinien przejść próbkową weryfikację CRC32"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1811,7 +2576,10 @@ mod tests {
         assert!(block.contains("Zdrowe: 10 wspólne / 0 unikalne"));
         assert!(block.contains("Bomba (liczba plików): 0 wspólne / 2 unikalne"));
         assert!(block.contains("Zaszyfrowane: 3 wspólne / 0 unikalne"));
-        assert!(!block.contains("CRC32"), "Blok CRC nie powinien się pojawić gdy deep_scan_enabled=false");
+        assert!(
+            !block.contains("CRC32"),
+            "Blok CRC nie powinien się pojawić gdy deep_scan_enabled=false"
+        );
     }
 
     #[test]
@@ -1831,7 +2599,9 @@ mod tests {
     #[test]
     fn test_build_source_block_reports_average_compression_ratio() {
         let stats = LiveStats::new(4);
-        stats.uncompressed_size_sum.store(400_000, Ordering::Relaxed);
+        stats
+            .uncompressed_size_sum
+            .store(400_000, Ordering::Relaxed);
         stats.ok_bytes_sum.store(100_000, Ordering::Relaxed);
 
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -1866,7 +2636,10 @@ mod tests {
         let start_time = Instant::now() - Duration::from_millis(500);
         let block = build_source_block("UFS Explorer", &stats, start_time, false);
 
-        let line = block.lines().find(|l| l.starts_with("Wątki analizy")).expect("powinna istnieć linia Wariantu A");
+        let line = block
+            .lines()
+            .find(|l| l.starts_with("Wątki analizy"))
+            .expect("powinna istnieć linia Wariantu A");
         assert_eq!(line, "Wątki analizy (Wariant A): {G:1} {R:2}");
     }
 
@@ -1900,10 +2673,18 @@ mod tests {
         let tar = tar_archiwum(&[("a.txt", b"alfa"), ("b.txt", b"beta-beta")]);
         let (_g, path) = temp_with_ext(&tar, "tar");
 
-        let a = analyze_archive(&path, tar.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, tar.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(a.is_valid, "Zdrowy tar musi przejść: {:?}", a.reason);
-        assert_eq!(a.internal_files_count, 2, "Liczba wpisów z realnej struktury, nie z magic bytes");
-        assert_eq!(a.uncompressed_size, 4 + 9, "Rozmiar treści = suma rozmiarów wpisów");
+        assert_eq!(
+            a.internal_files_count, 2,
+            "Liczba wpisów z realnej struktury, nie z magic bytes"
+        );
+        assert_eq!(
+            a.uncompressed_size,
+            4 + 9,
+            "Rozmiar treści = suma rozmiarów wpisów"
+        );
     }
 
     #[test]
@@ -1915,9 +2696,14 @@ mod tests {
         let uciety = &tar[..tar.len() - 1200];
         let (_g, path) = temp_with_ext(uciety, "tar");
 
-        assert_eq!(&uciety[257..262], b"ustar", "Test bez sensu: magic bytes muszą zostać nietknięte");
+        assert_eq!(
+            &uciety[257..262],
+            b"ustar",
+            "Test bez sensu: magic bytes muszą zostać nietknięte"
+        );
 
-        let a = analyze_archive(&path, uciety.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, uciety.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid, "Tar ucięty w danych wpisu musi zostać wykryty");
     }
 
@@ -1928,10 +2714,18 @@ mod tests {
         let bez_znacznika = &tar[..tar.len() - TAR_BLOK * 2];
         let (_g, path) = temp_with_ext(bez_znacznika, "tar");
 
-        let a = analyze_archive(&path, bez_znacznika.len() as u64, false).unwrap();
-        assert!(!a.is_valid, "Brak znacznika końca to objaw ucięcia archiwum");
-        let powod = a.reason.unwrap();
-        assert!(powod.contains("znacznika końca"), "Powód powinien nazwać objaw wprost, dostałem: {}", powod);
+        let a = analyze_archive(&path, bez_znacznika.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
+        assert!(
+            !a.is_valid,
+            "Brak znacznika końca to objaw ucięcia archiwum"
+        );
+        let powod = a.reason.expect("Analiza archiwum nie powiodła się");
+        assert!(
+            powod.contains("znacznika końca"),
+            "Powód powinien nazwać objaw wprost, dostałem: {}",
+            powod
+        );
     }
 
     #[test]
@@ -1945,11 +2739,19 @@ mod tests {
         zepsuty[offset_drugiego + 148] = b'9';
 
         let (_g, path) = temp_with_ext(&zepsuty, "tar");
-        let a = analyze_archive(&path, zepsuty.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, zepsuty.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
 
-        assert!(!a.is_valid, "Zła suma kontrolna nagłówka musi unieważnić archiwum");
-        let powod = a.reason.unwrap();
-        assert!(powod.contains("poprawnych nagłówków"), "Brak informacji o ocalałych wpisach: {}", powod);
+        assert!(
+            !a.is_valid,
+            "Zła suma kontrolna nagłówka musi unieważnić archiwum"
+        );
+        let powod = a.reason.expect("Analiza archiwum nie powiodła się");
+        assert!(
+            powod.contains("poprawnych nagłówków"),
+            "Brak informacji o ocalałych wpisach: {}",
+            powod
+        );
     }
 
     #[test]
@@ -1958,12 +2760,18 @@ mod tests {
         let smieci = vec![0xABu8; TAR_BLOK * 3];
         let (_g, path) = temp_with_ext(&smieci, "tar");
 
-        let a = analyze_archive(&path, smieci.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, smieci.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        let powod = a.reason.unwrap();
-        assert!(powod.contains("Nie znaleziono żadnych wpisów"), "dostałem: {}", powod);
+        let powod = a.reason.expect("Analiza archiwum nie powiodła się");
+        assert!(
+            powod.contains("Nie znaleziono żadnych wpisów"),
+            "dostałem: {}",
+            powod
+        );
         assert_eq!(
-            classify_hard_reason(&powod), "empty",
+            classify_hard_reason(&powod),
+            "empty",
             "Tar bez wpisów to Wydmuszka, nie uszkodzony nagłówek"
         );
     }
@@ -1973,9 +2781,14 @@ mod tests {
         let content = [0x01u8; 100];
         let (_g, path) = temp_with_ext(&content, "tar");
 
-        let a = analyze_archive(&path, content.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, content.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid);
-        assert!(a.reason.unwrap().contains("Zbyt mały"));
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Zbyt mały")
+        );
     }
 
     #[test]
@@ -1986,15 +2799,25 @@ mod tests {
         let tar = tar_archiwum(&[("a.txt", b"alfa")]);
         let (_g, path) = temp_with_ext(&tar, "tar.gz");
 
-        let a = analyze_archive(&path, tar.len() as u64, false).unwrap();
+        let a = analyze_archive(&path, tar.len() as u64, false)
+            .expect("Analiza archiwum nie powiodła się");
         assert!(!a.is_valid, "Poprawny tar pod nazwą .tar.gz to zły gzip");
-        assert!(a.reason.unwrap().contains("Magic"), "Powinna zadziałać gałąź magic bytes, nie strukturalna");
+        assert!(
+            a.reason
+                .expect("Analiza archiwum nie powiodła się")
+                .contains("Magic"),
+            "Powinna zadziałać gałąź magic bytes, nie strukturalna"
+        );
 
         // Odwrotnie: prawdziwe magic bytes gzipa przechodzą, mimo że w środku
         // nie ma żadnej struktury tar (bo i nie ma jej jak sprawdzić).
         let gzip = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00];
         let (_g2, path2) = temp_with_ext(&gzip, "tar.gz");
-        assert!(analyze_archive(&path2, gzip.len() as u64, false).unwrap().is_valid);
+        assert!(
+            analyze_archive(&path2, gzip.len() as u64, false)
+                .expect("Analiza archiwum nie powiodła się")
+                .is_valid
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2006,7 +2829,12 @@ mod tests {
 
     #[test]
     fn test_etykiety_maja_zarejestrowane_wyjasnienia_albo_sa_generyczne() {
-        const GENERYCZNE: &[&str] = &["Prędkość", "Top format", "Wątki analizy (Wariant A)", "Błędy I/O"];
+        const GENERYCZNE: &[&str] = &[
+            "Prędkość",
+            "Top format",
+            "Wątki analizy (Wariant A)",
+            "Błędy I/O",
+        ];
 
         let stats = LiveStats::new(1);
         let start_time = Instant::now() - Duration::from_secs(1);
@@ -2014,26 +2842,41 @@ mod tests {
 
         let mut sprawdzonych = 0;
         for line in block.lines() {
-            if line.starts_with('[') { continue; }
-            let Some((etykieta, _)) = line.split_once(": ") else { continue; };
-            if GENERYCZNE.contains(&etykieta) { continue; }
+            if line.starts_with('[') {
+                continue;
+            }
+            let Some((etykieta, _)) = line.split_once(": ") else {
+                continue;
+            };
+            if GENERYCZNE.contains(&etykieta) {
+                continue;
+            }
 
             assert!(
                 crate::opisy_anomalii::znajdz_opis(etykieta).is_some(),
-                "etykieta \"{}\" z panelu Fazy 11 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii", etykieta
+                "etykieta \"{}\" z panelu Fazy 11 nie ma zarejestrowanego wyjaśnienia w opisy_anomalii",
+                etykieta
             );
             sprawdzonych += 1;
         }
-        assert_eq!(sprawdzonych, 11, "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza11_archiwa.rs");
+        assert_eq!(
+            sprawdzonych, 11,
+            "liczba sprawdzonych etykiet zmieniła się - zaktualizuj GENERYCZNE albo opisy_anomalii/faza11_archiwa.rs"
+        );
     }
 
     #[test]
     fn test_classify_hard_reason_maps_empty_tar_to_empty_bucket() {
         assert_eq!(
-            classify_hard_reason("Nie znaleziono żadnych wpisów tar (plik pusty, ucięty lub nie jest archiwum)"),
+            classify_hard_reason(
+                "Nie znaleziono żadnych wpisów tar (plik pusty, ucięty lub nie jest archiwum)"
+            ),
             "empty"
         );
         // Uszkodzone nagłówki zostają w kategorii "Nagłówek".
-        assert_eq!(classify_hard_reason("3 uszkodzonych nagłówków (z 5) (poprawnych nagłówków: 2 z 5)"), "header");
+        assert_eq!(
+            classify_hard_reason("3 uszkodzonych nagłówków (z 5) (poprawnych nagłówków: 2 z 5)"),
+            "header"
+        );
     }
 }
